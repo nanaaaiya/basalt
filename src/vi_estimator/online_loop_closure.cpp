@@ -56,6 +56,25 @@ namespace basalt {
 
 namespace {
 
+// Looser than config_.mapper_max_hamming_distance / _second_best_test_ratio
+// (70 / 1.2), used ONLY for matching between our own two calibrated
+// cameras (cam0/cam1) at the same instant, never for matching across time.
+// This is safe to loosen because, unlike temporal matching, a stereo match
+// between a rigidly-mounted, calibrated pair can be verified exactly
+// against the known relative geometry (see findInliersEssential() below) --
+// so we can afford to let more candidate matches through here and let the
+// geometry check reject the wrong ones, instead of relying on descriptor
+// similarity alone to be strict enough. Goal: raise the fraction of each
+// keyframe's corners that end up with a real triangulated 3D point (was
+// consistently only 5-20% -- see conversation), so more temporal matches
+// later have a chance of being PnP-ready.
+constexpr int kStereoMaxHammingDistance = 90;
+constexpr double kStereoSecondBestTestRatio = 1.5;
+// Epipolar error threshold for findInliersEssential() -- same value
+// Basalt's own offline mapper uses for the identical stereo-verification
+// purpose (NfrMapper::match_stereo(), src/vi_estimator/nfr_mapper.cpp).
+constexpr double kStereoEpipolarErrorThreshold = 1e-3;
+
 // Decompose R = Rz(yaw) * Ry(pitch) * Rx(roll). Assumes no gimbal lock
 // (pitch away from +-90 deg), a reasonable assumption for a handheld/mobile
 // device that isn't doing full vertical flips.
@@ -223,16 +242,31 @@ void OnlineLoopClosure::processKeyframe(const MargData::Ptr& data,
     detectKeypointsMapping(img1, kd1, config_.mapper_detection_num_points);
     computeAngles(img1, kd1, true);
     computeDescriptors(img1, kd1);
-
-    std::vector<std::pair<int, int>> matches;
-    matchDescriptors(kf.kd0.corner_descriptors, kd1.corner_descriptors, matches,
-                     (int)config_.mapper_max_hamming_distance,
-                     config_.mapper_second_best_test_ratio);
+    {
+      std::vector<bool> success;
+      calib_.intrinsics[1].unproject(kd1.corners, kd1.corners_3d, success);
+    }
 
     Sophus::SE3d T_c0_c1 = calib_.T_i_c[0].inverse() * calib_.T_i_c[1];
     Eigen::Vector3d O1 = T_c0_c1.translation();
 
-    for (const auto& m : matches) {
+    // Deliberately loose descriptor matching here (see kStereo* constants
+    // above) -- safe because every match gets verified next against the
+    // exact, known epipolar geometry between our two calibrated cameras, a
+    // much stronger check than descriptor similarity alone (and one
+    // temporal/cross-time matching below doesn't get to use, since we
+    // don't know the relative pose between two arbitrary past keyframes in
+    // advance -- that's the whole point of PnP-RANSAC there).
+    MatchData md;
+    matchDescriptors(kf.kd0.corner_descriptors, kd1.corner_descriptors,
+                     md.matches, kStereoMaxHammingDistance,
+                     kStereoSecondBestTestRatio);
+
+    Eigen::Matrix4d E;
+    computeEssential(T_c0_c1, E);
+    findInliersEssential(kf.kd0, kd1, E, kStereoEpipolarErrorThreshold, md);
+
+    for (const auto& m : md.inliers) {
       Eigen::Vector4d b0h, b1h;
       if (!calib_.intrinsics[0].unproject(kf.kd0.corners[m.first], b0h))
         continue;
