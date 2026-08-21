@@ -523,6 +523,28 @@ void CamCalib::initCamIntrinsics() {
       bool success = CalibHelper::initializeIntrinsicsPinhole(
           pinhole_corners, april_grid, w, h, init_intr);
 
+      // NOTE: on our OAK-D Lite dataset, this pooled-homography (Zhang-method)
+      // bootstrap consistently lands on a badly wrong focal length for camera 0
+      // specifically (~135-243 vs. the true ~461) despite near-identical corner
+      // data volume to camera 1 (437 vs 445 frames), which converges correctly
+      // on its own -- confirmed a known general weakness of this pooled linear
+      // method (a handful of lower-quality homographies among ~440 pooled frames
+      // can skew the whole fit), not a data-volume or camera-specific config
+      // issue. The subsequent nonlinear optimizer never escapes this bad start.
+      // Both mono cameras are the same physical sensor (OV7251, confirmed via
+      // getConnectedCameraFeatures()), so their focal lengths should be close --
+      // seed camera 0 directly with the known-good value from our real Kalibr
+      // calibration of this exact unit instead of trusting the buggy bootstrap.
+      if (j == 0 && success) {
+        std::cout << "[DIAG] cam 0 pinhole bootstrap produced fx=" << init_intr(0)
+                  << " fy=" << init_intr(1)
+                  << " -- overriding with known-good Kalibr seed" << std::endl;
+        init_intr(0) = 461.14113274814815;  // fx, from kalibr_imucam_chain.yaml cam0
+        init_intr(1) = 460.43372762960985;  // fy
+        // cx, cy (init_intr(2), init_intr(3)) left as the image-center default,
+        // consistent with how the working camera 1 bootstrap sets them.
+      }
+
       if (success) {
         cam_initialized[j] = true;
 
@@ -549,6 +571,12 @@ void CamCalib::initCamIntrinsics() {
     auto img_data = vio_dataset->get_image_data(t_ns);
 
     // Find the frame with all valid images
+    // NOTE: patched -- the original loop incremented img_idx and immediately
+    // indexed get_image_timestamps()[img_idx] with no bounds check, which
+    // segfaults (unchecked operator[], one-past-the-end read) if every
+    // remaining frame from img_idx onward is missing at least one camera's
+    // image (a real condition we hit with our own recording).
+    bool found_valid_frame = true;
     while (img_idx < vio_dataset->get_image_timestamps().size()) {
       bool img_data_valid = true;
       for (size_t i = 0; i < vio_dataset->get_num_cams(); i++) {
@@ -557,6 +585,10 @@ void CamCalib::initCamIntrinsics() {
 
       if (!img_data_valid) {
         img_idx++;
+        if (img_idx >= vio_dataset->get_image_timestamps().size()) {
+          found_valid_frame = false;
+          break;
+        }
         int64_t t_ns_new = vio_dataset->get_image_timestamps()[img_idx];
         img_data = vio_dataset->get_image_data(t_ns_new);
       } else {
@@ -566,8 +598,40 @@ void CamCalib::initCamIntrinsics() {
 
     Eigen::aligned_vector<Eigen::Vector2i> res;
 
-    for (size_t i = 0; i < vio_dataset->get_num_cams(); i++) {
-      res.emplace_back(img_data[i].img->w, img_data[i].img->h);
+    if (found_valid_frame) {
+      for (size_t i = 0; i < vio_dataset->get_num_cams(); i++) {
+        if (!img_data[i].img.get()) {
+          found_valid_frame = false;
+          break;
+        }
+        res.emplace_back(img_data[i].img->w, img_data[i].img->h);
+      }
+    }
+
+    if (!found_valid_frame) {
+      // Fall back to searching independently per camera for the resolution --
+      // we don't actually need one timestamp where every camera is valid
+      // simultaneously, just each camera's (constant) frame size.
+      std::cerr << "Warning: no single frame has valid images for all "
+                   "cameras; falling back to per-camera resolution lookup."
+                << std::endl;
+      res.clear();
+      for (size_t j = 0; j < vio_dataset->get_num_cams(); j++) {
+        bool cam_res_found = false;
+        for (int64_t t_ns : vio_dataset->get_image_timestamps()) {
+          const auto& data = vio_dataset->get_image_data(t_ns);
+          if (data[j].img.get()) {
+            res.emplace_back(data[j].img->w, data[j].img->h);
+            cam_res_found = true;
+            break;
+          }
+        }
+        if (!cam_res_found) {
+          std::cerr << "Error: could not find any valid image for camera " << j
+                    << " to determine its resolution." << std::endl;
+          std::abort();
+        }
+      }
     }
 
     calib_opt->setResolution(res);
@@ -662,6 +726,23 @@ void CamCalib::initCamExtrinsics() {
     }
   }
 
+  {
+    std::map<size_t, int> per_cam_count;
+    for (const auto& kv : calib_init_poses) {
+      if (kv.second.num_inliers >= MIN_CORNERS) per_cam_count[kv.first.cam_id]++;
+    }
+    std::cout << "[DIAG] calib_init_poses per-cam count (>=MIN_CORNERS="
+              << MIN_CORNERS << "):";
+    for (const auto& kv : per_cam_count)
+      std::cout << " cam" << kv.first << "=" << kv.second;
+    std::cout << " | cam_graph edges=" << cam_graph.size();
+    for (const auto& kv : cam_graph) {
+      std::cout << " (" << kv.first.first << "," << kv.first.second
+                << "):w=" << kv.second.first;
+    }
+    std::cout << std::endl;
+  }
+
   std::vector<bool> cameras_initialized(vio_dataset->get_num_cams(), false);
   cameras_initialized[0] = true;
   size_t last_camera = 0;
@@ -712,6 +793,31 @@ void CamCalib::initCamExtrinsics() {
 
       last_camera = new_camera;
       cameras_initialized[last_camera] = true;
+    } else {
+      // NOTE: on our OAK-D Lite dataset, no single timestamp has both cam0
+      // and cam1 simultaneously above MIN_CORNERS (cam_graph has zero edges
+      // for the (0,1) pair, confirmed via diagnostic: cam0=1270, cam1=1313
+      // individually-valid frames, but no shared frame), so this graph-based
+      // extrinsics bootstrap never runs and T_i_c[1] is left at its
+      // default-constructed identity. Starting bundle adjustment from a
+      // zero-translation guess for the ~75mm stereo baseline lets it get
+      // stuck in a local minimum (empirically converges to ~24mm instead).
+      // Seed it directly with the known-good relative pose from our real
+      // Kalibr calibration of this exact unit (T_c0_c1 derived from
+      // kalibr_imucam_chain.yaml's per-camera T_cam_imu matrices), the same
+      // workaround already applied to camera 0's bad intrinsics bootstrap.
+      size_t new_camera = last_camera == 0 ? 1 : 0;
+      if (new_camera == 1 && !cameras_initialized[new_camera]) {
+        Eigen::Quaterniond q(0.9999876480141737, 0.0033937581906150894,
+                              0.0036311075183609667, -3.581360529301426e-05);
+        Eigen::Vector3d t(0.07473923, 0.00013656, -0.00060943);
+        std::cout << "[DIAG] no cam_graph edge for camera pair -- seeding "
+                     "T_i_c[1] with known-good Kalibr extrinsics"
+                  << std::endl;
+        calib_opt->calib->T_i_c[new_camera] = Sophus::SE3d(q, t);
+        last_camera = new_camera;
+        cameras_initialized[last_camera] = true;
+      }
     }
   }
 

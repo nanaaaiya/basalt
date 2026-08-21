@@ -105,7 +105,7 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR CMAKE_CXX_COMPILER_ID STREQUAL "App
     add_definitions(-DTBB_USE_GLIBCXX_VERSION=${TBB_USE_GLIBCXX_VERSION})
   endif()
 else()
-  set(BASALT_CXX_FLAGS "${BASALT_CXX_FLAGS} -Wno-error=maybe-uninitialized -Wno-error=implicit-fallthrough -Wno-error=deprecated-declarations")
+  set(BASALT_CXX_FLAGS "${BASALT_CXX_FLAGS} -Wno-error=maybe-uninitialized -Wno-error=implicit-fallthrough -Wno-error=deprecated-declarations -Wno-error=unused-variable")
 
   if(CMAKE_CXX_COMPILER_VERSION VERSION_LESS 10.0)
     set(BASALT_CXX_FLAGS "${BASALT_CXX_FLAGS} -Wno-error=uninitialized")
@@ -339,6 +339,7 @@ target_sources(basalt
     ${CMAKE_CURRENT_SOURCE_DIR}/src/vi_estimator/landmark_database.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/vi_estimator/marg_helper.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/vi_estimator/nfr_mapper.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/vi_estimator/online_loop_closure.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/vi_estimator/sc_ba_base.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/vi_estimator/sqrt_ba_base.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/vi_estimator/sqrt_keypoint_vio.cpp
@@ -441,6 +442,37 @@ if(realsense2_FOUND)
   endif()
 endif()
 
+# Live driver for a Luxonis OAK-D Lite, only built if depthai-core is found.
+# depthai-core's own depthaiConfig.cmake is missing find_dependency() calls for
+# several of its own transitive deps (fmt, yaml-cpp, spdlog, ZLIB, BZip2, lz4,
+# LibArchive, magic_enum, semver, httplib, liblzma, Backward) even though
+# depthaiTargets.cmake requires their imported targets to exist. All of them
+# were already built by depthai-core's own vcpkg step, so pointing
+# CMAKE_PREFIX_PATH at that vcpkg_installed tree (pass
+# -DDEPTHAI_VCPKG_INSTALLED_DIR=<path>/vcpkg_installed/<triplet> when
+# configuring) resolves every one of them at once instead of listing them by
+# hand -- same workaround already used by the OpenVINS project's run_oakd
+# target (ov_msckf/cmake/ROS1.cmake).
+if(DEFINED DEPTHAI_VCPKG_INSTALLED_DIR)
+  list(APPEND CMAKE_PREFIX_PATH ${DEPTHAI_VCPKG_INSTALLED_DIR})
+  foreach(_dep fmt yaml-cpp spdlog magic_enum semver httplib liblzma Backward)
+    find_package(${_dep} CONFIG QUIET)
+  endforeach()
+  foreach(_dep ZLIB BZip2 lz4 LibArchive)
+    find_package(${_dep} QUIET)
+  endforeach()
+endif()
+find_package(depthai CONFIG QUIET)
+if(depthai_FOUND)
+  message(STATUS "FOUND DEPTHAI-CORE, building basalt_oak_d_vio")
+  add_executable(basalt_oak_d_vio src/oak_d_vio.cpp src/device/oak_d.cpp)
+  target_link_libraries(basalt_oak_d_vio basalt depthai::core ${BASALT_PANGO_TARGETS} basalt::cli11)
+  basalt_add_gui_link_options(basalt_oak_d_vio)
+  basalt_add_macos_runtime_paths(basalt_oak_d_vio)
+else()
+  message(WARNING "depthai-core not found, skipping basalt_oak_d_vio target")
+endif()
+
 
 
 install(TARGETS basalt_calibrate basalt_calibrate_imu basalt_vio_sim basalt_mapper_sim basalt_mapper basalt_opt_flow basalt_vio basalt_kitti_eval basalt_time_alignment basalt
@@ -459,6 +491,14 @@ endif()
 
 if(realsense2_FOUND)
     install(TARGETS basalt_rs_t265_record basalt_rs_t265_vio
+      EXPORT BasaltTargets
+      RUNTIME DESTINATION ${CMAKE_INSTALL_PREFIX}/bin
+      LIBRARY DESTINATION ${CMAKE_INSTALL_PREFIX}/lib
+      ARCHIVE DESTINATION ${CMAKE_INSTALL_PREFIX}/lib)
+endif()
+
+if(depthai_FOUND)
+    install(TARGETS basalt_oak_d_vio
       EXPORT BasaltTargets
       RUNTIME DESTINATION ${CMAKE_INSTALL_PREFIX}/bin
       LIBRARY DESTINATION ${CMAKE_INSTALL_PREFIX}/lib

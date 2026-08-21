@@ -6,3 +6,8 @@ scripts/eval/eval_*
 scripts/eval_full/eval_*
 stats_*.*json
 __pycache__
+
+# Calibration debug/cache artifacts (regenerable, large binary caches) --
+# keep only the final calibration actually used by the OAK-D live driver.
+results/*
+!results/calibration_final.json
