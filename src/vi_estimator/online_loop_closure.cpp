@@ -40,6 +40,9 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <cmath>
 #include <iostream>
 
+#include <Eigen/Sparse>
+#include <Eigen/SparseCholesky>
+
 #include <basalt/utils/keypoints.h>
 
 #pragma GCC diagnostic push
@@ -473,91 +476,102 @@ void OnlineLoopClosure::solvePoseGraph() {
     return node_idx == 0 ? -1 : 4 * (int)(node_idx - 1);
   };
 
+  // Generator matrix for d Rz(yaw)/d yaw = Rz(yaw) * skewZ (standard result
+  // for a single-axis rotation derivative).
+  Eigen::Matrix3d skewZ;
+  skewZ << 0, -1, 0, 1, 0, 0, 0, 0, 0;
+
   double lambda = 1e-4;
 
   for (int iter = 0; iter < 15; iter++) {
-    Eigen::MatrixXd JtJ = Eigen::MatrixXd::Zero((long)dim, (long)dim);
+    // Sparse + analytic-Jacobian rebuild of the normal equations. Profiling
+    // (see conversation) showed the previous dense (Eigen::MatrixXd) +
+    // numeric-Jacobian (central-difference) version taking 1+ second per
+    // solve at only ~350 nodes -- almost entirely from rebuilding and
+    // factorizing a dense dim x dim matrix from scratch every iteration.
+    // The graph is naturally sparse (each node only touches a couple of
+    // edges), so a triplet-built SparseMatrix + SimplicialLDLT scales with
+    // the number of actual connections instead of dim^2/dim^3. Analytic
+    // Jacobians (derived from d(R^T)/d(yaw) = [d Rz(yaw)/d yaw * Ry * Rx]^T)
+    // remove the 16 extra residual evaluations per edge the numeric version
+    // needed, though that was a much smaller share of the 1s+ cost.
+    std::vector<Eigen::Triplet<double>> triplets;
+    triplets.reserve(edges_.size() * 40);
     Eigen::VectorXd Jtr = Eigen::VectorXd::Zero((long)dim);
-    double total_err = 0;
+
+    auto add_block = [&](int row_off, int col_off,
+                         const Eigen::Matrix4d& block) {
+      for (int r_ = 0; r_ < 4; r_++)
+        for (int c_ = 0; c_ < 4; c_++)
+          if (block(r_, c_) != 0.0)
+            triplets.emplace_back(row_off + r_, col_off + c_, block(r_, c_));
+    };
 
     for (const auto& e : edges_) {
       const LoopKeyframe& ni = keyframes_[e.i];
       const LoopKeyframe& nj = keyframes_[e.j];
 
-      Eigen::Matrix3d Ri = composeYPR(ni.roll, ni.pitch, ni.yaw);
-      Eigen::Vector3d predicted_dt = Ri.transpose() * (nj.t_opt - ni.t_opt);
+      // Ri = Rz(yaw_i) * Ci, where Ci = Ry(pitch_i) * Rx(roll_i) is
+      // constant (roll/pitch are never optimized) -- matches composeYPR().
+      Eigen::Matrix3d Ci = composeYPR(ni.roll, ni.pitch, 0.0);
+      Eigen::Matrix3d Rzi =
+          Eigen::AngleAxisd(ni.yaw, Eigen::Vector3d::UnitZ()).toRotationMatrix();
+      Eigen::Matrix3d Ri = Rzi * Ci;
+
+      Eigen::Vector3d dt_vec = nj.t_opt - ni.t_opt;
+      Eigen::Vector3d predicted_dt = Ri.transpose() * dt_vec;
       double predicted_dyaw = wrapAngle(nj.yaw - ni.yaw);
 
       Eigen::Vector4d r;
       r.head<3>() = predicted_dt - e.dt;
       r(3) = wrapAngle(predicted_dyaw - e.dyaw);
-      total_err += r.squaredNorm();
 
-      // Numeric (central-difference) Jacobian, 4x4 per node, only for free
-      // (non-anchor) nodes -- small graphs, correctness over cleverness.
-      const double h = 1e-6;
+      // d(Ri^T)/d(yaw_i) = [Rzi * skewZ * Ci]^T, so
+      // d(predicted_dt)/d(yaw_i) = [Rzi * skewZ * Ci]^T * (tj - ti).
+      Eigen::Matrix3d dRi_dyaw = Rzi * skewZ * Ci;
+      Eigen::Vector3d dt_dyawi = dRi_dyaw.transpose() * dt_vec;
+
       Eigen::Matrix<double, 4, 8> J = Eigen::Matrix<double, 4, 8>::Zero();
-
-      auto eval = [&](double dxi, double dyi, double dzi, double dyawi,
-                      double dxj, double dyj, double dzj, double dyawj) {
-        Eigen::Vector3d ti = ni.t_opt + Eigen::Vector3d(dxi, dyi, dzi);
-        Eigen::Vector3d tj = nj.t_opt + Eigen::Vector3d(dxj, dyj, dzj);
-        Eigen::Matrix3d Ri2 = composeYPR(ni.roll, ni.pitch, ni.yaw + dyawi);
-        Eigen::Vector4d rr;
-        rr.head<3>() = Ri2.transpose() * (tj - ti) - e.dt;
-        rr(3) = wrapAngle(wrapAngle(nj.yaw + dyawj - (ni.yaw + dyawi)) - e.dyaw);
-        return rr;
-      };
-
-      for (int k = 0; k < 4; k++) {
-        double d[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-        d[k] = h;
-        Eigen::Vector4d rp = eval(d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]);
-        d[k] = -h;
-        Eigen::Vector4d rm = eval(d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]);
-        J.col(k) = (rp - rm) / (2 * h);
-      }
-      for (int k = 0; k < 4; k++) {
-        double d[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-        d[4 + k] = h;
-        Eigen::Vector4d rp = eval(d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]);
-        d[4 + k] = -h;
-        Eigen::Vector4d rm = eval(d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]);
-        J.col(4 + k) = (rp - rm) / (2 * h);
-      }
+      J.block<3, 3>(0, 0) = -Ri.transpose();  // d r_t / d t_i
+      J.block<3, 1>(0, 3) = dt_dyawi;         // d r_t / d yaw_i
+      J.block<3, 3>(0, 4) = Ri.transpose();   // d r_t / d t_j
+      // d r_t / d yaw_j == 0 (t_j doesn't rotate through node j's yaw)
+      J(3, 3) = -1.0;  // d r_yaw / d yaw_i
+      J(3, 7) = 1.0;   // d r_yaw / d yaw_j
 
       int oi = param_offset(e.i);
       int oj = param_offset(e.j);
 
-      Eigen::Matrix<double, 4, 8> Jfull = J;
-
-      auto accumulate = [&](int off_a, int block_a, int off_b, int block_b) {
-        if (off_a < 0 || off_b < 0) return;
-        JtJ.block(off_a, off_b, 4, 4) +=
-            Jfull.block<4, 4>(0, block_a).transpose() *
-            Jfull.block<4, 4>(0, block_b);
-      };
+      Eigen::Matrix4d Jii = J.block<4, 4>(0, 0).transpose() * J.block<4, 4>(0, 0);
+      Eigen::Matrix4d Jjj = J.block<4, 4>(0, 4).transpose() * J.block<4, 4>(0, 4);
+      Eigen::Matrix4d Jij = J.block<4, 4>(0, 0).transpose() * J.block<4, 4>(0, 4);
 
       if (oi >= 0) {
-        JtJ.block(oi, oi, 4, 4) += Jfull.block<4, 4>(0, 0).transpose() *
-                                   Jfull.block<4, 4>(0, 0);
-        Jtr.segment(oi, 4) += Jfull.block<4, 4>(0, 0).transpose() * r;
+        add_block(oi, oi, Jii);
+        Jtr.segment(oi, 4) += J.block<4, 4>(0, 0).transpose() * r;
       }
       if (oj >= 0) {
-        JtJ.block(oj, oj, 4, 4) += Jfull.block<4, 4>(0, 4).transpose() *
-                                   Jfull.block<4, 4>(0, 4);
-        Jtr.segment(oj, 4) += Jfull.block<4, 4>(0, 4).transpose() * r;
+        add_block(oj, oj, Jjj);
+        Jtr.segment(oj, 4) += J.block<4, 4>(0, 4).transpose() * r;
       }
-      accumulate(oi, 0, oj, 4);
       if (oi >= 0 && oj >= 0) {
-        JtJ.block(oj, oi, 4, 4) = JtJ.block(oi, oj, 4, 4).transpose();
+        add_block(oi, oj, Jij);
+        add_block(oj, oi, Jij.transpose());
       }
     }
 
-    JtJ.diagonal().array() += lambda;
+    for (size_t k = 0; k < dim; k++)
+      triplets.emplace_back((int)k, (int)k, lambda);
 
-    Eigen::VectorXd dx = JtJ.ldlt().solve(-Jtr);
-    if (!dx.allFinite()) break;
+    Eigen::SparseMatrix<double> JtJ((long)dim, (long)dim);
+    JtJ.setFromTriplets(triplets.begin(), triplets.end());
+
+    Eigen::SimplicialLDLT<Eigen::SparseMatrix<double>> solver;
+    solver.compute(JtJ);
+    if (solver.info() != Eigen::Success) break;
+
+    Eigen::VectorXd dx = solver.solve(-Jtr);
+    if (solver.info() != Eigen::Success || !dx.allFinite()) break;
 
     for (size_t idx = 1; idx < n; idx++) {
       int off = param_offset(idx);
