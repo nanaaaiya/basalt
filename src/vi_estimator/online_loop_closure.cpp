@@ -75,6 +75,18 @@ constexpr double kStereoSecondBestTestRatio = 1.5;
 // purpose (NfrMapper::match_stereo(), src/vi_estimator/nfr_mapper.cpp).
 constexpr double kStereoEpipolarErrorThreshold = 1e-3;
 
+// Keyframe quality gate: minimum triangulated 3D points a keyframe needs
+// before it's allowed to become a future match TARGET (see processKeyframe()
+// below). Basalt's own keyframe-selection trigger (sqrt_keypoint_vio.cpp,
+// vio_new_kf_keypoints_thresh) is a pure motion/parallax heuristic -- it has
+// no concept of image quality, so keyframes arrive with wildly inconsistent
+// triangulation yield (observed anywhere from under 1% to 20%+ of detected
+// corners across a real session). Chosen from that same data: keyframes
+// that went on to succeed as loop-closure partners consistently had 30+ raw
+// triangulated points; ones that consistently failed to produce enough
+// PnP-ready matches almost always had well under 20-30.
+constexpr int kMinTriangulatedPointsForDatabase = 30;
+
 // Decompose R = Rz(yaw) * Ry(pitch) * Rx(roll). Assumes no gimbal lock
 // (pitch away from +-90 deg), a reasonable assumption for a handheld/mobile
 // device that isn't doing full vertical flips.
@@ -471,8 +483,22 @@ void OnlineLoopClosure::processKeyframe(const MargData::Ptr& data,
 
   auto t4 = std::chrono::steady_clock::now();
 
-  hash_bow_->add_to_database(TimeCamId(kf_id, 0),
-                             keyframes_.back().kd0.bow_vector);
+  // Quality gate (see kMinTriangulatedPointsForDatabase above): this
+  // keyframe still got a pose-graph node and a chance to QUERY against
+  // history above (we don't get to choose which frames Basalt hands us),
+  // but only keyframes with enough triangulated points are added as future
+  // match TARGETS, so a poor one can't poison later keyframes' candidate
+  // pool the way we saw happen repeatedly during live testing.
+  size_t num_pts3d = keyframes_.back().pts3d.size();
+  if ((int)num_pts3d >= kMinTriangulatedPointsForDatabase) {
+    hash_bow_->add_to_database(TimeCamId(kf_id, 0),
+                               keyframes_.back().kd0.bow_vector);
+  } else {
+    std::cout << "[ONLINE-LOOP] kf=" << (keyframes_.size() - 1)
+              << " excluded from candidate database (" << num_pts3d
+              << " triangulated points < " << kMinTriangulatedPointsForDatabase
+              << ")" << std::endl;
+  }
 
   auto t5 = std::chrono::steady_clock::now();
 
