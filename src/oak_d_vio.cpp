@@ -40,8 +40,10 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 // tools seeded/patched with known-good Kalibr values for this exact unit.
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <csignal>
 #include <ctime>
 #include <fstream>
 #include <iostream>
@@ -98,6 +100,20 @@ basalt::OnlineLoopClosure::Ptr online_loop_closure;
 
 using Button = pangolin::Var<std::function<void(void)>>;
 
+// Global (not local to main()) so the SIGINT/SIGTERM handler below can reach
+// it -- a plain signal handler can only touch process-wide state. Ctrl+C
+// used to kill the process instantly, skipping the shutdown block at the
+// end of main() (thread joins + write_trajectory_logs()), so no trajectory
+// log ever got written unless the Pangolin window was closed by hand
+// instead. Setting this flag and nudging Pangolin to quit makes Ctrl+C fall
+// through to that same clean-shutdown path.
+std::atomic<bool> terminate{false};
+
+void handle_shutdown_signal(int /*signum*/) {
+  terminate = true;
+  pangolin::QuitAll();
+}
+
 pangolin::DataLog imu_data_log, vio_data_log, error_data_log;
 pangolin::Plotter* plotter;
 
@@ -137,7 +153,9 @@ basalt::OpticalFlowBase::Ptr opt_flow_ptr;
 basalt::VioEstimatorBase::Ptr vio;
 
 int main(int argc, char** argv) {
-  bool terminate = false;
+  std::signal(SIGINT, handle_shutdown_signal);
+  std::signal(SIGTERM, handle_shutdown_signal);
+
   bool show_gui = true;
   bool print_queue = false;
   std::string cam_calib_path;
