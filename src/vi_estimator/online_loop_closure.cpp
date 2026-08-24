@@ -311,6 +311,19 @@ void OnlineLoopClosure::processKeyframe(const MargData::Ptr& data,
       kf.pts3d.push_back(point);
       kf.corner_to_pt3d[m.first] = pt_idx;
     }
+
+    // Diagnostic breakdown of *why* triangulated-point yield ends up where
+    // it does -- distinguishes "not enough corners detected" (texture/
+    // exposure problem) from "corners detected but stereo matching/
+    // epipolar verification rejects them" (matching/calibration problem)
+    // from "matches verified but triangulation itself fails" (cheirality/
+    // range-gate problem), instead of only knowing the final count.
+    std::cout << "[STEREO-DIAG] kf=" << keyframes_.size()
+              << " corners0=" << kf.kd0.corners.size()
+              << " corners1=" << kd1.corners.size()
+              << " raw_matches=" << md.matches.size()
+              << " epipolar_inliers=" << md.inliers.size()
+              << " triangulated=" << kf.pts3d.size() << std::endl;
   }
 
   auto t2 = std::chrono::steady_clock::now();
