@@ -669,6 +669,20 @@ Eigen::aligned_vector<Eigen::Vector3d> OnlineLoopClosure::getCorrectedTrajectory
   return out;
 }
 
+void OnlineLoopClosure::getCorrectedTrajectoryWithTimestamps(
+    std::vector<int64_t>& t_ns,
+    Eigen::aligned_vector<Eigen::Vector3d>& positions) const {
+  std::lock_guard<std::mutex> lock(state_mutex_);
+  t_ns.clear();
+  positions.clear();
+  t_ns.reserve(keyframes_.size());
+  positions.reserve(keyframes_.size());
+  for (const auto& kf : keyframes_) {
+    t_ns.push_back(kf.t_ns);
+    positions.push_back(kf.t_opt);
+  }
+}
+
 bool OnlineLoopClosure::getLatestCorrectedPose(Sophus::SE3d& out) const {
   std::lock_guard<std::mutex> lock(state_mutex_);
   if (keyframes_.empty()) return false;

@@ -42,6 +42,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
+#include <ctime>
 #include <fstream>
 #include <iostream>
 #include <memory>
@@ -66,6 +67,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <basalt/device/oak_d.h>
 #include <basalt/io/dataset_io.h>
 #include <basalt/io/marg_data_io.h>
+#include <basalt/utils/filesystem.h>
 #include <basalt/spline/se3_spline.h>
 #include <basalt/vi_estimator/online_loop_closure.h>
 #include <basalt/vi_estimator/vio_estimator.h>
@@ -82,6 +84,11 @@ void load_data(const std::string& calib_path);
 void draw_plots();
 void drain_vio_plot_queue();
 basalt::VioVisualizationData::Ptr get_curr_vis_data_snapshot();
+
+// Saves the raw and (if enabled) loop-closure-corrected trajectories to
+// disk, plus a summary with the start-to-end distance for each -- the
+// quantitative replacement for eyeballing drift off the live GUI.
+void write_trajectory_logs(const std::string& log_dir);
 
 // Pangolin variables
 constexpr int UI_WIDTH = 200;
@@ -157,10 +164,28 @@ int main(int argc, char** argv) {
   app.add_option("--online-loop-closure", online_loop_closure_enabled,
                  "Enable live loop-closure correction (see OnlineLoopClosure).");
 
+  // Default: a fresh timestamped folder per run, so repeated test runs
+  // don't clobber each other and can be compared later -- see
+  // writeTrajectoryLogs() for what actually gets written into it.
+  std::string log_dir;
+  app.add_option("--log-dir", log_dir,
+                 "Directory to save raw/corrected trajectories and a drift "
+                 "summary to on exit (default: ./run_logs/<timestamp>/).");
+
   try {
     app.parse(argc, argv);
   } catch (const CLI::ParseError& e) {
     return app.exit(e);
+  }
+
+  if (log_dir.empty()) {
+    auto now = std::chrono::system_clock::to_time_t(
+        std::chrono::system_clock::now());
+    std::tm tm_buf;
+    localtime_r(&now, &tm_buf);
+    char buf[64];
+    std::strftime(buf, sizeof(buf), "run_logs/%Y%m%d_%H%M%S", &tm_buf);
+    log_dir = buf;
   }
 
   // global thread limit is in effect until global_control object is destroyed
@@ -418,6 +443,8 @@ int main(int argc, char** argv) {
   t4.join();
   if (t5.get()) t5->join();
 
+  write_trajectory_logs(log_dir);
+
   return 0;
 }
 
@@ -555,6 +582,71 @@ void load_data(const std::string& calib_path) {
               << std::endl;
     std::abort();
   }
+}
+
+void write_trajectory_logs(const std::string& log_dir) {
+  basalt::fs::create_directories(log_dir);
+
+  std::vector<int64_t> raw_t_ns;
+  Eigen::aligned_vector<Eigen::Vector3d> raw_pos;
+  {
+    std::lock_guard<std::mutex> lock(vio_state_mutex);
+    raw_t_ns = vio_t_ns;
+    raw_pos = vio_t_w_i;
+  }
+
+  {
+    std::ofstream os(log_dir + "/raw_trajectory.txt");
+    os << "# t_ns x y z\n";
+    for (size_t i = 0; i < raw_pos.size(); i++) {
+      os << raw_t_ns[i] << " " << raw_pos[i].x() << " " << raw_pos[i].y()
+         << " " << raw_pos[i].z() << "\n";
+    }
+  }
+
+  double raw_drift = -1;
+  if (raw_pos.size() >= 2) raw_drift = (raw_pos.back() - raw_pos.front()).norm();
+
+  double corrected_drift = -1;
+  size_t num_corrected = 0;
+  int num_closures = 0;
+  if (online_loop_closure) {
+    std::vector<int64_t> corr_t_ns;
+    Eigen::aligned_vector<Eigen::Vector3d> corr_pos;
+    online_loop_closure->getCorrectedTrajectoryWithTimestamps(corr_t_ns,
+                                                               corr_pos);
+
+    std::ofstream os(log_dir + "/corrected_trajectory.txt");
+    os << "# t_ns x y z\n";
+    for (size_t i = 0; i < corr_pos.size(); i++) {
+      os << corr_t_ns[i] << " " << corr_pos[i].x() << " " << corr_pos[i].y()
+         << " " << corr_pos[i].z() << "\n";
+    }
+
+    num_corrected = corr_pos.size();
+    if (corr_pos.size() >= 2)
+      corrected_drift = (corr_pos.back() - corr_pos.front()).norm();
+    num_closures = online_loop_closure->numLoopClosures();
+  }
+
+  {
+    std::ofstream os(log_dir + "/summary.txt");
+    os << "raw_trajectory_points: " << raw_pos.size() << "\n";
+    os << "raw_start_to_end_distance_m: " << raw_drift << "\n";
+    if (online_loop_closure) {
+      os << "corrected_trajectory_points: " << num_corrected << "\n";
+      os << "corrected_start_to_end_distance_m: " << corrected_drift << "\n";
+      os << "num_loop_closures: " << num_closures << "\n";
+    }
+  }
+
+  std::cout << "[LOG] Saved trajectory logs to " << log_dir << "\n"
+            << "      raw start-to-end distance: " << raw_drift << " m";
+  if (online_loop_closure) {
+    std::cout << " | corrected: " << corrected_drift << " m (" << num_closures
+              << " closures)";
+  }
+  std::cout << std::endl;
 }
 
 basalt::VioVisualizationData::Ptr get_curr_vis_data_snapshot() {

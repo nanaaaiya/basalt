@@ -90,6 +90,14 @@ class OnlineLoopClosure {
   Eigen::aligned_vector<Eigen::Vector3d> getCorrectedTrajectory() const;
   bool getLatestCorrectedPose(Sophus::SE3d& out) const;
 
+  // Same as getCorrectedTrajectory(), but paired with each keyframe's
+  // timestamp -- needed for logging/analysis (matching timestamps up
+  // against the raw VIO trajectory, sample rate, etc.), not just drawing a
+  // line in the GUI.
+  void getCorrectedTrajectoryWithTimestamps(
+      std::vector<int64_t>& t_ns,
+      Eigen::aligned_vector<Eigen::Vector3d>& positions) const;
+
   int numLoopClosures() const { return num_loop_closures.load(); }
 
  private:
