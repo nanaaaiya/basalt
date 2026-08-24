@@ -88,13 +88,21 @@ constexpr double kStereoEpipolarErrorThreshold = 1e-3;
 // PnP-ready matches to pass, no matter how good the descriptor matching is
 // (pnp_ready_points is upper-bounded by the partner's own triangulated
 // count), so anything below that floor is a pure waste, not a real chance.
-// Lowered from 30 to 15 -- a real reduction while staying just above that
-// hard floor, giving headroom for the imperfect overlap between "matched"
-// and "triangulated" corners without accepting mathematically-doomed
-// candidates. If Pi5 hardware instability keeps triangulation near-zero
-// regardless, this alone won't fix it -- that's a data-quality problem no
-// database threshold can compensate for.
-constexpr int kMinTriangulatedPointsForDatabase = 15;
+//
+// History: 30 (initial) -> 15 (too strict, excluded almost everything on
+// Pi5) -> 25 (current). 15 let through partners whose triangulated points
+// were sparse/marginal -- still numerically able to clear
+// mapper_min_matches, but a thin or poorly-distributed point set can give
+// RANSAC/PnP a badly-conditioned problem, producing a pose that passes
+// verification while still being meaningfully wrong. A *wrong* accepted
+// closure is worse than a missed one -- it actively pulls the trajectory
+// off, rather than just failing to correct it. 25 is a deliberate partial
+// revert to isolate whether this specific gate was the dominant cause of
+// the increased drift observed after the previous set of loosenings,
+// before touching the other thresholds. If Pi5 hardware instability keeps
+// triangulation near-zero regardless, this alone won't fix it -- that's a
+// data-quality problem no database threshold can compensate for.
+constexpr int kMinTriangulatedPointsForDatabase = 25;
 
 // Decompose R = Rz(yaw) * Ry(pitch) * Rx(roll). Assumes no gimbal lock
 // (pitch away from +-90 deg), a reasonable assumption for a handheld/mobile
