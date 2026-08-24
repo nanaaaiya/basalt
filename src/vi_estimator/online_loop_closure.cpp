@@ -104,6 +104,21 @@ constexpr double kStereoEpipolarErrorThreshold = 1e-3;
 // data-quality problem no database threshold can compensate for.
 constexpr int kMinTriangulatedPointsForDatabase = 25;
 
+// Cap on how many BoW candidates get the FULL verification treatment
+// (countMatchStages + matchDescriptors, both O(corners0 x corners_partner)
+// brute-force Hamming searches, plus PnP-RANSAC) per keyframe. Measured
+// live on a long (~90s, ~370-keyframe) session: loop_candidate_search cost
+// grew from <1ms early on to 100-235ms once the database was rich enough
+// that most keyframes had all mapper_num_frames_to_match (30) candidates
+// clear the BoW threshold -- with ~450 corners/keyframe (since the
+// epipolar-matching fix), verifying all 30 in the worst case (no early
+// success) meant tens of millions of comparisons per keyframe, enough to
+// exceed the ~230ms real keyframe arrival interval and make the background
+// thread fall behind real time. BoW candidates are already score-sorted,
+// so only trying the most-similar few first sacrifices little recall while
+// bounding worst-case cost regardless of how large/rich the database gets.
+constexpr size_t kMaxCandidatesToVerify = 5;
+
 // Decompose R = Rz(yaw) * Ry(pitch) * Rx(roll). Assumes no gimbal lock
 // (pitch away from +-90 deg), a reasonable assumption for a handheld/mobile
 // device that isn't doing full vertical flips.
@@ -407,6 +422,16 @@ void OnlineLoopClosure::processKeyframe(const MargData::Ptr& data,
     for (const auto& cand : results) {
       if (cand.second >= config_.mapper_frames_to_match_threshold)
         above_threshold.push_back(cand);
+    }
+
+    // Only fully verify the top kMaxCandidatesToVerify by BoW score (see
+    // constant comment above) -- results from querry_database() are only
+    // guaranteed sorted when it truncated internally, so re-sort here to be
+    // safe rather than assume that in all cases.
+    std::sort(above_threshold.begin(), above_threshold.end(),
+             [](const auto& a, const auto& b) { return a.second > b.second; });
+    if (above_threshold.size() > kMaxCandidatesToVerify) {
+      above_threshold.resize(kMaxCandidatesToVerify);
     }
 
     size_t this_kf_display_id = keyframes_.size();
