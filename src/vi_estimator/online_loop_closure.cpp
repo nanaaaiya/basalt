@@ -158,6 +158,68 @@ void countMatchStages(const std::vector<std::bitset<256>>& d1,
   }
 }
 
+// Stereo-specific matcher that exploits the one piece of information plain
+// matchDescriptors() doesn't use: for a rigidly-mounted, calibrated stereo
+// pair, the relative pose is known exactly, so a true correspondence MUST
+// lie on the known epipolar line. matchDescriptors() instead ranks
+// candidates by descriptor similarity across the WHOLE other image and only
+// checks epipolar geometry afterward (findInliersEssential) -- measured live
+// on real data, this let ~420 corners per camera collapse to only ~43 raw
+// matches and then just ~7 epipolar inliers: in a real room with
+// repetitive-looking corners (tile grout, door frames, cable runs), the
+// globally best-looking Hamming match is very often the WRONG corner
+// elsewhere in the frame, which the TRUE corresponding corner (a worse but
+// still legitimate Hamming score) then loses to and never gets a chance to
+// be tried against. Restricting the candidate pool to epipolar-consistent
+// corners BEFORE ranking by Hamming distance fixes that failure mode
+// directly, instead of only discovering the loss after the fact.
+void matchStereoEpipolar(const KeypointsData& kd0, const KeypointsData& kd1,
+                         const Eigen::Matrix4d& E,
+                         double epipolar_error_threshold, int hamming_threshold,
+                         double ratio_threshold,
+                         std::vector<std::pair<int, int>>& matches) {
+  matches.clear();
+
+  auto search = [&](const KeypointsData& a, const KeypointsData& b,
+                    bool a_is_first, std::unordered_map<int, int>& out) {
+    for (size_t i = 0; i < a.corner_descriptors.size(); i++) {
+      int best_idx = -1, best_dist = 500, best2_dist = 500;
+      for (size_t j = 0; j < b.corner_descriptors.size(); j++) {
+        double epi_err =
+            a_is_first
+                ? std::abs(a.corners_3d[i].transpose() * E * b.corners_3d[j])
+                : std::abs(b.corners_3d[j].transpose() * E * a.corners_3d[i]);
+        if (epi_err > epipolar_error_threshold) continue;
+
+        int dist =
+            (int)(a.corner_descriptors[i] ^ b.corner_descriptors[j]).count();
+        if (dist <= best_dist) {
+          best2_dist = best_dist;
+          best_dist = dist;
+          best_idx = (int)j;
+        } else if (dist < best2_dist) {
+          best2_dist = dist;
+        }
+      }
+      if (best_idx >= 0 && best_dist < hamming_threshold &&
+          best_dist * ratio_threshold <= best2_dist) {
+        out.emplace((int)i, best_idx);
+      }
+    }
+  };
+
+  std::unordered_map<int, int> m01, m10;
+  search(kd0, kd1, true, m01);
+  search(kd1, kd0, false, m10);
+
+  for (const auto& kv : m01) {
+    auto it = m10.find(kv.second);
+    if (it != m10.end() && it->second == kv.first) {
+      matches.emplace_back(kv.first, kv.second);
+    }
+  }
+}
+
 // Midpoint-of-closest-approach triangulation of two rays given in a common
 // frame: ray0 from origin O0=0 with direction d0, ray1 from origin O1 with
 // direction d1 (both normalized). Returns false if the rays are near-
@@ -279,21 +341,23 @@ void OnlineLoopClosure::processKeyframe(const MargData::Ptr& data,
     Sophus::SE3d T_c0_c1 = calib_.T_i_c[0].inverse() * calib_.T_i_c[1];
     Eigen::Vector3d O1 = T_c0_c1.translation();
 
-    // Deliberately loose descriptor matching here (see kStereo* constants
-    // above) -- safe because every match gets verified next against the
-    // exact, known epipolar geometry between our two calibrated cameras, a
-    // much stronger check than descriptor similarity alone (and one
-    // temporal/cross-time matching below doesn't get to use, since we
-    // don't know the relative pose between two arbitrary past keyframes in
-    // advance -- that's the whole point of PnP-RANSAC there).
-    MatchData md;
-    matchDescriptors(kf.kd0.corner_descriptors, kd1.corner_descriptors,
-                     md.matches, kStereoMaxHammingDistance,
-                     kStereoSecondBestTestRatio);
-
+    // Epipolar-constrained matching (see matchStereoEpipolar() above) --
+    // candidates are restricted to the known epipolar line BEFORE ranking
+    // by descriptor similarity, rather than searching the whole image and
+    // only checking geometry afterward. md.inliers == md.matches here by
+    // construction, since every candidate already satisfied the epipolar
+    // check during the search itself (unlike temporal/cross-time matching
+    // below, which can't do this -- we don't know the relative pose
+    // between two arbitrary past keyframes in advance, that's the whole
+    // point of PnP-RANSAC there).
     Eigen::Matrix4d E;
     computeEssential(T_c0_c1, E);
-    findInliersEssential(kf.kd0, kd1, E, kStereoEpipolarErrorThreshold, md);
+
+    MatchData md;
+    matchStereoEpipolar(kf.kd0, kd1, E, kStereoEpipolarErrorThreshold,
+                        kStereoMaxHammingDistance, kStereoSecondBestTestRatio,
+                        md.matches);
+    md.inliers = md.matches;
 
     for (const auto& m : md.inliers) {
       Eigen::Vector4d b0h, b1h;
