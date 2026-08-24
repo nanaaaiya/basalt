@@ -114,6 +114,35 @@ void handle_shutdown_signal(int /*signum*/) {
   pangolin::QuitAll();
 }
 
+// Duplicates every byte written to it into two underlying streambufs --
+// used to mirror stdout/stderr into a console.log file inside
+// run_logs/<timestamp>/ while still printing live to the terminal.
+// Post-run analysis needs the actual [ONLINE-LOOP] per-keyframe decision
+// log, not just the trajectory numbers, so this makes that automatic
+// instead of relying on remembering to add `| tee` on the command line.
+class TeeStreambuf : public std::streambuf {
+ public:
+  TeeStreambuf(std::streambuf* a, std::streambuf* b) : a_(a), b_(b) {}
+
+ protected:
+  int overflow(int c) override {
+    if (c == EOF) return !EOF;
+    bool ok_a = a_->sputc(static_cast<char>(c)) != EOF;
+    bool ok_b = b_->sputc(static_cast<char>(c)) != EOF;
+    return (ok_a && ok_b) ? c : EOF;
+  }
+
+  int sync() override {
+    int ra = a_->pubsync();
+    int rb = b_->pubsync();
+    return (ra == 0 && rb == 0) ? 0 : -1;
+  }
+
+ private:
+  std::streambuf* a_;
+  std::streambuf* b_;
+};
+
 pangolin::DataLog imu_data_log, vio_data_log, error_data_log;
 pangolin::Plotter* plotter;
 
@@ -204,6 +233,24 @@ int main(int argc, char** argv) {
     char buf[64];
     std::strftime(buf, sizeof(buf), "run_logs/%Y%m%d_%H%M%S", &tm_buf);
     log_dir = buf;
+  }
+
+  basalt::fs::create_directories(log_dir);
+
+  std::ofstream console_log_file(log_dir + "/console.log");
+  std::streambuf* orig_cout_buf = std::cout.rdbuf();
+  std::streambuf* orig_cerr_buf = std::cerr.rdbuf();
+  std::unique_ptr<TeeStreambuf> tee_cout, tee_cerr;
+  if (console_log_file.is_open()) {
+    tee_cout.reset(new TeeStreambuf(orig_cout_buf, console_log_file.rdbuf()));
+    tee_cerr.reset(new TeeStreambuf(orig_cerr_buf, console_log_file.rdbuf()));
+    std::cout.rdbuf(tee_cout.get());
+    std::cerr.rdbuf(tee_cerr.get());
+  } else {
+    std::cerr << "Warning: could not open " << log_dir
+              << "/console.log for writing; console output will not be "
+                 "saved for this run."
+              << std::endl;
   }
 
   // global thread limit is in effect until global_control object is destroyed
@@ -462,6 +509,9 @@ int main(int argc, char** argv) {
   if (t5.get()) t5->join();
 
   write_trajectory_logs(log_dir);
+
+  std::cout.rdbuf(orig_cout_buf);
+  std::cerr.rdbuf(orig_cerr_buf);
 
   return 0;
 }
