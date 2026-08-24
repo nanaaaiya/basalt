@@ -81,11 +81,20 @@ constexpr double kStereoEpipolarErrorThreshold = 1e-3;
 // vio_new_kf_keypoints_thresh) is a pure motion/parallax heuristic -- it has
 // no concept of image quality, so keyframes arrive with wildly inconsistent
 // triangulation yield (observed anywhere from under 1% to 20%+ of detected
-// corners across a real session). Chosen from that same data: keyframes
-// that went on to succeed as loop-closure partners consistently had 30+ raw
-// triangulated points; ones that consistently failed to produce enough
-// PnP-ready matches almost always had well under 20-30.
-constexpr int kMinTriangulatedPointsForDatabase = 30;
+// corners across a real session).
+//
+// This must never go below mapper_min_matches (currently 13): a partner
+// with fewer triangulated points than that can *never* produce enough
+// PnP-ready matches to pass, no matter how good the descriptor matching is
+// (pnp_ready_points is upper-bounded by the partner's own triangulated
+// count), so anything below that floor is a pure waste, not a real chance.
+// Lowered from 30 to 15 -- a real reduction while staying just above that
+// hard floor, giving headroom for the imperfect overlap between "matched"
+// and "triangulated" corners without accepting mathematically-doomed
+// candidates. If Pi5 hardware instability keeps triangulation near-zero
+// regardless, this alone won't fix it -- that's a data-quality problem no
+// database threshold can compensate for.
+constexpr int kMinTriangulatedPointsForDatabase = 15;
 
 // Decompose R = Rz(yaw) * Ry(pitch) * Rx(roll). Assumes no gimbal lock
 // (pitch away from +-90 deg), a reasonable assumption for a handheld/mobile
