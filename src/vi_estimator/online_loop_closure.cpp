@@ -48,6 +48,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 #include <opengv/absolute_pose/CentralAbsoluteAdapter.hpp>
+#include <opengv/absolute_pose/methods.hpp>
 #include <opengv/sac/Ransac.hpp>
 #include <opengv/sac_problems/absolute_pose/AbsolutePoseSacProblem.hpp>
 #pragma GCC diagnostic pop
@@ -525,6 +526,23 @@ void OnlineLoopClosure::processKeyframe(const MargData::Ptr& data,
       ransac.threshold_ = config_.mapper_ransac_threshold;
       ransac.max_iterations_ = 100;
       ransac.computeModel();
+
+      // Non-linear refinement over all RANSAC inliers -- mirrors the
+      // pattern already used for the relative-pose case in
+      // findInliersRansac() (src/utils/keypoints.cpp). RANSAC's model comes
+      // from whichever minimal random subset scored best during search, not
+      // a least-squares-optimal fit over every inlier; this refines it and
+      // re-selects inliers against the refined model, same as the existing
+      // relative-pose pattern.
+      if (!ransac.inliers_.empty()) {
+        adapter.sett(ransac.model_coefficients_.topRightCorner<3, 1>());
+        adapter.setR(ransac.model_coefficients_.topLeftCorner<3, 3>());
+        opengv::transformation_t refined =
+            opengv::absolute_pose::optimize_nonlinear(adapter, ransac.inliers_);
+        ransac.sac_model_->selectWithinDistance(refined, ransac.threshold_,
+                                                ransac.inliers_);
+        ransac.model_coefficients_ = refined;
+      }
 
       Eigen::Vector3d ransac_t =
           ransac.model_coefficients_.topRightCorner<3, 1>();
