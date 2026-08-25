@@ -152,6 +152,14 @@ class OnlineLoopClosure {
     size_t i, j;
     Eigen::Vector3d dt;
     double dyaw;
+    // Relative confidence of this edge's measurement, applied as a scalar
+    // weight on its residual in the solve (equivalent to scaling its
+    // information matrix). Odometry edges keep the default 1.0; loop edges
+    // get inlier_count / mapper_min_matches (clamped), so a well-supported
+    // closure pulls the graph harder than one that barely cleared the
+    // acceptance floor -- previously every edge was weighted identically
+    // regardless of how many inliers actually backed it.
+    double weight = 1.0;
   };
 
   void processingLoop();

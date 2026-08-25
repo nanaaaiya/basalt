@@ -85,6 +85,7 @@ void draw_scene();
 void load_data(const std::string& calib_path);
 void draw_plots();
 void drain_vio_plot_queue();
+void drain_localization_queue();
 basalt::VioVisualizationData::Ptr get_curr_vis_data_snapshot();
 
 // Saves the raw and (if enabled) loop-closure-corrected trajectories to
@@ -166,6 +167,16 @@ tbb::concurrent_bounded_queue<basalt::PoseVelBiasState<double>::Ptr>
 
 std::vector<int64_t> vio_t_ns;
 Eigen::aligned_vector<Eigen::Vector3d> vio_t_w_i;
+
+// Latest verified visual-match localization result (see LocalizationResult
+// in online_loop_closure.h), drained from online_loop_closure->
+// localization_queue once per render frame -- both the drain and the draw
+// happen on this same single GUI thread, so no locking is needed, same as
+// the vio_data_log/imu_data_log pattern below. Gives immediate feedback on
+// a small "look at a known place" test without needing a full corrected-
+// trajectory drift readout.
+bool has_localization = false;
+basalt::LocalizationResult latest_localization;
 
 std::string marg_data_path;
 
@@ -442,6 +453,7 @@ int main(int argc, char** argv) {
 
     while (!pangolin::ShouldQuit()) {
       drain_vio_plot_queue();
+      drain_localization_queue();
 
       glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
@@ -585,6 +597,29 @@ void draw_image_overlay(pangolin::View& v, size_t cam_id) {
             .Text("corrected: x % .3f  y % .3f  z % .3f (loops: %d)", pc.x(),
                   pc.y(), pc.z(), online_loop_closure->numLoopClosures())
             .Draw(5, 420);
+      }
+
+      // Latest single verified match, shown independently of the
+      // pose-graph-corrected line above -- lets a quick "look at a place
+      // you've been before" test show a result immediately, without doing
+      // a full walk-and-return and reading drift off the trajectory log.
+      if (has_localization) {
+        Eigen::Vector3d rel_t =
+            latest_localization.T_reference_current.translation();
+        int64_t t0;
+        {
+          std::lock_guard<std::mutex> lock(vio_state_mutex);
+          t0 = curr_t_ns;
+        }
+        double ref_age_s =
+            t0 >= 0 ? (latest_localization.reference_t_ns - t0) * 1e-9 : 0.0;
+        glColor3f(1.0, 0.5, 0.0);
+        pangolin::default_font()
+            .Text(
+                "localize: ref@%.1fs  rel_t=[% .3f % .3f % .3f]  inliers=%d",
+                ref_age_s, rel_t.x(), rel_t.y(), rel_t.z(),
+                latest_localization.num_inliers)
+            .Draw(5, 400);
       }
     }
   }
@@ -775,5 +810,14 @@ void drain_vio_plot_queue() {
   std::vector<float> vals;
   while (vio_plot_queue.try_pop(vals)) {
     vio_data_log.Log(vals);
+  }
+}
+
+void drain_localization_queue() {
+  if (!online_loop_closure) return;
+  basalt::LocalizationResult loc;
+  while (online_loop_closure->localization_queue.try_pop(loc)) {
+    latest_localization = loc;
+    has_localization = true;
   }
 }

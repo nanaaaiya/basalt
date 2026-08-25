@@ -413,6 +413,7 @@ void OnlineLoopClosure::processKeyframe(const MargData::Ptr& data,
   bool have_loop = false;
   size_t loop_partner_idx = 0;
   Sophus::SE3d T_body_partner_new;
+  int loop_num_inliers = 0;
 
   {
     std::vector<std::pair<TimeCamId, double>> results;
@@ -583,6 +584,7 @@ void OnlineLoopClosure::processKeyframe(const MargData::Ptr& data,
             partner->t_opt);
         loc.T_w_current = T_w_reference_corrected * T_body_partner_new;
         loc.num_inliers = (int)ransac.inliers_.size();
+        loop_num_inliers = loc.num_inliers;
         localization_queue.try_push(loc);
       }
 
@@ -626,6 +628,14 @@ void OnlineLoopClosure::processKeyframe(const MargData::Ptr& data,
       double r, p, y;
       decomposeYPR(T_body_partner_new.rotationMatrix(), r, p, y);
       e.dyaw = y;
+      // See PoseGraphEdge::weight comment (online_loop_closure.h) -- a
+      // closure that just barely cleared mapper_min_matches gets the same
+      // baseline trust as an odometry edge (weight 1.0); one with several
+      // times as many inliers pulls proportionally harder, capped at 5x so
+      // a single very-strong match can't dominate the graph unboundedly.
+      e.weight = std::clamp(
+          loop_num_inliers / std::max(1.0, config_.mapper_min_matches), 1.0,
+          5.0);
       edges_.push_back(e);
 
       num_loop_closures++;
@@ -760,17 +770,24 @@ void OnlineLoopClosure::solvePoseGraph() {
       int oi = param_offset(e.i);
       int oj = param_offset(e.j);
 
-      Eigen::Matrix4d Jii = J.block<4, 4>(0, 0).transpose() * J.block<4, 4>(0, 0);
-      Eigen::Matrix4d Jjj = J.block<4, 4>(0, 4).transpose() * J.block<4, 4>(0, 4);
-      Eigen::Matrix4d Jij = J.block<4, 4>(0, 0).transpose() * J.block<4, 4>(0, 4);
+      // Scaling the per-edge contribution by e.weight before accumulation
+      // is equivalent to minimizing sum_e weight_e * ||r_e||^2 -- the
+      // normal equations become sum_e w_e * J_e^T J_e * dx = -sum_e w_e *
+      // J_e^T r_e, same Gauss-Newton derivation as before, just weighted.
+      Eigen::Matrix4d Jii =
+          e.weight * J.block<4, 4>(0, 0).transpose() * J.block<4, 4>(0, 0);
+      Eigen::Matrix4d Jjj =
+          e.weight * J.block<4, 4>(0, 4).transpose() * J.block<4, 4>(0, 4);
+      Eigen::Matrix4d Jij =
+          e.weight * J.block<4, 4>(0, 0).transpose() * J.block<4, 4>(0, 4);
 
       if (oi >= 0) {
         add_block(oi, oi, Jii);
-        Jtr.segment(oi, 4) += J.block<4, 4>(0, 0).transpose() * r;
+        Jtr.segment(oi, 4) += e.weight * J.block<4, 4>(0, 0).transpose() * r;
       }
       if (oj >= 0) {
         add_block(oj, oj, Jjj);
-        Jtr.segment(oj, 4) += J.block<4, 4>(0, 4).transpose() * r;
+        Jtr.segment(oj, 4) += e.weight * J.block<4, 4>(0, 4).transpose() * r;
       }
       if (oi >= 0 && oj >= 0) {
         add_block(oi, oj, Jij);
