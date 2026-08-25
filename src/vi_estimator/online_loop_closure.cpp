@@ -266,6 +266,7 @@ OnlineLoopClosure::OnlineLoopClosure(const Calibration<double>& calib,
     : calib_(calib), config_(config) {
   hash_bow_.reset(new HashBow<256>(config_.mapper_bow_num_bits));
   input_queue.set_capacity(1000);
+  localization_queue.set_capacity(1000);
 }
 
 OnlineLoopClosure::~OnlineLoopClosure() { stop(); }
@@ -546,6 +547,26 @@ void OnlineLoopClosure::processKeyframe(const MargData::Ptr& data,
       loop_partner_idx = partner_idx;
       T_body_partner_new =
           calib_.T_i_c[0] * T_partnerCam_newCam * calib_.T_i_c[0].inverse();
+
+      // Publish the localization result immediately -- before the
+      // pose-graph insertion/solve below -- so consumers that need "where
+      // am I now" (navigation, RTL) don't have to wait on the potentially
+      // slower global solve. Composed against the reference keyframe's
+      // current CORRECTED pose (already reflecting any earlier loop
+      // closures), not its raw VIO pose, so T_w_current is already
+      // globally-consistent without needing a fresh solve first.
+      {
+        LocalizationResult loc;
+        loc.t_ns = kf_id;
+        loc.reference_t_ns = partner_t_ns;
+        loc.T_reference_current = T_body_partner_new;
+        Sophus::SE3d T_w_reference_corrected(
+            composeYPR(partner->roll, partner->pitch, partner->yaw),
+            partner->t_opt);
+        loc.T_w_current = T_w_reference_corrected * T_body_partner_new;
+        loc.num_inliers = (int)ransac.inliers_.size();
+        localization_queue.try_push(loc);
+      }
 
       std::cout << "              RESULT: ACCEPTED (loop closure #"
                 << (num_loop_closures.load() + 1) << ")" << std::endl;

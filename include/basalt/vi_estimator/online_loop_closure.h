@@ -72,6 +72,25 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 namespace basalt {
 
+// Result of a single verified visual match against a historical keyframe --
+// published the moment PnP-RANSAC succeeds, before pose-graph insertion or
+// solving happens. Answers "given this known reference keyframe, where am I
+// NOW?" for consumers (navigation, RTL) that need the freshest possible
+// localization and shouldn't have to wait for a global pose-graph solve.
+struct LocalizationResult {
+  int64_t t_ns = 0;                  // current keyframe's timestamp
+  int64_t reference_t_ns = 0;        // matched historical keyframe's timestamp
+  Sophus::SE3d T_reference_current;  // reference body frame -> current body
+                                      // frame (the raw relative-pose measurement)
+  Sophus::SE3d T_w_current;          // world frame -> current body frame,
+                                      // composed with the reference keyframe's
+                                      // current CORRECTED pose (not raw), so
+                                      // this already reflects any earlier
+                                      // pose-graph corrections without waiting
+                                      // for a fresh solve
+  int num_inliers = 0;
+};
+
 class OnlineLoopClosure {
  public:
   using Ptr = std::shared_ptr<OnlineLoopClosure>;
@@ -81,6 +100,11 @@ class OnlineLoopClosure {
 
   // Feed this from vio->out_marg_queue.
   tbb::concurrent_bounded_queue<MargData::Ptr> input_queue;
+
+  // Published immediately on every successful verified match -- see
+  // LocalizationResult above. Non-blocking on the producer side (try_push),
+  // so a slow/absent consumer never stalls keyframe processing.
+  tbb::concurrent_bounded_queue<LocalizationResult> localization_queue;
 
   void start();
   void stop();
