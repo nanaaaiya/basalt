@@ -175,13 +175,14 @@ class OnlineLoopClosure {
   std::unordered_map<int64_t, size_t> t_ns_to_idx_;
   std::vector<PoseGraphEdge> edges_;
 
-  // Keyframe-storage distance gate state (see
-  // config_.mapper_min_keyframe_storage_dist): position (raw VIO estimate)
-  // of the last keyframe actually added to the match database, so the next
-  // candidate's distance can be measured against it rather than against
-  // every keyframe Basalt hands us (most of which never get stored at all).
-  Eigen::Vector3d last_stored_raw_position_ = Eigen::Vector3d::Zero();
-  bool has_stored_any_ = false;
+  // Timestamp of the very first keyframe this instance ever processed,
+  // captured unconditionally (bypassing the normal quality gate) as a
+  // dedicated "home" reference for a future takeoff-point revisit check --
+  // not consumed anywhere yet, but costs nothing to track now and avoids
+  // the alternative of only having a home reference if the first keyframe
+  // happens to also clear the quality bar (plausible to fail right at
+  // startup, camera still settling).
+  int64_t home_keyframe_t_ns_ = -1;
 
   mutable std::mutex state_mutex_;
   std::atomic<int> num_loop_closures{0};

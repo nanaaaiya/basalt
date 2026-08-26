@@ -106,13 +106,6 @@ struct VioConfig {
   bool mapper_use_lm;
   double mapper_lm_lambda_min;
   double mapper_lm_lambda_max;
-
-  // Online loop-closure keyframe-storage gate (see OnlineLoopClosure): a
-  // keyframe that already passed the triangulated-point quality gate must
-  // also be at least this far (raw VIO estimate, meters) from the last
-  // STORED keyframe to become a future match target. Default 0.5 is a
-  // placeholder starting point, not a tuned value.
-  double mapper_min_keyframe_storage_dist;
 };
 
 }  // namespace basalt

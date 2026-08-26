@@ -107,8 +107,6 @@ VioConfig::VioConfig() {
   mapper_use_lm = false;
   mapper_lm_lambda_min = 1e-32;
   mapper_lm_lambda_max = 1e2;
-
-  mapper_min_keyframe_storage_dist = 0.5;
 }
 
 void VioConfig::save(const std::string& filename) {
@@ -220,7 +218,5 @@ void serialize(Archive& ar, basalt::VioConfig& config) {
   ar(CEREAL_NVP(config.mapper_use_lm));
   ar(CEREAL_NVP(config.mapper_lm_lambda_min));
   ar(CEREAL_NVP(config.mapper_lm_lambda_max));
-
-  ar(CEREAL_NVP(config.mapper_min_keyframe_storage_dist));
 }
 }  // namespace cereal
