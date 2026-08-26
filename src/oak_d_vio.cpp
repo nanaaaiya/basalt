@@ -671,17 +671,35 @@ void draw_scene() {
 
   auto vis_data = get_curr_vis_data_snapshot();
   if (vis_data.get()) {
-    for (const auto& p : vis_data->states)
-      for (const auto& t_i_c : calib.T_i_c)
-        render_camera((p * t_i_c).matrix(), 2.0f, state_color, 0.1f);
+    if (show_raw_traj) {
+      for (const auto& p : vis_data->states)
+        for (const auto& t_i_c : calib.T_i_c)
+          render_camera((p * t_i_c).matrix(), 2.0f, state_color, 0.1f);
 
-    for (const auto& p : vis_data->frames)
-      for (const auto& t_i_c : calib.T_i_c)
-        render_camera((p * t_i_c).matrix(), 2.0f, pose_color, 0.1f);
+      for (const auto& p : vis_data->frames)
+        for (const auto& t_i_c : calib.T_i_c)
+          render_camera((p * t_i_c).matrix(), 2.0f, pose_color, 0.1f);
 
-    for (const auto& t_i_c : calib.T_i_c)
-      render_camera((vis_data->states.back() * t_i_c).matrix(), 2.0f, cam_color,
-                    0.1f);
+      for (const auto& t_i_c : calib.T_i_c)
+        render_camera((vis_data->states.back() * t_i_c).matrix(), 2.0f,
+                      cam_color, 0.1f);
+    }
+
+    // "You are here" marker at the CORRECTED pose, matching the blue line
+    // and the HUD's corrected:/localize: numbers -- without this, the only
+    // drawn camera icon was always the raw pose (cam_color, above), which
+    // can sit meters away from the corrected pose right after a big loop
+    // closure snap and looks like the marker "teleported" relative to what
+    // the screen otherwise reports.
+    if (online_loop_closure) {
+      static const uint8_t corrected_cam_color[3]{0, 128, 255};
+      Sophus::SE3d T_w_i_corrected;
+      if (online_loop_closure->getLatestCorrectedPose(T_w_i_corrected)) {
+        for (const auto& t_i_c : calib.T_i_c)
+          render_camera((T_w_i_corrected * t_i_c).matrix(), 2.0f,
+                        corrected_cam_color, 0.1f);
+      }
+    }
 
     glColor3ubv(pose_color);
     pangolin::glDrawPoints(vis_data->points);
