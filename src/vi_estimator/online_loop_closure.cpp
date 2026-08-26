@@ -39,6 +39,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <chrono>
 #include <cmath>
 #include <iostream>
+#include <limits>
 
 #include <Eigen/Sparse>
 #include <Eigen/SparseCholesky>
@@ -677,15 +678,46 @@ void OnlineLoopClosure::processKeyframe(const MargData::Ptr& data,
   // but only keyframes with enough triangulated points are added as future
   // match TARGETS, so a poor one can't poison later keyframes' candidate
   // pool the way we saw happen repeatedly during live testing.
+  //
+  // Distance gate (config_.mapper_min_keyframe_storage_dist, Step 4 of the
+  // visual-localization/RTL proposal): a keyframe that clears the quality
+  // gate must ALSO be far enough (raw VIO estimate) from the last STORED
+  // keyframe to be added. Without this, keyframes get stored roughly every
+  // ~230ms of motion (near-continuous), producing a database far denser
+  // than needed for matching and, more importantly for RTL, too large to
+  // route waypoints through. Caveat: this measures distance from the raw,
+  // potentially-drifting VIO estimate -- acceptable here because it's a
+  // LOCAL delta since the last stored keyframe (seconds/meters), not a
+  // global position, so accumulated drift over that short an interval
+  // should be small; worth confirming empirically rather than assuming.
   size_t num_pts3d = keyframes_.back().pts3d.size();
-  if ((int)num_pts3d >= kMinTriangulatedPointsForDatabase) {
+  bool quality_ok = (int)num_pts3d >= kMinTriangulatedPointsForDatabase;
+  double dist_since_last_stored =
+      has_stored_any_
+          ? (T_w_i_raw.translation() - last_stored_raw_position_).norm()
+          : std::numeric_limits<double>::infinity();
+  bool distance_ok =
+      !has_stored_any_ ||
+      dist_since_last_stored >= config_.mapper_min_keyframe_storage_dist;
+
+  if (quality_ok && distance_ok) {
     hash_bow_->add_to_database(TimeCamId(kf_id, 0),
                                keyframes_.back().kd0.bow_vector);
+    last_stored_raw_position_ = T_w_i_raw.translation();
+    has_stored_any_ = true;
   } else {
     std::cout << "[ONLINE-LOOP] kf=" << (keyframes_.size() - 1)
-              << " excluded from candidate database (" << num_pts3d
-              << " triangulated points < " << kMinTriangulatedPointsForDatabase
-              << ")" << std::endl;
+              << " excluded from candidate database (";
+    if (!quality_ok) {
+      std::cout << num_pts3d << " triangulated points < "
+                << kMinTriangulatedPointsForDatabase;
+    }
+    if (!quality_ok && !distance_ok) std::cout << "; ";
+    if (!distance_ok) {
+      std::cout << dist_since_last_stored << "m since last stored < "
+                << config_.mapper_min_keyframe_storage_dist << "m";
+    }
+    std::cout << ")" << std::endl;
   }
 
   auto t5 = std::chrono::steady_clock::now();

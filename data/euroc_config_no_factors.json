@@ -51,6 +51,7 @@
         "config.mapper_use_factors": false,
         "config.mapper_use_lm": true,
         "config.mapper_lm_lambda_min": 1e-32,
-        "config.mapper_lm_lambda_max": 1e3
+        "config.mapper_lm_lambda_max": 1e3,
+        "config.mapper_min_keyframe_storage_dist": 0.5
     }
 }
