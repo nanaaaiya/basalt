@@ -528,6 +528,28 @@ void OnlineLoopClosure::processKeyframe(const MargData::Ptr& data,
       ransac.max_iterations_ = 100;
       ransac.computeModel();
 
+      // Reject on the RAW RANSAC inlier count *before* refining -- measured
+      // live (~600-keyframe Pi5 session): opengv's optimize_nonlinear() is a
+      // numeric-difference Levenberg-Marquardt optimizer (not analytic),
+      // capped internally at 1000 function evaluations with very tight
+      // tolerances, and its cost varies wildly with convergence difficulty
+      // rather than point count (observed 73ms-455ms for similar inlier
+      // counts, no clean correlation with N). Refining a candidate about to
+      // be rejected anyway is pure waste, and the per-keyframe candidate
+      // loop can attempt up to kMaxCandidatesToVerify of these -- so
+      // checking the cheap raw count first, before paying for refinement,
+      // bounds the common case to at most one refinement call per keyframe
+      // (the loop breaks on first accepted candidate) instead of up to
+      // kMaxCandidatesToVerify of them on failed attempts.
+      if ((int)ransac.inliers_.size() < config_.mapper_min_matches) {
+        std::cout << "              ransac_inliers=" << ransac.inliers_.size()
+                  << " (raw, pre-refinement)" << std::endl;
+        std::cout << "              RESULT: rejected (inliers "
+                  << ransac.inliers_.size() << " < mapper_min_matches "
+                  << config_.mapper_min_matches << ")" << std::endl;
+        continue;
+      }
+
       // Non-linear refinement over all RANSAC inliers -- mirrors the
       // pattern already used for the relative-pose case in
       // findInliersRansac() (src/utils/keypoints.cpp). RANSAC's model comes
@@ -535,24 +557,22 @@ void OnlineLoopClosure::processKeyframe(const MargData::Ptr& data,
       // a least-squares-optimal fit over every inlier; this refines it and
       // re-selects inliers against the refined model, same as the existing
       // relative-pose pattern.
-      if (!ransac.inliers_.empty()) {
-        adapter.sett(ransac.model_coefficients_.topRightCorner<3, 1>());
-        adapter.setR(ransac.model_coefficients_.topLeftCorner<3, 3>());
-        opengv::transformation_t refined =
-            opengv::absolute_pose::optimize_nonlinear(adapter, ransac.inliers_);
-        ransac.sac_model_->selectWithinDistance(refined, ransac.threshold_,
-                                                ransac.inliers_);
-        ransac.model_coefficients_ = refined;
-      }
+      adapter.sett(ransac.model_coefficients_.topRightCorner<3, 1>());
+      adapter.setR(ransac.model_coefficients_.topLeftCorner<3, 3>());
+      opengv::transformation_t refined =
+          opengv::absolute_pose::optimize_nonlinear(adapter, ransac.inliers_);
+      ransac.sac_model_->selectWithinDistance(refined, ransac.threshold_,
+                                              ransac.inliers_);
+      ransac.model_coefficients_ = refined;
 
       Eigen::Vector3d ransac_t =
           ransac.model_coefficients_.topRightCorner<3, 1>();
       std::cout << "              ransac_inliers=" << ransac.inliers_.size()
-                << "  ransac_pose_t=[" << ransac_t.x() << ", " << ransac_t.y()
-                << ", " << ransac_t.z() << "]" << std::endl;
+                << " (refined)  ransac_pose_t=[" << ransac_t.x() << ", "
+                << ransac_t.y() << ", " << ransac_t.z() << "]" << std::endl;
 
       if ((int)ransac.inliers_.size() < config_.mapper_min_matches) {
-        std::cout << "              RESULT: rejected (inliers "
+        std::cout << "              RESULT: rejected (refined inliers "
                   << ransac.inliers_.size() << " < mapper_min_matches "
                   << config_.mapper_min_matches << ")" << std::endl;
         continue;
