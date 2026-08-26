@@ -156,6 +156,7 @@ pangolin::Var<bool> show_est_bg("ui.show_est_bg", false, true);
 pangolin::Var<bool> show_est_ba("ui.show_est_ba", false, true);
 
 pangolin::Var<bool> follow("ui.follow", true, true);
+pangolin::Var<bool> show_raw_traj("ui.show_raw_traj", true, true);
 
 // Visualization variables
 basalt::VioVisualizationData::Ptr curr_vis_data;
@@ -458,11 +459,27 @@ int main(int argc, char** argv) {
       glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
       if (follow) {
-        auto vis_data = get_curr_vis_data_snapshot();
-        if (vis_data.get()) {
-          auto T_w_i = vis_data->states.back();
-          T_w_i.so3() = Sophus::SO3d();
+        // Follow the loop-closure-corrected pose (blue line) when
+        // available, not the raw VIO pose (red line) -- the raw pose can
+        // sit meters away from the corrected one right after a big loop
+        // closure snap, which used to make the camera chase the wrong
+        // trajectory. Falls back to the raw pose only when loop closure
+        // isn't running at all (or hasn't produced a keyframe yet).
+        Sophus::SE3d T_w_i;
+        bool have_pose = false;
 
+        if (online_loop_closure && online_loop_closure->getLatestCorrectedPose(T_w_i)) {
+          have_pose = true;
+        } else {
+          auto vis_data = get_curr_vis_data_snapshot();
+          if (vis_data.get()) {
+            T_w_i = vis_data->states.back();
+            have_pose = true;
+          }
+        }
+
+        if (have_pose) {
+          T_w_i.so3() = Sophus::SO3d();
           camera.Follow(T_w_i.matrix());
         }
       }
@@ -631,13 +648,15 @@ void draw_scene() {
   glEnable(GL_BLEND);
   glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
-  glColor3ubv(cam_color);
-  Eigen::aligned_vector<Eigen::Vector3d> sub_gt;
-  {
-    std::lock_guard<std::mutex> lock(vio_state_mutex);
-    sub_gt = vio_t_w_i;
+  if (show_raw_traj) {
+    glColor3ubv(cam_color);
+    Eigen::aligned_vector<Eigen::Vector3d> sub_gt;
+    {
+      std::lock_guard<std::mutex> lock(vio_state_mutex);
+      sub_gt = vio_t_w_i;
+    }
+    pangolin::glDrawLineStrip(sub_gt);
   }
-  pangolin::glDrawLineStrip(sub_gt);
 
   // Loop-closure-corrected trajectory, drawn as a second, distinctly
   // colored line alongside the raw (uncorrected) one above -- before any
