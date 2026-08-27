@@ -145,6 +145,13 @@ Eigen::aligned_vector<Eigen::Vector3d> gt_t_w_i;
 std::string marg_data_path;
 size_t last_frame_processed = 0;
 
+// Replay the dataset this many times back-to-back in the same process (see
+// --dataset-loops) -- lets a short dataset stand in for a long session when
+// testing OnlineLoopClosure's database-scaling behavior (keyframe count,
+// BoW/pose-graph timing growth), without needing a real 30-minute capture.
+int dataset_loops = 1;
+int64_t dataset_loop_offset_ns = 0;
+
 tbb::concurrent_unordered_map<int64_t, int, std::hash<int64_t>> timestamp_to_id;
 
 std::mutex m;
@@ -169,25 +176,34 @@ basalt::OnlineLoopClosure::Ptr online_loop_closure;
 void feed_images() {
   std::cout << "Started input_data thread " << std::endl;
 
-  for (size_t i = 0; i < vio_dataset->get_image_timestamps().size(); i++) {
-    if (vio->finished || terminate || (max_frames > 0 && i >= max_frames)) {
-      // stop loop early if we set a limit on number of frames to process
-      break;
+  for (int lap = 0; lap < dataset_loops; lap++) {
+    if (vio->finished || terminate) break;
+
+    for (size_t i = 0; i < vio_dataset->get_image_timestamps().size(); i++) {
+      if (vio->finished || terminate || (max_frames > 0 && i >= max_frames)) {
+        // stop loop early if we set a limit on number of frames to process
+        break;
+      }
+
+      if (step_by_step) {
+        std::unique_lock<std::mutex> lk(m);
+        cv.wait(lk, [&]() { return !step_by_step || show_frame >= int(i); });
+      }
+
+      basalt::OpticalFlowInput::Ptr data(new basalt::OpticalFlowInput);
+
+      // Image lookup must use the dataset's ORIGINAL timestamp (that's the
+      // only key the dataset reader knows); the offset is applied only to
+      // the timestamp handed downstream, so replayed laps land at strictly
+      // later times instead of colliding with lap 1's.
+      const int64_t orig_t_ns = vio_dataset->get_image_timestamps()[i];
+      data->img_data = vio_dataset->get_image_data(orig_t_ns);
+      data->t_ns = orig_t_ns + int64_t(lap) * dataset_loop_offset_ns;
+
+      timestamp_to_id[data->t_ns] = i;
+
+      opt_flow_ptr->input_queue.push(data);
     }
-
-    if (step_by_step) {
-      std::unique_lock<std::mutex> lk(m);
-      cv.wait(lk, [&]() { return !step_by_step || show_frame >= int(i); });
-    }
-
-    basalt::OpticalFlowInput::Ptr data(new basalt::OpticalFlowInput);
-
-    data->t_ns = vio_dataset->get_image_timestamps()[i];
-    data->img_data = vio_dataset->get_image_data(data->t_ns);
-
-    timestamp_to_id[data->t_ns] = i;
-
-    opt_flow_ptr->input_queue.push(data);
   }
 
   // Indicate the end of the sequence
@@ -197,18 +213,23 @@ void feed_images() {
 }
 
 void feed_imu() {
-  for (size_t i = 0; i < vio_dataset->get_gyro_data().size(); i++) {
-    if (vio->finished || terminate) {
-      break;
+  for (int lap = 0; lap < dataset_loops; lap++) {
+    if (vio->finished || terminate) break;
+
+    for (size_t i = 0; i < vio_dataset->get_gyro_data().size(); i++) {
+      if (vio->finished || terminate) {
+        break;
+      }
+
+      basalt::ImuData<double>::Ptr data(new basalt::ImuData<double>);
+      data->t_ns = vio_dataset->get_gyro_data()[i].timestamp_ns +
+                   int64_t(lap) * dataset_loop_offset_ns;
+
+      data->accel = vio_dataset->get_accel_data()[i].data;
+      data->gyro = vio_dataset->get_gyro_data()[i].data;
+
+      vio->imu_data_queue.push(data);
     }
-
-    basalt::ImuData<double>::Ptr data(new basalt::ImuData<double>);
-    data->t_ns = vio_dataset->get_gyro_data()[i].timestamp_ns;
-
-    data->accel = vio_dataset->get_accel_data()[i].data;
-    data->gyro = vio_dataset->get_gyro_data()[i].data;
-
-    vio->imu_data_queue.push(data);
   }
   vio->imu_data_queue.push(nullptr);
 }
@@ -263,6 +284,18 @@ int main(int argc, char** argv) {
   app.add_option("--online-loop-closure", online_loop_closure_enabled,
                  "Enable live loop-closure correction (see OnlineLoopClosure).");
 
+  app.add_option(
+      "--dataset-loops", dataset_loops,
+      "Replay the dataset this many times back-to-back within this single "
+      "process (default 1 = no looping). Each lap's timestamps are offset "
+      "so IMU/image time stays strictly increasing across the wrap; VIO and "
+      "OnlineLoopClosure are never reset between laps, so the keyframe "
+      "database keeps growing across the whole run. Use this to stand in "
+      "for a long real session (e.g. 30 minutes) using a short dataset, "
+      "when testing database-scaling behavior rather than trajectory "
+      "accuracy -- ground-truth ATE comparison is skipped when looped, "
+      "since it's not meaningful against a single-lap ground truth.");
+
   try {
     app.parse(argc, argv);
   } catch (const CLI::ParseError& e) {
@@ -311,6 +344,25 @@ int main(int argc, char** argv) {
       gt_t_ns.push_back(vio_dataset->get_gt_timestamps()[i]);
       gt_t_w_i.push_back(vio_dataset->get_gt_pose_data()[i].translation());
     }
+  }
+
+  if (dataset_loops > 1) {
+    const int64_t first_img = vio_dataset->get_image_timestamps().front();
+    const int64_t last_img = vio_dataset->get_image_timestamps().back();
+    const int64_t first_imu = vio_dataset->get_gyro_data().front().timestamp_ns;
+    const int64_t last_imu = vio_dataset->get_gyro_data().back().timestamp_ns;
+    const int64_t span = std::max(last_img, last_imu) -
+                          std::min(first_img, first_imu);
+    constexpr int64_t kLoopGapNs = 5'000'000;  // 5ms, avoids landing exactly
+                                                // on the previous lap's last
+                                                // sample timestamp
+    dataset_loop_offset_ns = span + kLoopGapNs;
+
+    const double lap_s = dataset_loop_offset_ns * 1e-9;
+    std::cout << "[dataset-loops] " << dataset_loops << " laps x " << lap_s
+              << "s/lap =~ " << (dataset_loops * lap_s) << "s total dataset "
+              << "time (processed as fast as possible, not real-time)"
+              << std::endl;
   }
 
   const int64_t start_t_ns = vio_dataset->get_image_timestamps().front();
@@ -673,9 +725,23 @@ int main(int argc, char** argv) {
   // the RAW trajectory's frame, not a fresh, independent alignment.
   const Eigen::aligned_vector<Eigen::Vector3d> gt_t_w_i_original = gt_t_w_i;
 
+  // A looped run's estimated trajectory spans many multiples of the
+  // single-lap ground truth's time range, so alignSVD's rigid-alignment
+  // assumption (one estimate sample roughly per gt sample, same span)
+  // doesn't hold -- skip it. This run's purpose is database-scaling
+  // diagnostics (see [TIMING]/[ONLINE-LOOP] console lines), not accuracy.
+  const bool looped = dataset_loops > 1;
+
   // TODO: remove this unconditional call (here for debugging);
   const double ate_rmse =
-      basalt::alignSVD(vio_t_ns, vio_t_w_i, gt_t_ns, gt_t_w_i);
+      looped ? -1.0
+             : basalt::alignSVD(vio_t_ns, vio_t_w_i, gt_t_ns, gt_t_w_i);
+  if (looped) {
+    std::cout << "[dataset-loops] Skipping ground-truth ATE comparison for "
+                 "this looped run -- not meaningful against single-lap "
+                 "ground truth."
+              << std::endl;
+  }
   vio->debug_finalize();
   std::cout << "Total runtime: {:.3f}s\n"_format(duration_total);
 
@@ -721,7 +787,9 @@ int main(int argc, char** argv) {
   }
 
   if (!aborted && !result_path.empty()) {
-    double error = basalt::alignSVD(vio_t_ns, vio_t_w_i, gt_t_ns, gt_t_w_i);
+    double error = looped ? -1.0
+                          : basalt::alignSVD(vio_t_ns, vio_t_w_i, gt_t_ns,
+                                             gt_t_w_i);
 
     auto exec_time_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
         time_end - time_start);
@@ -760,7 +828,7 @@ int main(int argc, char** argv) {
     Eigen::aligned_vector<Eigen::Vector3d> gt_copy_for_corrected =
         gt_t_w_i_original;
     double corrected_ate_rmse =
-        corrected.size() >= 2
+        (!looped && corrected.size() >= 2)
             ? basalt::alignSVD(corrected_t_ns, corrected, gt_t_ns,
                                gt_copy_for_corrected)
             : -1;
