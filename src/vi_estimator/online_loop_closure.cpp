@@ -120,6 +120,20 @@ constexpr int kMinTriangulatedPointsForDatabase = 25;
 // bounding worst-case cost regardless of how large/rich the database gets.
 constexpr size_t kMaxCandidatesToVerify = 5;
 
+// Minimum time gap (nanoseconds) between a query keyframe and any candidate
+// it's allowed to match against. Root-caused via an EuRoC dataset test: with
+// no minimum separation, 26 of 29 keyframes in a 15s window "loop closed" --
+// nearly every one -- with query/partner index gaps as small as 1 (i.e.
+// matching against the immediately preceding keyframe). That isn't a real
+// revisit, it's redundantly re-detecting what the odometry chain already
+// encodes, and these spurious matches (often high-weight, since near-
+// duplicate images produce lots of inliers) measurably made the corrected
+// trajectory WORSE than raw against ground truth (ATE RMSE 0.0094m raw vs
+// 0.125m corrected on the same run). 2 seconds is long enough that a real
+// revisit requires actually having left and come back, not just normal
+// keyframe-to-keyframe density.
+constexpr int64_t kMinLoopClosureTimeGapNs = 2'000'000'000;
+
 // Decompose R = Rz(yaw) * Ry(pitch) * Rx(roll). Assumes no gimbal lock
 // (pitch away from +-90 deg), a reasonable assumption for a handheld/mobile
 // device that isn't doing full vertical flips.
@@ -423,8 +437,10 @@ void OnlineLoopClosure::processKeyframe(const MargData::Ptr& data,
 
     std::vector<std::pair<TimeCamId, double>> above_threshold;
     for (const auto& cand : results) {
-      if (cand.second >= config_.mapper_frames_to_match_threshold)
+      if (cand.second >= config_.mapper_frames_to_match_threshold &&
+          kf_id - cand.first.frame_id >= kMinLoopClosureTimeGapNs) {
         above_threshold.push_back(cand);
+      }
     }
 
     // Only fully verify the top kMaxCandidatesToVerify by BoW score (see
