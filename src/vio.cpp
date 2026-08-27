@@ -508,19 +508,35 @@ int main(int argc, char** argv) {
       glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
       if (follow) {
-        size_t frame_id = show_frame;
-        int64_t t_ns = vio_dataset->get_image_timestamps()[frame_id];
-        auto vis_data = get_vis_data_snapshot(t_ns);
+        // Follow the loop-closure-corrected pose (blue line) when
+        // available, not the raw VIO pose (red line) -- same fix already
+        // applied in oak_d_vio.cpp: the raw pose can sit far from the
+        // corrected one right after a big loop closure, which makes the
+        // view frame around the wrong trajectory otherwise.
+        Sophus::SE3d T_w_i;
+        bool have_pose = false;
 
-        if (vis_data) {
-          Sophus::SE3d T_w_i;
-          if (!vis_data->states.empty()) {
-            T_w_i = vis_data->states.back();
-          } else if (!vis_data->frames.empty()) {
-            T_w_i = vis_data->frames.back();
+        if (online_loop_closure &&
+            online_loop_closure->getLatestCorrectedPose(T_w_i)) {
+          have_pose = true;
+        } else {
+          size_t frame_id = show_frame;
+          int64_t t_ns = vio_dataset->get_image_timestamps()[frame_id];
+          auto vis_data = get_vis_data_snapshot(t_ns);
+
+          if (vis_data) {
+            if (!vis_data->states.empty()) {
+              T_w_i = vis_data->states.back();
+              have_pose = true;
+            } else if (!vis_data->frames.empty()) {
+              T_w_i = vis_data->frames.back();
+              have_pose = true;
+            }
           }
-          T_w_i.so3() = Sophus::SO3d();
+        }
 
+        if (have_pose) {
+          T_w_i.so3() = Sophus::SO3d();
           camera.Follow(T_w_i.matrix());
         }
       }
