@@ -54,6 +54,45 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 // deliberately NOT plain monocular 2D-2D matching, which only recovers
 // translation *direction*, not metric magnitude, and would silently feed
 // wrongly-scaled corrections into the pose graph.
+//
+// KNOWN LIMITATION (accepted, not fixed): a single wrong long-range loop
+// closure can meaningfully corrupt the corrected trajectory, and this
+// pose-only graph has no reliable way to reject one in advance. Root-
+// caused on an EuRoC dataset test (V1_01_easy, a small Vicon capture room
+// covered in repetitive calibration markers -- a "perceptual aliasing"
+// setup): a match ~36s in the past with only 28 supporting points got
+// accepted and pulled one keyframe's position badly off, and that error
+// then propagated forward through the normal keyframe chain. Three fixes
+// were tried:
+//   1. Minimum time gap before a candidate is eligible (kept, real,
+//      insufficient alone -- see kMinLoopClosureTimeGapNs below).
+//   2. Requiring more supporting points for a longer time gap (tried,
+//      REVERTED -- made results measurably worse, because a genuine
+//      distant revisit also naturally has fewer points than a recent one,
+//      since more time means more viewpoint/lighting change even when the
+//      match is correct; inlier count alone can't separate "far and
+//      right" from "far and wrong").
+//   3. Robust (Huber) down-weighting of loop edges in the solve (kept, no
+//      measurable improvement on the diagnosed case -- see
+//      kLoopEdgeHuberDeltaM below). Doesn't help here because the
+//      corrupted node only has 3 edges touching it (2 odometry + the bad
+//      loop edge); there's no independent evidence in this thin pose-only
+//      graph to outvote a bad edge with, so the solver just satisfies all
+//      three edges by bending to the wrong position instead of the bad
+//      edge showing up as a residual outlier.
+// The real fix would be a richer graph with actual landmark-level
+// redundancy (multiple independent point observations per closure, like
+// Basalt's own offline basalt_mapper) -- deliberately NOT pursued now:
+// that's a major redesign (comparable in scope to this module), carries
+// real risk of new scaling problems (this session already found three
+// unrelated ones in the current, much simpler design as it scaled up),
+// and isn't proven to fully fix aliasing even then. Every live OAK-D test
+// this session (the actual deployment target) has performed well with no
+// sign of this failure mode -- this was found via an EuRoC scaling side-
+// investigation, on an unusually repetitive dataset, not the real use
+// case. Revisit toward a richer graph only if a REAL deployment test
+// shows this same failure mode in a genuinely repetitive real-world
+// environment, not preemptively.
 
 #pragma once
 
@@ -160,6 +199,13 @@ class OnlineLoopClosure {
     // acceptance floor -- previously every edge was weighted identically
     // regardless of how many inliers actually backed it.
     double weight = 1.0;
+
+    // True for loop-closure edges, false for sequential odometry edges.
+    // Only loop edges get robust (Huber) down-weighting in the solve --
+    // see solvePoseGraph() -- since the odometry chain is the trusted
+    // backbone that should resist being dragged by a bad loop edge, not
+    // get weakened alongside it.
+    bool is_loop = false;
   };
 
   void processingLoop();

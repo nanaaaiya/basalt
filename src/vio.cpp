@@ -772,6 +772,37 @@ int main(int argc, char** argv) {
               << "m num_loop_closures="
               << online_loop_closure->numLoopClosures()
               << " num_stored_keyframes=" << corrected.size() << std::endl;
+
+    // Per-keyframe dump for offline analysis -- finding exactly WHERE in
+    // time the error is introduced (vs. only having one aggregate RMSE
+    // number) needs the corrected trajectory alongside ground truth
+    // already aligned into its frame (gt_copy_for_corrected, mutated in
+    // place by the alignSVD call above).
+    {
+      std::ofstream os("corrected_trajectory.csv");
+      os << "t_ns,x,y,z\n";
+      for (size_t i = 0; i < corrected.size(); i++) {
+        os << corrected_t_ns[i] << "," << corrected[i].x() << ","
+           << corrected[i].y() << "," << corrected[i].z() << "\n";
+      }
+    }
+    {
+      std::ofstream os("gt_aligned_to_corrected.csv");
+      os << "t_ns,x,y,z\n";
+      for (size_t i = 0; i < gt_copy_for_corrected.size(); i++) {
+        os << gt_t_ns[i] << "," << gt_copy_for_corrected[i].x() << ","
+           << gt_copy_for_corrected[i].y() << ","
+           << gt_copy_for_corrected[i].z() << "\n";
+      }
+    }
+    {
+      std::ofstream os("raw_trajectory.csv");
+      os << "t_ns,x,y,z\n";
+      for (size_t i = 0; i < vio_t_w_i.size(); i++) {
+        os << vio_t_ns[i] << "," << vio_t_w_i[i].x() << ","
+           << vio_t_w_i[i].y() << "," << vio_t_w_i[i].z() << "\n";
+      }
+    }
   }
 
   return 0;

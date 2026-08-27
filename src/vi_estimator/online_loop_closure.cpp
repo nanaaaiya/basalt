@@ -134,6 +134,15 @@ constexpr size_t kMaxCandidatesToVerify = 5;
 // keyframe-to-keyframe density.
 constexpr int64_t kMinLoopClosureTimeGapNs = 2'000'000'000;
 
+// Huber threshold (meters) for robust down-weighting of loop-closure edges
+// in solvePoseGraph() -- see the comment at its use site. A residual under
+// this is treated as normal noise (full weight); beyond it, weight falls
+// off as kLoopEdgeHuberDeltaM / residual_norm, standard IRLS Huber
+// behavior. 0.5m is a placeholder starting point (well above normal
+// matching/odometry noise, well below the multi-meter residuals a wrong
+// long-range match produces), not yet empirically tuned.
+constexpr double kLoopEdgeHuberDeltaM = 0.5;
+
 // Decompose R = Rz(yaw) * Ry(pitch) * Rx(roll). Assumes no gimbal lock
 // (pitch away from +-90 deg), a reasonable assumption for a handheld/mobile
 // device that isn't doing full vertical flips.
@@ -672,6 +681,7 @@ void OnlineLoopClosure::processKeyframe(const MargData::Ptr& data,
       e.weight = std::clamp(
           loop_num_inliers / std::max(1.0, config_.mapper_min_matches), 1.0,
           5.0);
+      e.is_loop = true;
       edges_.push_back(e);
 
       num_loop_closures++;
@@ -823,24 +833,45 @@ void OnlineLoopClosure::solvePoseGraph() {
       int oi = param_offset(e.i);
       int oj = param_offset(e.j);
 
-      // Scaling the per-edge contribution by e.weight before accumulation
-      // is equivalent to minimizing sum_e weight_e * ||r_e||^2 -- the
-      // normal equations become sum_e w_e * J_e^T J_e * dx = -sum_e w_e *
-      // J_e^T r_e, same Gauss-Newton derivation as before, just weighted.
-      Eigen::Matrix4d Jii =
-          e.weight * J.block<4, 4>(0, 0).transpose() * J.block<4, 4>(0, 0);
-      Eigen::Matrix4d Jjj =
-          e.weight * J.block<4, 4>(0, 4).transpose() * J.block<4, 4>(0, 4);
-      Eigen::Matrix4d Jij =
-          e.weight * J.block<4, 4>(0, 0).transpose() * J.block<4, 4>(0, 4);
+      // Robust (Huber) down-weighting for LOOP edges only, recomputed each
+      // iteration from the CURRENT residual (standard IRLS pattern). An
+      // edge whose translation residual disagrees with the rest of the
+      // graph by more than kLoopEdgeHuberDeltaM gets progressively less
+      // say the worse it disagrees, instead of being trusted at full
+      // weight or rejected outright before ever being tried. Root-caused
+      // via EuRoC testing: pre-filtering candidates by inlier count or
+      // time gap either let wrong long-range matches through (aliasing in
+      // a visually repetitive room) or blocked genuine ones alongside them
+      // (a true distant revisit naturally has fewer inliers too, since
+      // more time means more viewpoint change even when correct) -- inlier
+      // count can't reliably separate the two cases in advance. Odometry
+      // edges are deliberately NOT robustified: they're the trusted
+      // backbone that should resist being dragged by a bad loop edge, not
+      // get weakened right alongside it.
+      double robust_scale = 1.0;
+      if (e.is_loop) {
+        double res_norm = r.head<3>().norm();
+        if (res_norm > kLoopEdgeHuberDeltaM) {
+          robust_scale = kLoopEdgeHuberDeltaM / res_norm;
+        }
+      }
+      double w = e.weight * robust_scale;
+
+      // Scaling the per-edge contribution by w before accumulation is
+      // equivalent to minimizing sum_e w_e * ||r_e||^2 -- the normal
+      // equations become sum_e w_e * J_e^T J_e * dx = -sum_e w_e * J_e^T
+      // r_e, same Gauss-Newton derivation as before, just weighted.
+      Eigen::Matrix4d Jii = w * J.block<4, 4>(0, 0).transpose() * J.block<4, 4>(0, 0);
+      Eigen::Matrix4d Jjj = w * J.block<4, 4>(0, 4).transpose() * J.block<4, 4>(0, 4);
+      Eigen::Matrix4d Jij = w * J.block<4, 4>(0, 0).transpose() * J.block<4, 4>(0, 4);
 
       if (oi >= 0) {
         add_block(oi, oi, Jii);
-        Jtr.segment(oi, 4) += e.weight * J.block<4, 4>(0, 0).transpose() * r;
+        Jtr.segment(oi, 4) += w * J.block<4, 4>(0, 0).transpose() * r;
       }
       if (oj >= 0) {
         add_block(oj, oj, Jjj);
-        Jtr.segment(oj, 4) += e.weight * J.block<4, 4>(0, 4).transpose() * r;
+        Jtr.segment(oj, 4) += w * J.block<4, 4>(0, 4).transpose() * r;
       }
       if (oi >= 0 && oj >= 0) {
         add_block(oi, oj, Jij);
