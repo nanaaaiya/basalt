@@ -59,6 +59,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <basalt/io/dataset_io.h>
 #include <basalt/io/marg_data_io.h>
 #include <basalt/spline/se3_spline.h>
+#include <basalt/vi_estimator/online_loop_closure.h>
 #include <basalt/vi_estimator/vio_estimator.h>
 #include <basalt/calibration/calibration.hpp>
 
@@ -162,6 +163,7 @@ basalt::VioDatasetPtr vio_dataset;
 basalt::VioConfig vio_config;
 basalt::OpticalFlowBase::Ptr opt_flow_ptr;
 basalt::VioEstimatorBase::Ptr vio;
+basalt::OnlineLoopClosure::Ptr online_loop_closure;
 
 // Feed functions
 void feed_images() {
@@ -257,6 +259,10 @@ int main(int argc, char** argv) {
       "--max-frames", max_frames,
       "Limit number of frames to process from dataset (0 means unlimited)");
 
+  bool online_loop_closure_enabled = false;
+  app.add_option("--online-loop-closure", online_loop_closure_enabled,
+                 "Enable live loop-closure correction (see OnlineLoopClosure).");
+
   try {
     app.parse(argc, argv);
   } catch (const CLI::ParseError& e) {
@@ -335,6 +341,22 @@ int main(int argc, char** argv) {
         archive(gt_t_w_i);
       }
       os.close();
+    }
+  }
+
+  // Mutually exclusive with --marg-data -- out_marg_queue only has one
+  // consumer slot (same constraint as oak_d_vio.cpp).
+  if (online_loop_closure_enabled) {
+    if (marg_data_saver) {
+      std::cerr << "--online-loop-closure and --marg-data are mutually "
+                   "exclusive (both want out_marg_queue). Ignoring "
+                   "--online-loop-closure."
+                << std::endl;
+    } else {
+      online_loop_closure.reset(
+          new basalt::OnlineLoopClosure(calib, vio_config));
+      online_loop_closure->start();
+      vio->out_marg_queue = &online_loop_closure->input_queue;
     }
   }
 
@@ -610,6 +632,8 @@ int main(int argc, char** argv) {
   // std::cout << "Data input finished, terminate auxiliary threads.";
   terminate = true;
 
+  if (online_loop_closure) online_loop_closure->stop();
+
   // join other threads
   if (t3) t3->join();
   t4.join();
@@ -687,6 +711,21 @@ int main(int argc, char** argv) {
       ar(cereal::make_nvp("exec_time_ns", exec_time_ns.count()));
     }
     os.close();
+  }
+
+  if (online_loop_closure) {
+    Eigen::aligned_vector<Eigen::Vector3d> corrected =
+        online_loop_closure->getCorrectedTrajectory();
+    double raw_drift = -1, corrected_drift = -1;
+    if (vio_t_w_i.size() >= 2)
+      raw_drift = (vio_t_w_i.back() - vio_t_w_i.front()).norm();
+    if (corrected.size() >= 2)
+      corrected_drift = (corrected.back() - corrected.front()).norm();
+    std::cout << "[LOOP-CLOSURE SUMMARY] raw_start_to_end=" << raw_drift
+              << "m corrected_start_to_end=" << corrected_drift
+              << "m num_loop_closures="
+              << online_loop_closure->numLoopClosures()
+              << " num_stored_keyframes=" << corrected.size() << std::endl;
   }
 
   return 0;
@@ -804,6 +843,16 @@ void draw_scene(pangolin::View& view) {
 
   glColor3ubv(gt_color);
   if (show_gt) pangolin::glDrawLineStrip(gt_t_w_i);
+
+  // Loop-closure-corrected trajectory, drawn as a second, distinctly
+  // colored line alongside the raw one above -- same pattern as
+  // oak_d_vio.cpp's live GUI.
+  if (online_loop_closure) {
+    glColor3f(0.0, 0.5, 1.0);  // blue, distinct from cam_color/gt_color
+    glLineWidth(2.0);
+    pangolin::glDrawLineStrip(online_loop_closure->getCorrectedTrajectory());
+    glLineWidth(1.0);
+  }
 
   size_t frame_id = show_frame;
   int64_t t_ns = vio_dataset->get_image_timestamps()[frame_id];
