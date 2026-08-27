@@ -665,6 +665,14 @@ int main(int argc, char** argv) {
   const double duration_total =
       std::chrono::duration<double>(time_end - time_start).count();
 
+  // alignSVD mutates gt_t_w_i in place (aligns it into whichever
+  // trajectory's frame it's given), so a copy of the ORIGINAL ground truth
+  // is saved here for the corrected-trajectory comparison below -- reusing
+  // the now-mutated gt_t_w_i a second time would align the corrected
+  // trajectory against ground truth already rotated/translated to match
+  // the RAW trajectory's frame, not a fresh, independent alignment.
+  const Eigen::aligned_vector<Eigen::Vector3d> gt_t_w_i_original = gt_t_w_i;
+
   // TODO: remove this unconditional call (here for debugging);
   const double ate_rmse =
       basalt::alignSVD(vio_t_ns, vio_t_w_i, gt_t_ns, gt_t_w_i);
@@ -730,15 +738,37 @@ int main(int argc, char** argv) {
   }
 
   if (online_loop_closure) {
-    Eigen::aligned_vector<Eigen::Vector3d> corrected =
-        online_loop_closure->getCorrectedTrajectory();
+    std::vector<int64_t> corrected_t_ns;
+    Eigen::aligned_vector<Eigen::Vector3d> corrected;
+    online_loop_closure->getCorrectedTrajectoryWithTimestamps(corrected_t_ns,
+                                                               corrected);
+
     double raw_drift = -1, corrected_drift = -1;
     if (vio_t_w_i.size() >= 2)
       raw_drift = (vio_t_w_i.back() - vio_t_w_i.front()).norm();
     if (corrected.size() >= 2)
       corrected_drift = (corrected.back() - corrected.front()).norm();
+
+    // Real accuracy-against-ground-truth for the corrected trajectory,
+    // computed the same rigorous way Basalt already does for the raw one
+    // above (ate_rmse) -- NOT the visual GUI comparison, which is
+    // misleading before the align_se3 button has been used (ground truth
+    // is drawn in its own native frame until then, unrelated to VIO's).
+    // Uses the pre-mutation ground-truth copy since alignSVD would
+    // otherwise align against ground truth already rotated to match the
+    // raw trajectory's frame from the call above.
+    Eigen::aligned_vector<Eigen::Vector3d> gt_copy_for_corrected =
+        gt_t_w_i_original;
+    double corrected_ate_rmse =
+        corrected.size() >= 2
+            ? basalt::alignSVD(corrected_t_ns, corrected, gt_t_ns,
+                               gt_copy_for_corrected)
+            : -1;
+
     std::cout << "[LOOP-CLOSURE SUMMARY] raw_start_to_end=" << raw_drift
               << "m corrected_start_to_end=" << corrected_drift
+              << "m raw_ate_rmse=" << ate_rmse
+              << "m corrected_ate_rmse=" << corrected_ate_rmse
               << "m num_loop_closures="
               << online_loop_closure->numLoopClosures()
               << " num_stored_keyframes=" << corrected.size() << std::endl;
@@ -883,6 +913,21 @@ void draw_scene(pangolin::View& view) {
         render_camera((vis_data->frames.back() * calib.T_i_c[i]).matrix(), 2.0f,
                       cam_color, 0.1f);
       }
+
+    // "You are here" marker at the CORRECTED pose, matching the blue line
+    // -- same fix already applied in oak_d_vio.cpp. Without this the only
+    // drawn camera icon was always the raw pose (cam_color, above), which
+    // can sit far from the corrected pose after a big loop closure and
+    // looks like the marker is stuck on the wrong trajectory.
+    if (online_loop_closure) {
+      static const uint8_t corrected_cam_color[3]{0, 128, 255};
+      Sophus::SE3d T_w_i_corrected;
+      if (online_loop_closure->getLatestCorrectedPose(T_w_i_corrected)) {
+        for (size_t i = 0; i < calib.T_i_c.size(); i++)
+          render_camera((T_w_i_corrected * calib.T_i_c[i]).matrix(), 2.0f,
+                        corrected_cam_color, 0.1f);
+      }
+    }
 
     for (const auto& p : vis_data->states)
       for (size_t i = 0; i < calib.T_i_c.size(); i++)
