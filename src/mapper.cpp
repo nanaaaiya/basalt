@@ -107,6 +107,7 @@ void tracks();
 void optimize();
 void filter();
 void saveTrajectoryButton();
+void saveMapButton();
 
 constexpr int UI_WIDTH = 200;
 
@@ -143,10 +144,12 @@ Button align_btn("ui.aling_se3", &alignButton);
 pangolin::Var<bool> euroc_fmt("ui.euroc_fmt", true, true);
 pangolin::Var<bool> tum_rgbd_fmt("ui.tum_rgbd_fmt", false, true);
 Button save_traj_btn("ui.save_traj", &saveTrajectoryButton);
+Button save_map_btn("ui.save_map", &saveMapButton);
 
 pangolin::OpenGlRenderState camera;
 
 std::string marg_data_path;
+std::string map_path = "map.ply";
 
 int main(int argc, char** argv) {
   bool show_gui = true;
@@ -167,6 +170,12 @@ int main(int argc, char** argv) {
   app.add_option("--config-path", config_path, "Path to config file.");
 
   app.add_option("--result-path", result_path, "Path to config file.");
+
+  app.add_option("--save-map", map_path,
+                 "Path to save the optimized 3D point map after "
+                 "detect/match/track/optimize/filter/optimize (PLY format, "
+                 "ASCII). Written automatically at the end of --show-gui "
+                 "false runs; pass an empty string to skip.");
 
   try {
     app.parse(argc, argv);
@@ -343,6 +352,8 @@ int main(int argc, char** argv) {
     optimize();
     filter();
     optimize();
+
+    if (!map_path.empty()) saveMapButton();
 
     auto time_end = std::chrono::high_resolution_clock::now();
 
@@ -548,19 +559,26 @@ void load_data(const std::string& calib_path, const std::string& cache_path) {
   }
 
   {
-    // Load gt.
-    {
-      std::string p = cache_path + "/gt.cereal";
-      std::ifstream is(p, std::ios::binary);
+    // Load gt, if present. basalt_vio writes one automatically (from the
+    // dataset's own ground truth); live-camera recordings (oak_d_vio with
+    // --marg-data) never do, since there is no ground truth for a live
+    // flight -- that's expected, not an error, so proceed without it
+    // rather than failing to load the recording at all. Ground-truth-only
+    // features (alignButton(), --result-path's ATE) are skipped later when
+    // gt_frame_t_ns is empty.
+    std::string p = cache_path + "/gt.cereal";
+    std::ifstream is(p, std::ios::binary);
 
-      {
-        cereal::BinaryInputArchive archive(is);
-        archive(gt_frame_t_ns);
-        archive(gt_frame_t_w_i);
-      }
+    if (is.is_open()) {
+      cereal::BinaryInputArchive archive(is);
+      archive(gt_frame_t_ns);
+      archive(gt_frame_t_w_i);
       is.close();
       std::cout << "Loaded " << gt_frame_t_ns.size() << " timestamps and "
                 << gt_frame_t_w_i.size() << " poses" << std::endl;
+    } else {
+      std::cout << "No gt.cereal in " << cache_path
+                << " -- proceeding without ground truth." << std::endl;
     }
   }
 
@@ -639,6 +657,13 @@ void optimize() {
 }
 
 double alignButton() {
+  // alignSVD needs ground truth to align against; with none loaded (a
+  // live-camera recording has no gt.cereal, see load_data()) it would
+  // silently divide by zero over empty associations and produce NaN
+  // instead of failing loudly, so short-circuit here -- the one guard
+  // covers both the GUI button and the --result-path batch-mode call.
+  if (gt_frame_t_ns.empty()) return -1.0;
+
   Eigen::aligned_vector<Eigen::Vector3d> filter_t_w_i;
   std::vector<int64_t> filter_t_ns;
 
@@ -720,4 +745,32 @@ void saveTrajectoryButton() {
         << "Saved trajectory in Euroc Dataset format in keyframeTrajectory.csv"
         << std::endl;
   }
+}
+
+void saveMapButton() {
+  // mapper_points is populated by optimize()/tracks()/filter() as a side
+  // effect (for GUI drawing); this is the only place that writes it to
+  // disk, so a save-map call must happen after at least one optimize()
+  // pass or the file will just be an empty point set.
+  std::ofstream os(map_path);
+
+  os << "ply\n"
+        "format ascii 1.0\n"
+        "comment Basalt NfrMapper optimized landmark map\n"
+        "element vertex "
+     << mapper_points.size()
+     << "\n"
+        "property float x\n"
+        "property float y\n"
+        "property float z\n"
+        "end_header\n";
+
+  for (const auto& p : mapper_points) {
+    os << p.x() << " " << p.y() << " " << p.z() << "\n";
+  }
+
+  os.close();
+
+  std::cout << "Saved map (" << mapper_points.size() << " points) to "
+            << map_path << std::endl;
 }
