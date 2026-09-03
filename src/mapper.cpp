@@ -193,6 +193,48 @@ int main(int argc, char** argv) {
     nrf_mapper->addMargData(kv.second);
   }
 
+  // Diagnostic: rank relative-pose factors by their Mahalanobis contribution
+  // using the RAW, unoptimized poses -- this is exactly the state
+  // optimize()'s very first iteration linearizes around, so if rel_error is
+  // dominated (or made numerically rigid) by one or a few factors, this
+  // finds them without needing to run the optimizer at all.
+  {
+    struct FactorDiag {
+      int64_t t_i_ns, t_j_ns;
+      double contrib, res_norm, gap_s, cov_inv_min_eig, cov_inv_max_eig;
+    };
+    std::vector<FactorDiag> diags;
+    const auto& poses = nrf_mapper->getFramePoses();
+    for (const auto& rpf : nrf_mapper->rel_pose_factors) {
+      if (poses.count(rpf.t_i_ns) == 0 || poses.count(rpf.t_j_ns) == 0) continue;
+      const Sophus::SE3d& pose_i = poses.at(rpf.t_i_ns).getPose();
+      const Sophus::SE3d& pose_j = poses.at(rpf.t_j_ns).getPose();
+      Sophus::Vector6d res = basalt::relPoseError(rpf.T_i_j, pose_i, pose_j);
+      double contrib = res.transpose() * rpf.cov_inv * res;
+      Eigen::SelfAdjointEigenSolver<Sophus::Matrix6d> es(rpf.cov_inv);
+      diags.push_back({rpf.t_i_ns, rpf.t_j_ns, contrib, res.norm(),
+                       (rpf.t_j_ns - rpf.t_i_ns) / 1e9,
+                       es.eigenvalues().minCoeff(), es.eigenvalues().maxCoeff()});
+    }
+    std::sort(diags.begin(), diags.end(),
+              [](const FactorDiag& a, const FactorDiag& b) {
+                return a.contrib > b.contrib;
+              });
+    double total = 0;
+    for (auto& d : diags) total += d.contrib;
+    std::cout << "[REL-POSE-DIAG] " << diags.size()
+              << " factors, total rel_error=" << total << std::endl;
+    for (size_t i = 0; i < std::min<size_t>(15, diags.size()); i++) {
+      auto& d = diags[i];
+      std::cout << "  #" << i << " t_i=" << d.t_i_ns << " t_j=" << d.t_j_ns
+                << " gap=" << d.gap_s << "s contrib=" << d.contrib << " ("
+                << (total > 0 ? 100.0 * d.contrib / total : 0)
+                << "%) res_norm=" << d.res_norm << " cov_inv_eig=["
+                << d.cov_inv_min_eig << ", " << d.cov_inv_max_eig << "]"
+                << std::endl;
+    }
+  }
+
   computeEdgeVis();
 
   {
@@ -752,25 +794,54 @@ void saveMapButton() {
   // effect (for GUI drawing); this is the only place that writes it to
   // disk, so a save-map call must happen after at least one optimize()
   // pass or the file will just be an empty point set.
+  //
+  // A small fraction of points can still land at inf/nan, or at merely
+  // finite-but-absurd coordinates, even after a healthy optimization run
+  // -- individual landmarks with poor parallax (near-zero baseline
+  // between the views that observe them) are poorly constrained in a
+  // plain XYZ parameterization and can diverge during bundle adjustment
+  // independently of whether the poses/factors around them are sound.
+  // filterOutliers() doesn't reliably catch these (a residual computed
+  // from an already-divergent point is itself not a usable comparison),
+  // so guard here instead -- a viewer opening this file should never have
+  // to handle a point sitting tens of thousands of units from everything
+  // else. 100m is generous headroom over any realistic indoor/room-scale
+  // recording (this pipeline's actual use case); revisit if a real
+  // outdoor/large-scale map ever needs more.
+  constexpr double kMaxPointDistM = 100.0;
+  size_t n_skipped = 0;
+  std::vector<const Eigen::Vector3d*> finite_points;
+  finite_points.reserve(mapper_points.size());
+  for (const auto& p : mapper_points) {
+    if (p.allFinite() && p.norm() < kMaxPointDistM) {
+      finite_points.push_back(&p);
+    } else {
+      n_skipped++;
+    }
+  }
+
   std::ofstream os(map_path);
 
   os << "ply\n"
         "format ascii 1.0\n"
         "comment Basalt NfrMapper optimized landmark map\n"
         "element vertex "
-     << mapper_points.size()
+     << finite_points.size()
      << "\n"
         "property float x\n"
         "property float y\n"
         "property float z\n"
         "end_header\n";
 
-  for (const auto& p : mapper_points) {
-    os << p.x() << " " << p.y() << " " << p.z() << "\n";
+  for (const auto* p : finite_points) {
+    os << p->x() << " " << p->y() << " " << p->z() << "\n";
   }
 
   os.close();
 
-  std::cout << "Saved map (" << mapper_points.size() << " points) to "
-            << map_path << std::endl;
+  std::cout << "Saved map (" << finite_points.size() << " points";
+  if (n_skipped > 0) {
+    std::cout << ", skipped " << n_skipped << " non-finite";
+  }
+  std::cout << ") to " << map_path << std::endl;
 }

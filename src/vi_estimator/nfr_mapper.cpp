@@ -33,6 +33,8 @@ OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 */
 
+#include <Eigen/Eigenvalues>
+
 #include <basalt/optimization/accumulator.h>
 #include <basalt/utils/keypoints.h>
 #include <basalt/utils/nfr.h>
@@ -43,6 +45,40 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <basalt/hash_bow/hash_bow.h>
 
 namespace basalt {
+
+namespace {
+// qr.solve() below inverts the VIO's own marginalization-prior Hessian
+// (abs_H) directly. The rank check just above only guarantees a nonzero
+// determinant, not good conditioning -- a near-singular but technically
+// full-rank Hessian (routine for weakly-observable directions in a real
+// live recording, much more so than a curated dataset) produces a
+// numerically corrupted covariance when inverted this way, sometimes not
+// even positive-semidefinite. That corruption then propagates into every
+// relative-pose and roll/pitch factor derived from it, giving some
+// factors an information matrix with a negative eigenvalue -- which
+// doesn't just under-penalize drift in that direction, it actively
+// REWARDS it (decreasing the true residual there looks like an INCREASE
+// under a matrix that isn't actually a valid metric). Symptom observed in
+// practice: every attempted Levenberg-Marquardt step increases total
+// error and gets rejected, even under maximum damping, because the
+// accumulated Hessian isn't actually positive-definite the way the
+// solver assumes -- optimize() runs its full iteration budget without
+// ever accepting a single step.
+//
+// Fix: symmetrize and clamp eigenvalues to a small positive floor
+// (relative to the matrix's own scale, so well-conditioned directions are
+// left untouched) before this covariance is used for anything downstream.
+// A floored-to-zero eigenvalue means "treat this direction as
+// unconstrained," which is the honest reading of "the Hessian couldn't
+// tell us anything reliable here" -- not "trust it with an arbitrary,
+// possibly negative, sign."
+Eigen::MatrixXd projectToPSD(const Eigen::MatrixXd& m) {
+  Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> es(0.5 * (m + m.transpose()));
+  double floor = std::max(1e-12, es.eigenvalues().maxCoeff() * 1e-9);
+  Eigen::VectorXd eigs = es.eigenvalues().cwiseMax(floor);
+  return es.eigenvectors() * eigs.asDiagonal() * es.eigenvectors().transpose();
+}
+}  // namespace
 
 NfrMapper::NfrMapper(const Calibration<double>& calib, const VioConfig& config)
     : config(config),
@@ -156,6 +192,7 @@ bool NfrMapper::extractNonlinearFactors(MargData& m) {
   if (qr.rank() != m.abs_H.cols()) return false;
 
   Eigen::MatrixXd cov_old = qr.solve(Eigen::MatrixXd::Identity(asize, asize));
+  cov_old = projectToPSD(cov_old);
 
   int64_t kf_id = *m.kfs_to_marg.cbegin();
   int kf_start_idx = m.aom.abs_order_map.at(kf_id).first;
