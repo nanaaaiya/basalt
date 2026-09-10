@@ -323,6 +323,7 @@ target_sources(basalt
     ${CMAKE_CURRENT_SOURCE_DIR}/src/calibration/aprilgrid.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/calibration/calibraiton_helper.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/calibration/vignette.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/io/dashboard_client.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/io/dataset_io.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/io/marg_data_io.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/linearization/landmark_block.cpp
@@ -462,6 +463,7 @@ if(DEFINED DEPTHAI_VCPKG_INSTALLED_DIR)
     find_package(${_dep} QUIET)
   endforeach()
 endif()
+
 find_package(depthai CONFIG QUIET)
 if(depthai_FOUND)
   message(STATUS "FOUND DEPTHAI-CORE, building basalt_oak_d_vio")
