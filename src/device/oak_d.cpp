@@ -152,13 +152,18 @@ void OakDDevice::deviceLoop() {
     }
 
     // Independent of the IMU/stereo-frame pairing below -- the occupancy
-    // mapper (once it exists) times its own depth frames against VIO's
-    // pose stream itself, the same way DashboardClient consumes poses
-    // without needing to be threaded through this pairing logic.
+    // mapper times its own depth frames against VIO's pose stream itself,
+    // the same way DashboardClient consumes poses without needing to be
+    // threaded through this pairing logic. try_push, not push: this same
+    // loop also reads the IMU/mono frames VIO actually needs every single
+    // one of, so a depth consumer that ever falls behind must never be
+    // able to block this thread -- dropping a depth frame costs nothing
+    // but a slightly staler map, dropping an IMU sample would be a real
+    // VIO correctness problem.
     if (q_depth) {
       while (auto depthFrame = q_depth->tryGet<dai::ImgFrame>()) {
         got_data = true;
-        if (queues.depth_data_queue) queues.depth_data_queue->push(depthFrame);
+        if (queues.depth_data_queue) queues.depth_data_queue->try_push(depthFrame);
       }
     }
 

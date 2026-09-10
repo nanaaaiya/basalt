@@ -43,8 +43,8 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 // Deliberately a separate module from OnlineLoopClosure, mirroring how
 // ModalAI's own stack splits VIO (voxl-qvio-server) from mapping
 // (voxl-mapper) -- this class only ever consumes a pose, it never produces
-// one. The caller (oak_d_vio.cpp, eventually) is responsible for pairing
-// each depth frame with whatever pose it wants mapped against (raw or
+// one. The caller (oak_d_vio.cpp) is responsible for pairing each depth
+// frame with whatever pose it wants mapped against (raw or
 // loop-closure-corrected) before calling addDepthFrame(); this class has
 // no opinion on which.
 //
@@ -55,6 +55,29 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 // (occupancy mapping doesn't need every single depth frame -- unlike VIO,
 // missing one costs nothing but a slightly staler map). A dedicated
 // processing thread owns the actual octree work.
+//
+// KNOWN LIMITATION, not caused by this class: the Pi5's OAK-D connection
+// has a pre-existing hardware/USB instability (seen in earlier sessions
+// independent of any mapping code) where the physical device can crash
+// and reconnect mid-run (depthai logs "Device ... has crashed" then
+// "Reconnection successful"). Confirmed via a live test with
+// --enable-occupancy-mapping OFF that this reproduces with zero mapping
+// code running at all -- so it's a device/environment issue, not a bug
+// here. It does mean: (a) when the connection is healthy, this class's
+// own logic is verified correct (both synthetically -- see
+// test_occupancy_mapper.cpp -- and against real depth frames on
+// hardware, producing sensible voxel counts); (b) repeated device
+// crash/reconnect churn while depthai's own queues are being actively
+// read has been observed to eventually corrupt depthai's host-side state
+// badly enough to abort the whole process (glibc "corrupted double-
+// linked list") -- a robustness gap in the vendored depthai library
+// reacting to a flaky device, not a memory-safety bug in this class or
+// its callers. Requesting StereoDepth does add real device-side compute
+// and USB bandwidth on top of an already-marginal connection, so it's
+// plausible (not confirmed) that enabling mapping makes an already-flaky
+// session crash more often, even though it isn't the root cause.
+// Revisit if/when the underlying device connection is made more robust;
+// not something more code here can fix on its own.
 
 #pragma once
 

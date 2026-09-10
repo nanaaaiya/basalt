@@ -70,6 +70,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <basalt/io/dashboard_client.h>
 #include <basalt/io/dataset_io.h>
 #include <basalt/io/marg_data_io.h>
+#include <basalt/mapping/occupancy_mapper.h>
 #include <basalt/utils/filesystem.h>
 #include <basalt/spline/se3_spline.h>
 #include <basalt/vi_estimator/online_loop_closure.h>
@@ -101,6 +102,8 @@ basalt::OakDDevice::Ptr oakd_device;
 basalt::OnlineLoopClosure::Ptr online_loop_closure;
 basalt::MargDataFanOut::Ptr marg_fan_out;
 basalt::DashboardClient::Ptr dashboard_client;
+basalt::OccupancyMapper::Ptr occupancy_mapper;
+tbb::concurrent_bounded_queue<std::shared_ptr<dai::ImgFrame>> depth_queue;
 
 using Button = pangolin::Var<std::function<void(void)>>;
 
@@ -186,6 +189,10 @@ std::string marg_data_path;
 
 bool step_by_step = false;
 int64_t curr_t_ns = -1;
+// Latest raw VIO pose, for the occupancy mapper to use when
+// --online-loop-closure isn't active (or hasn't produced a corrected pose
+// yet) -- guarded by vio_state_mutex like curr_t_ns/vio_t_w_i above.
+Sophus::SE3d curr_raw_pose;
 std::mutex vio_state_mutex;
 tbb::concurrent_bounded_queue<std::vector<float>> vio_plot_queue;
 
@@ -235,6 +242,29 @@ int main(int argc, char** argv) {
   int dashboard_port = 8765;
   app.add_option("--dashboard-port", dashboard_port,
                  "Dashboard backend's PI5_TCP_PORT.");
+
+  // Live 3D occupancy-grid mapping (see basalt::OccupancyMapper). Enables
+  // the OAK-D's on-device StereoDepth node too -- see OakDDevice's
+  // enable_stereo_depth constructor flag. See the "KNOWN LIMITATION" note
+  // at the top of occupancy_mapper.h before relying on this for a real
+  // flight -- a pre-existing OAK-D/USB instability, independent of this
+  // feature, can crash the whole process under sustained real-hardware use.
+  bool enable_occupancy_mapping = false;
+  app.add_option("--enable-occupancy-mapping", enable_occupancy_mapping,
+                 "Build a live 3D occupancy grid from stereo depth "
+                 "(see OccupancyMapper).");
+  double occupancy_voxel_size = 0.2;
+  app.add_option("--occupancy-voxel-size", occupancy_voxel_size,
+                 "Occupancy grid voxel size in meters.");
+  int occupancy_depth_stride = 4;
+  app.add_option("--occupancy-depth-stride", occupancy_depth_stride,
+                 "Only insert every Nth depth pixel (in both axes) -- a "
+                 "compute-budget knob, not a depth-quality one.");
+  double occupancy_rate_hz = 5.0;
+  app.add_option("--occupancy-rate-hz", occupancy_rate_hz,
+                 "Max rate to integrate depth frames into the occupancy "
+                 "grid -- independent of the depth stream's own ~30fps, "
+                 "since mapping doesn't need every frame.");
 
   // Default: a fresh timestamped folder per run, so repeated test runs
   // don't clobber each other and can be compared later -- see
@@ -293,7 +323,7 @@ int main(int argc, char** argv) {
 
   load_data(cam_calib_path);
 
-  oakd_device.reset(new basalt::OakDDevice);
+  oakd_device.reset(new basalt::OakDDevice(enable_occupancy_mapping));
 
   try {
     oakd_device->start();
@@ -355,6 +385,14 @@ int main(int argc, char** argv) {
     dashboard_client->start();
   }
 
+  if (enable_occupancy_mapping) {
+    occupancy_mapper.reset(new basalt::OccupancyMapper(
+        calib, occupancy_voxel_size, occupancy_depth_stride));
+    occupancy_mapper->start();
+    depth_queue.set_capacity(4);
+    oakd_device->setDepthOutputQueue(&depth_queue);
+  }
+
   vio_data_log.Clear();
   vio_plot_queue.set_capacity(10000);
 
@@ -399,6 +437,7 @@ int main(int argc, char** argv) {
         std::lock_guard<std::mutex> lock(vio_state_mutex);
         vio_t_ns.emplace_back(data->t_ns);
         vio_t_w_i.emplace_back(T_w_i.translation());
+        curr_raw_pose = T_w_i;
       }
 
       if (dashboard_client) {
@@ -488,6 +527,62 @@ int main(int argc, char** argv) {
     }
     std::cout << "Finished t6" << std::endl;
   });
+
+  // Feeds real depth frames + the current pose into occupancy_mapper.
+  // Independent of show_gui for the same reason t6 is -- a real headless
+  // flight still needs mapping to run.
+  std::shared_ptr<std::thread> t7;
+  if (occupancy_mapper) {
+    t7.reset(new std::thread([&]() {
+      auto last_processed = std::chrono::steady_clock::now();
+      const auto min_interval = std::chrono::duration<double>(
+          1.0 / std::max(0.1, occupancy_rate_hz));
+
+      int64_t total_added = 0, total_removed = 0;
+
+      while (!terminate) {
+        std::shared_ptr<dai::ImgFrame> depth_frame;
+        depth_queue.pop(depth_frame);
+        if (!depth_frame) break;  // shutdown sentinel from OakDDevice::stop()
+
+        auto now = std::chrono::steady_clock::now();
+        if (now - last_processed < min_interval) continue;  // rate budget
+        last_processed = now;
+
+        Sophus::SE3d pose;
+        bool have_pose = online_loop_closure &&
+                         online_loop_closure->getLatestCorrectedPose(pose);
+        if (!have_pose) {
+          std::lock_guard<std::mutex> lock(vio_state_mutex);
+          if (curr_t_ns < 0) continue;  // no VIO pose yet at all
+          pose = curr_raw_pose;
+        }
+
+        double t_sec = std::chrono::duration<double>(
+                           depth_frame->getTimestamp().time_since_epoch())
+                           .count();
+
+        auto input = std::make_shared<basalt::DepthFrameInput>();
+        input->t_ns = static_cast<int64_t>(t_sec * 1e9);
+        input->T_w_c = pose * calib.T_i_c[0];
+        input->depth_mm = depth_frame->getCvFrame();
+        input->cam_id = 0;
+        occupancy_mapper->addDepthFrame(input);
+
+        // Step D observation only -- dashboard wiring is a later step.
+        basalt::VoxelDelta delta;
+        while (occupancy_mapper->pollVoxelDelta(delta)) {
+          total_added += delta.added.size();
+          total_removed += delta.removed.size();
+        }
+      }
+
+      std::cout << "Finished t7 -- occupancy grid: " << total_added
+                << " voxels added, " << total_removed << " removed (net "
+                << (total_added - total_removed) << " occupied)"
+                << std::endl;
+    }));
+  }
 
   if (show_gui) {
     pangolin::CreateWindowAndBind("OAK-D Lite Vio", 1800, 1000);
@@ -622,6 +717,7 @@ int main(int argc, char** argv) {
   terminate = true;
 
   if (online_loop_closure) online_loop_closure->stop();
+  if (occupancy_mapper) occupancy_mapper->stop();
 
   // Push nullptr to output queues to unblock waiting threads
   out_vis_queue.push(nullptr);
@@ -631,6 +727,7 @@ int main(int argc, char** argv) {
   t4.join();
   if (t5.get()) t5->join();
   t6.join();
+  if (t7.get()) t7->join();
 
   if (dashboard_client) dashboard_client->stop();
 
