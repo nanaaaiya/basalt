@@ -71,7 +71,16 @@ class OakDDevice {
   static constexpr int CAM_FPS = 30;
   static constexpr int NUM_CAMS = 2;
 
-  OakDDevice();
+  // enable_stereo_depth: builds and runs the on-device StereoDepth node
+  // (for the future occupancy-grid mapper) alongside the existing raw
+  // mono + IMU streams VIO uses. This has to be a constructor-time
+  // choice, not a setter called after start() like setOutputQueues()
+  // below -- DepthAI's node graph is fixed once pipeline.start() runs,
+  // so whether the StereoDepth node exists at all can't be decided
+  // later. Defaults to false so every existing caller (just
+  // `new OakDDevice`) keeps paying zero extra device-side compute for a
+  // stream it never asked for.
+  explicit OakDDevice(bool enable_stereo_depth = false);
   ~OakDDevice();
 
   void start();
@@ -82,10 +91,21 @@ class OakDDevice {
       tbb::concurrent_bounded_queue<ImuData<double>::Ptr>* imu_queue);
   void detachOutputQueues();
 
+  // Separate from setOutputQueues() above -- depth is for the (future)
+  // occupancy-grid mapper, an entirely separate consumer from VIO's
+  // image/IMU wiring, and shouldn't need to touch that call at every
+  // existing call site just to add this. Safe to call whether or not
+  // enable_stereo_depth was set; it's simply never fed if not.
+  void setDepthOutputQueue(
+      tbb::concurrent_bounded_queue<std::shared_ptr<dai::ImgFrame>>*
+          depth_queue);
+
   OpticalFlowInput::Ptr getLastImageData() const;
 
  private:
   void deviceLoop();
+
+  const bool enable_stereo_depth_;
 
   std::atomic<bool> running{false};
   std::thread device_thread;
@@ -94,6 +114,7 @@ class OakDDevice {
   std::shared_ptr<dai::MessageQueue> q_left;
   std::shared_ptr<dai::MessageQueue> q_right;
   std::shared_ptr<dai::MessageQueue> q_imu;
+  std::shared_ptr<dai::MessageQueue> q_depth;  // null unless enable_stereo_depth_
 
   mutable std::mutex last_img_data_mutex;
   OpticalFlowInput::Ptr last_img_data;
@@ -103,6 +124,8 @@ class OakDDevice {
         nullptr;
     tbb::concurrent_bounded_queue<ImuData<double>::Ptr>* imu_data_queue =
         nullptr;
+    tbb::concurrent_bounded_queue<std::shared_ptr<dai::ImgFrame>>*
+        depth_data_queue = nullptr;
   };
 
   mutable std::mutex output_queues_mutex;

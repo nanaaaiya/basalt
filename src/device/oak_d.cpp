@@ -55,7 +55,8 @@ double to_seconds(
 
 }  // namespace
 
-OakDDevice::OakDDevice() {}
+OakDDevice::OakDDevice(bool enable_stereo_depth)
+    : enable_stereo_depth_(enable_stereo_depth) {}
 
 OakDDevice::~OakDDevice() { stop(); }
 
@@ -90,6 +91,18 @@ void OakDDevice::start() {
   q_right = rightOut->createOutputQueue(8, false);
   q_imu = imu->out.createOutputQueue(50, false);
 
+  if (enable_stereo_depth_) {
+    // For the occupancy-grid mapper (not VIO -- that still only uses the
+    // raw mono frames above). StereoDepth rectifies leftOut/rightOut
+    // internally using the device's calibration, so it's fine that
+    // they're the same raw, unrectified outputs VIO also reads.
+    auto stereo = pipeline.create<dai::node::StereoDepth>();
+    stereo->setDefaultProfilePreset(dai::node::StereoDepth::PresetMode::DEFAULT);
+    leftOut->link(stereo->left);
+    rightOut->link(stereo->right);
+    q_depth = stereo->depth.createOutputQueue(8, false);
+  }
+
   pipeline.start();
   std::cout << "[OAKD]: device connected, streaming" << std::endl;
 
@@ -114,6 +127,7 @@ void OakDDevice::stop() {
   }
   if (queues.image_data_queue) queues.image_data_queue->push(nullptr);
   if (queues.imu_data_queue) queues.imu_data_queue->push(nullptr);
+  if (queues.depth_data_queue) queues.depth_data_queue->push(nullptr);
 }
 
 void OakDDevice::deviceLoop() {
@@ -135,6 +149,17 @@ void OakDDevice::deviceLoop() {
     {
       std::lock_guard<std::mutex> lock(output_queues_mutex);
       queues = output_queues;
+    }
+
+    // Independent of the IMU/stereo-frame pairing below -- the occupancy
+    // mapper (once it exists) times its own depth frames against VIO's
+    // pose stream itself, the same way DashboardClient consumes poses
+    // without needing to be threaded through this pairing logic.
+    if (q_depth) {
+      while (auto depthFrame = q_depth->tryGet<dai::ImgFrame>()) {
+        got_data = true;
+        if (queues.depth_data_queue) queues.depth_data_queue->push(depthFrame);
+      }
     }
 
     while (auto imuData = q_imu->tryGet<dai::IMUData>()) {
@@ -225,6 +250,13 @@ void OakDDevice::setOutputQueues(
   std::lock_guard<std::mutex> lock(output_queues_mutex);
   output_queues.image_data_queue = image_queue;
   output_queues.imu_data_queue = imu_queue;
+}
+
+void OakDDevice::setDepthOutputQueue(
+    tbb::concurrent_bounded_queue<std::shared_ptr<dai::ImgFrame>>*
+        depth_queue) {
+  std::lock_guard<std::mutex> lock(output_queues_mutex);
+  output_queues.depth_data_queue = depth_queue;
 }
 
 void OakDDevice::detachOutputQueues() {
