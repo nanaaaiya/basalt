@@ -111,6 +111,18 @@ class DashboardClient {
   void sendMapEvent(int64_t t_ns, const std::string& event,
                      const std::string& detail_json = "{}");
 
+  // Incremental occupancy-grid update -- an add/remove voxel-center diff
+  // since the previous batch (matching VoxelBatch in schema.py), not a
+  // full-grid resend. Takes the two vectors separately rather than an
+  // OccupancyMapper::VoxelDelta directly so this header doesn't need to
+  // depend on basalt/mapping/occupancy_mapper.h; the caller (oak_d_vio.cpp)
+  // already has delta.added/delta.removed in exactly this shape. Silently
+  // does nothing if both are empty -- no point sending an empty batch.
+  // Non-blocking, best-effort -- see threading model above.
+  void sendVoxelBatch(int64_t t_ns, double voxel_size,
+                       const Eigen::aligned_vector<Eigen::Vector3d>& added,
+                       const Eigen::aligned_vector<Eigen::Vector3d>& removed);
+
   // Call once a map .ply is ready (e.g. after
   // OnlineLoopClosure::buildPointCloud() is written out), in response to a
   // pollSaveMapCommand() hit. Blocks (briefly -- this is a rare, deliberate

@@ -257,6 +257,28 @@ void DashboardClient::sendMapEvent(int64_t t_ns, const std::string& event,
   out_queue_.try_push(j.dump());
 }
 
+void DashboardClient::sendVoxelBatch(
+    int64_t t_ns, double voxel_size,
+    const Eigen::aligned_vector<Eigen::Vector3d>& added,
+    const Eigen::aligned_vector<Eigen::Vector3d>& removed) {
+  if (added.empty() && removed.empty()) return;
+
+  auto toJsonArray = [](const Eigen::aligned_vector<Eigen::Vector3d>& pts) {
+    auto arr = nlohmann::json::array();
+    for (const auto& p : pts) arr.push_back({p.x(), p.y(), p.z()});
+    return arr;
+  };
+
+  nlohmann::json j;
+  j["type"] = "voxel_batch";
+  j["run_id"] = "ignored";
+  j["t_ns"] = t_ns;
+  j["voxel_size"] = voxel_size;
+  j["add"] = toJsonArray(added);
+  j["remove"] = toJsonArray(removed);
+  out_queue_.try_push(j.dump());
+}
+
 bool DashboardClient::sendMapFile(const std::string& name,
                                    const std::string& ply_path) {
   std::ifstream f(ply_path, std::ios::binary);
