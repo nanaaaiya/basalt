@@ -933,4 +933,16 @@ bool OnlineLoopClosure::getLatestCorrectedPose(Sophus::SE3d& out) const {
   return true;
 }
 
+Eigen::aligned_vector<Eigen::Vector3d> OnlineLoopClosure::buildPointCloud()
+    const {
+  std::lock_guard<std::mutex> lock(state_mutex_);
+  Eigen::aligned_vector<Eigen::Vector3d> out;
+  for (const auto& kf : keyframes_) {
+    Sophus::SE3d T_w_i(composeYPR(kf.roll, kf.pitch, kf.yaw), kf.t_opt);
+    Sophus::SE3d T_w_c0 = T_w_i * calib_.T_i_c[0];
+    for (const auto& p_c0 : kf.pts3d) out.push_back(T_w_c0 * p_c0);
+  }
+  return out;
+}
+
 }  // namespace basalt

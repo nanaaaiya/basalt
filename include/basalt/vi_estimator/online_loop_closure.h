@@ -163,6 +163,20 @@ class OnlineLoopClosure {
 
   int numLoopClosures() const { return num_loop_closures.load(); }
 
+  // Every stereo-triangulated point from every keyframe, transformed into
+  // the corrected world frame -- for live map-saving (see
+  // DashboardClient::sendMapFile()). Deliberately NOT routed through the
+  // offline basalt_mapper/--marg-data pipeline: this uses data already
+  // held here for live correction, so a map is available immediately,
+  // mid-flight, without needing marg-data or a separate process. Unlike
+  // getCorrectedTrajectory() (one point per keyframe -- its position),
+  // this returns every landmark, so it can be much larger, and has no
+  // landmark deduplication or bundle adjustment -- that's what the
+  // offline basalt_mapper (--marg-data, --save-map) still does better,
+  // whenever a higher-quality post-flight map is wanted instead of an
+  // immediate live one.
+  Eigen::aligned_vector<Eigen::Vector3d> buildPointCloud() const;
+
  private:
   struct LoopKeyframe {
     int64_t t_ns;
