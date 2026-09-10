@@ -59,6 +59,43 @@ class MargDataSaver {
   tbb::concurrent_bounded_queue<OpticalFlowResult::Ptr> save_image_queue;
 };
 
+// Fans a single marginalization-data stream out to multiple consumers.
+// VioEstimatorBase::out_marg_queue is a single pointer -- only one consumer
+// at a time -- which used to force a choice between MargDataSaver (feeds
+// the offline basalt_mapper later) and OnlineLoopClosure (live correction
+// now): whichever one out_marg_queue pointed at got the data, the other got
+// nothing. Point out_marg_queue at this instead, and both get every
+// MargData::Ptr (including the closing nullptr sentinel) -- safe because
+// both existing consumers only ever read from what they're handed
+// (MargDataSaver::MargDataSaver()'s saving thread just serializes it;
+// OnlineLoopClosure::processKeyframe() only looks up frame_poses / iterates
+// opt_flow_res), never mutate it, so sharing the same shared_ptr is fine.
+class MargDataFanOut {
+ public:
+  using Ptr = std::shared_ptr<MargDataFanOut>;
+
+  explicit MargDataFanOut(
+      std::vector<tbb::concurrent_bounded_queue<MargData::Ptr>*> outputs)
+      : outputs_(std::move(outputs)) {
+    in_queue.set_capacity(1000);
+    thread_ = std::thread([this] {
+      MargData::Ptr data;
+      while (true) {
+        in_queue.pop(data);
+        for (auto* q : outputs_) q->push(data);
+        if (!data.get()) break;  // nullptr sentinel forwarded, then stop
+      }
+    });
+  }
+  ~MargDataFanOut() { thread_.join(); }
+
+  tbb::concurrent_bounded_queue<MargData::Ptr> in_queue;
+
+ private:
+  std::vector<tbb::concurrent_bounded_queue<MargData::Ptr>*> outputs_;
+  std::thread thread_;
+};
+
 class MargDataLoader {
  public:
   using Ptr = std::shared_ptr<MargDataLoader>;
