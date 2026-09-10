@@ -67,6 +67,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <CLI/CLI.hpp>
 
 #include <basalt/device/oak_d.h>
+#include <basalt/io/dashboard_client.h>
 #include <basalt/io/dataset_io.h>
 #include <basalt/io/marg_data_io.h>
 #include <basalt/utils/filesystem.h>
@@ -98,6 +99,8 @@ constexpr int UI_WIDTH = 200;
 
 basalt::OakDDevice::Ptr oakd_device;
 basalt::OnlineLoopClosure::Ptr online_loop_closure;
+basalt::MargDataFanOut::Ptr marg_fan_out;
+basalt::DashboardClient::Ptr dashboard_client;
 
 using Button = pangolin::Var<std::function<void(void)>>;
 
@@ -223,6 +226,16 @@ int main(int argc, char** argv) {
   app.add_option("--online-loop-closure", online_loop_closure_enabled,
                  "Enable live loop-closure correction (see OnlineLoopClosure).");
 
+  // VIO Dashboard integration (see basalt::DashboardClient). Leave
+  // --dashboard-host empty to disable -- no connection is attempted and
+  // every dashboard_client call site below is a no-op check.
+  std::string dashboard_host;
+  app.add_option("--dashboard-host", dashboard_host,
+                 "VIO Dashboard backend IP. Leave empty to disable.");
+  int dashboard_port = 8765;
+  app.add_option("--dashboard-port", dashboard_port,
+                 "Dashboard backend's PI5_TCP_PORT.");
+
   // Default: a fresh timestamped folder per run, so repeated test runs
   // don't clobber each other and can be compared later -- see
   // writeTrajectoryLogs() for what actually gets written into it.
@@ -303,26 +316,36 @@ int main(int argc, char** argv) {
   vio->out_state_queue = &out_state_queue;
 
   basalt::MargDataSaver::Ptr marg_data_saver;
-
   if (!marg_data_path.empty()) {
     marg_data_saver.reset(new basalt::MargDataSaver(marg_data_path));
-    vio->out_marg_queue = &marg_data_saver->in_marg_queue;
   }
 
-  // Mutually exclusive with --marg-data for now -- out_marg_queue only has
-  // one consumer slot (see plan's Phase 3 note).
   if (online_loop_closure_enabled) {
-    if (marg_data_saver) {
-      std::cerr << "--online-loop-closure and --marg-data are mutually "
-                   "exclusive (both want out_marg_queue). Ignoring "
-                   "--online-loop-closure."
-                << std::endl;
-    } else {
-      online_loop_closure.reset(
-          new basalt::OnlineLoopClosure(calib, vio_config));
-      online_loop_closure->start();
-      vio->out_marg_queue = &online_loop_closure->input_queue;
-    }
+    online_loop_closure.reset(
+        new basalt::OnlineLoopClosure(calib, vio_config));
+    online_loop_closure->start();
+  }
+
+  // out_marg_queue is a single pointer, but marg_data_saver (feeds the
+  // offline basalt_mapper later) and online_loop_closure (live correction
+  // now) can both legitimately want the same stream -- fan it out to
+  // whichever of the two are actually active instead of forcing a choice
+  // between them (see MargDataFanOut's own comment for why sharing the
+  // same MargData::Ptr between both is safe).
+  if (marg_data_saver && online_loop_closure) {
+    marg_fan_out.reset(new basalt::MargDataFanOut(
+        {&marg_data_saver->in_marg_queue, &online_loop_closure->input_queue}));
+    vio->out_marg_queue = &marg_fan_out->in_queue;
+  } else if (marg_data_saver) {
+    vio->out_marg_queue = &marg_data_saver->in_marg_queue;
+  } else if (online_loop_closure) {
+    vio->out_marg_queue = &online_loop_closure->input_queue;
+  }
+
+  if (!dashboard_host.empty()) {
+    dashboard_client.reset(
+        new basalt::DashboardClient(dashboard_host, dashboard_port));
+    dashboard_client->start();
   }
 
   vio_data_log.Clear();
@@ -371,6 +394,23 @@ int main(int argc, char** argv) {
         vio_t_w_i.emplace_back(T_w_i.translation());
       }
 
+      if (dashboard_client) {
+        Eigen::Quaterniond q = T_w_i.so3().unit_quaternion();
+        dashboard_client->sendPose(
+            t_ns, /*corrected=*/false, T_w_i.translation(),
+            Eigen::Vector4d(q.x(), q.y(), q.z(), q.w()), &vel_w_i);
+
+        if (online_loop_closure) {
+          Sophus::SE3d T_corrected;
+          if (online_loop_closure->getLatestCorrectedPose(T_corrected)) {
+            Eigen::Quaterniond qc = T_corrected.so3().unit_quaternion();
+            dashboard_client->sendPose(
+                t_ns, /*corrected=*/true, T_corrected.translation(),
+                Eigen::Vector4d(qc.x(), qc.y(), qc.z(), qc.w()));
+          }
+        }
+      }
+
       if (show_gui) {
         std::vector<float> vals;
         {
@@ -404,6 +444,43 @@ int main(int argc, char** argv) {
       }
     }));
   }
+
+  // Dashboard map-event/save-map polling. Deliberately its own thread
+  // rather than folded into the GUI frame loop below (like
+  // drain_vio_plot_queue()/drain_localization_queue() are) -- that loop
+  // only runs when show_gui is true, but a real flight (no display
+  // attached) needs this working regardless.
+  std::thread t6([&]() {
+    int last_num_closures = 0;
+    while (!terminate) {
+      if (dashboard_client) {
+        if (online_loop_closure) {
+          int n = online_loop_closure->numLoopClosures();
+          if (n > last_num_closures) {
+            last_num_closures = n;
+            int64_t t_ns;
+            {
+              std::lock_guard<std::mutex> lock(vio_state_mutex);
+              t_ns = curr_t_ns;
+            }
+            dashboard_client->sendMapEvent(t_ns, "loop_closure");
+          }
+        }
+
+        std::string cmd_run_id;
+        if (dashboard_client->pollSaveMapCommand(cmd_run_id) &&
+            online_loop_closure) {
+          auto points = online_loop_closure->buildPointCloud();
+          std::string ply_path = log_dir + "/live_map.ply";
+          if (basalt::writePointCloudPly(ply_path, points)) {
+            dashboard_client->sendMapFile("flight map", ply_path);
+          }
+        }
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+    std::cout << "Finished t6" << std::endl;
+  });
 
   if (show_gui) {
     pangolin::CreateWindowAndBind("OAK-D Lite Vio", 1800, 1000);
@@ -536,6 +613,9 @@ int main(int argc, char** argv) {
   if (t3.get()) t3->join();
   t4.join();
   if (t5.get()) t5->join();
+  t6.join();
+
+  if (dashboard_client) dashboard_client->stop();
 
   write_trajectory_logs(log_dir);
 
