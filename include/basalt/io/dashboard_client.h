@@ -48,8 +48,8 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 //
 // Threading model, matching the try_push/drop-if-full idiom already used
 // elsewhere in this codebase (e.g. OnlineLoopClosure::localization_queue,
-// vio_plot_queue in oak_d_vio.cpp): sendPose/sendImage/sendMapEvent are
-// called from hot VIO/GUI threads and must never block on network I/O, so
+// vio_plot_queue in oak_d_vio.cpp): sendPose/sendMapEvent are called from
+// hot VIO/GUI threads and must never block on network I/O, so
 // they only ever push onto a bounded queue and return immediately, silently
 // dropping the message if the queue is full (the connection is down, or
 // badly lagging) rather than backing up the caller. A dedicated writer
@@ -73,7 +73,6 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <tbb/concurrent_queue.h>
 
 #include <Eigen/Core>
-#include <opencv2/core/mat.hpp>
 
 #include <basalt/utils/eigen_utils.hpp>
 
@@ -104,12 +103,6 @@ class DashboardClient {
   void sendPose(int64_t t_ns, bool corrected, const Eigen::Vector3d& p,
                 const Eigen::Vector4d& quat_xyzw,
                 const Eigen::Vector3d* vel_w_i = nullptr);
-
-  // frame: BGR or grayscale, whatever oak_d.cpp already hands the GUI --
-  // this JPEG-encodes it internally. cam_id matches the dashboard's
-  // existing cam0/cam1 convention (see cameraPanels.js).
-  void sendImage(int cam_id, int64_t t_ns, const cv::Mat& frame,
-                 const std::vector<cv::Point2f>& keypoints = {});
 
   // event: one of "loop_closure" | "keyframe" | "map_saved" | "reinit",
   // matching MapEventType in schema.py exactly (any other string is

@@ -49,8 +49,6 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <sstream>
 
 #include <nlohmann/json.hpp>
-#include <opencv2/imgcodecs.hpp>
-#include <opencv2/imgproc.hpp>
 
 namespace basalt {
 
@@ -244,29 +242,6 @@ void DashboardClient::sendPose(int64_t t_ns, bool corrected,
   out_queue_.try_push(j.dump());
 }
 
-void DashboardClient::sendImage(int cam_id, int64_t t_ns, const cv::Mat& frame,
-                                 const std::vector<cv::Point2f>& keypoints) {
-  // Quality 70, matching the decimation/size tradeoff already chosen on
-  // the Jetson side (jetson_adapter.py) -- keep both sources comparable.
-  std::vector<uchar> jpeg_buf;
-  if (!cv::imencode(".jpg", frame, jpeg_buf, {cv::IMWRITE_JPEG_QUALITY, 70})) {
-    return;
-  }
-
-  nlohmann::json j;
-  j["type"] = "image";
-  j["run_id"] = "ignored";
-  j["cam_id"] = cam_id;
-  j["t_ns"] = t_ns;
-  j["jpeg_b64"] = base64Encode(jpeg_buf.data(), jpeg_buf.size());
-
-  auto kps = nlohmann::json::array();
-  for (const auto& kp : keypoints) kps.push_back({{"x", kp.x}, {"y", kp.y}});
-  j["keypoints"] = kps;
-
-  out_queue_.try_push(j.dump());
-}
-
 void DashboardClient::sendMapEvent(int64_t t_ns, const std::string& event,
                                     const std::string& detail_json) {
   nlohmann::json j;
@@ -301,7 +276,7 @@ bool DashboardClient::sendMapFile(const std::string& name,
       reinterpret_cast<const unsigned char*>(bytes.data()), bytes.size());
 
   // This one deliberately bypasses out_queue_ (which is sized for many
-  // small pose/image messages, not one multi-MB payload) and blocks
+  // small pose/map_event messages, not one multi-MB payload) and blocks
   // briefly waiting for room -- see the class comment on why that's fine
   // here specifically.
   std::string line = j.dump();
