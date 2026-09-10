@@ -303,13 +303,20 @@ int main(int argc, char** argv) {
   }
 
   opt_flow_ptr = basalt::OpticalFlowFactory::getOpticalFlow(vio_config, calib);
-  oakd_device->setOutputQueues(&opt_flow_ptr->input_queue, nullptr);
 
   vio = basalt::VioEstimatorFactory::getVioEstimator(
       vio_config, calib, basalt::constants::g, true, use_double);
-  vio->initialize(Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero());
+
+  // Wire the real IMU queue in BEFORE initialize(): initialize() spawns a
+  // background thread that immediately does a blocking pop off
+  // vio->imu_data_queue expecting the device to already be pushing into
+  // it. This used to run the other way around (device pointed at a null
+  // IMU queue, then initialize(), then the real queue wired in after),
+  // which reproduced a same-run "first IMU measurment is nullptr" abort
+  // on the Pi5 in headless (--show-gui false) testing.
   oakd_device->setOutputQueues(&opt_flow_ptr->input_queue,
                                &vio->imu_data_queue);
+  vio->initialize(Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero());
 
   opt_flow_ptr->output_queue = &vio->vision_data_queue;
   if (show_gui) vio->out_vis_queue = &out_vis_queue;
@@ -597,6 +604,16 @@ int main(int argc, char** argv) {
       }
 
       pangolin::FinishFrame();
+    }
+  } else {
+    // No GUI event loop to keep the process alive while flying headless --
+    // block here until Ctrl-C/SIGTERM (handle_shutdown_signal) requests a
+    // clean shutdown, the same role pangolin::ShouldQuit() plays above.
+    // Without this, main() previously fell straight through to shutdown
+    // within milliseconds of starting whenever --show-gui was false --
+    // headless flight never actually ran at all before this fix.
+    while (!terminate) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
   }
 
