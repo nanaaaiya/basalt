@@ -569,11 +569,14 @@ int main(int argc, char** argv) {
         input->cam_id = 0;
         occupancy_mapper->addDepthFrame(input);
 
-        // Step D observation only -- dashboard wiring is a later step.
         basalt::VoxelDelta delta;
         while (occupancy_mapper->pollVoxelDelta(delta)) {
           total_added += delta.added.size();
           total_removed += delta.removed.size();
+          if (dashboard_client) {
+            dashboard_client->sendVoxelBatch(input->t_ns, occupancy_voxel_size,
+                                              delta.added, delta.removed);
+          }
         }
       }
 
