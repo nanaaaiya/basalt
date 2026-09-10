@@ -14,6 +14,7 @@
     "lz4",
     "magic-enum",
     "nlohmann-json",
+    "octomap",
     {
       "name": "opencv4",
       "default-features": false,
