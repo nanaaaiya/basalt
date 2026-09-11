@@ -190,6 +190,15 @@ class OnlineLoopClosure {
   bool getSmoothedCorrectedPose(const Sophus::SE3d& current_raw_pose,
                                  Sophus::SE3d& out) const;
 
+  // True while the drift gate is holding the live pose (see
+  // solvePoseGraph()'s drift-gate comment and kDriftGateThresholdM in the
+  // .cpp) -- getSmoothedCorrectedPose() freezes at the last trusted pose
+  // while this is true, instead of advancing onto a newly-solved position
+  // whose odometry-edge residual looks implausible. Exposed so a caller
+  // (e.g. oak_d_vio.cpp) can surface a clear alert when this changes,
+  // rather than the pose just silently stopping.
+  bool isDriftHeld() const;
+
   // Same as getCorrectedTrajectory(), but paired with each keyframe's
   // timestamp -- needed for logging/analysis (matching timestamps up
   // against the raw VIO trajectory, sample rate, etc.), not just drawing a
@@ -262,6 +271,7 @@ class OnlineLoopClosure {
   void processingLoop();
   void processKeyframe(const MargData::Ptr& data, int64_t kf_id);
   void solvePoseGraph();
+  void checkDriftGate();  // called by solvePoseGraph() -- see its .cpp comment
 
   Calibration<double> calib_;
   VioConfig config_;
@@ -280,6 +290,20 @@ class OnlineLoopClosure {
   // happens to also clear the quality bar (plausible to fail right at
   // startup, camera still settling).
   int64_t home_keyframe_t_ns_ = -1;
+
+  // Drift gate (see checkDriftGate() in the .cpp): while held, the live
+  // pose (getSmoothedCorrectedPose()) freezes at held_pose_ instead of
+  // advancing, and the graph keeps solving normally in the background so
+  // it still has a chance to self-correct before the hold is released.
+  bool drift_held_ = false;
+  Sophus::SE3d held_pose_;
+  // Raw pose of the keyframe held_pose_ was taken from -- lets recovery
+  // checks chain real raw motion since the anchor forward, rather than
+  // just comparing adjacent nodes (two adjacent corrupted nodes can
+  // agree with each other while both still being wrong relative to the
+  // last point actually known to be good).
+  Sophus::SE3d held_anchor_raw_pose_;
+  int drift_gate_stable_count_ = 0;
 
   mutable std::mutex state_mutex_;
   // Counts accepted loop EDGES, not keyframes that found a match -- a

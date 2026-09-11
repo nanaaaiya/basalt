@@ -157,6 +157,26 @@ constexpr size_t kMaxLoopEdgesPerKeyframe = 3;
 // long-range match produces), not yet empirically tuned.
 constexpr double kLoopEdgeHuberDeltaM = 0.5;
 
+// Drift gate (see OnlineLoopClosure::checkDriftGate()): how far the
+// newest keyframe's just-solved corrected position is allowed to diverge
+// from what smoothly chaining raw odometry off the PREVIOUS (trusted)
+// node's own corrected position would predict, before the live pose
+// freezes instead of advancing onto it. This is deliberately NOT an
+// absolute jump-distance threshold (that would false-trigger during
+// genuinely fast real motion) -- it's measured against what raw motion
+// alone already explains, so it stays near-zero under normal conditions
+// regardless of how fast the platform is actually moving, and only spikes
+// when a correction is fighting hard against what the raw odometry chain
+// says actually happened. 1.0m is well above normal solve-to-solve noise
+// (observed sub-cm to a few cm on real Pi5 sessions) and well below a
+// genuine bad-closure jump (multi-meter, per the documented EuRoC case).
+constexpr double kDriftGateThresholdM = 1.0;
+
+// How many consecutive solves must show the residual back under
+// kDriftGateThresholdM before the hold releases -- requires the recovery
+// to look real, not a single lucky solve amid ongoing instability.
+constexpr int kDriftGateReleaseCount = 3;
+
 // Decompose R = Rz(yaw) * Ry(pitch) * Rx(roll). Assumes no gimbal lock
 // (pitch away from +-90 deg), a reasonable assumption for a handheld/mobile
 // device that isn't doing full vertical flips.
@@ -932,6 +952,78 @@ void OnlineLoopClosure::solvePoseGraph() {
 
     if (dx.norm() < 1e-7) break;
   }
+
+  checkDriftGate();
+}
+
+// Called only from solvePoseGraph(), which already holds state_mutex_ --
+// must not try to re-lock it (non-recursive mutex, would deadlock).
+//
+// See kDriftGateThresholdM's comment for the full reasoning. Short
+// version: compares the newest keyframe's just-solved corrected position
+// against what chaining its real raw-VIO motion off a trusted reference
+// would predict. Not held: the reference is simply the previous
+// keyframe (a lightweight, always-on tripwire). Held: the reference is
+// the frozen anchor (held_pose_/held_anchor_raw_pose_) instead of the
+// immediately preceding node, since a corrupted region can have
+// adjacent nodes that agree with each other while still being
+// collectively wrong relative to the last point actually known good --
+// deliberately asymmetric (quick to trip, more carefully verified to
+// release), which is the right shape for a safety gate.
+void OnlineLoopClosure::checkDriftGate() {
+  size_t n = keyframes_.size();
+  if (n < 2) return;
+
+  const LoopKeyframe& newest = keyframes_[n - 1];
+  Sophus::SE3d T_newest_corrected(composeYPR(newest.roll, newest.pitch, newest.yaw),
+                                  newest.t_opt);
+
+  Sophus::SE3d T_reference_corrected;
+  Sophus::SE3d T_reference_raw;
+  if (drift_held_) {
+    T_reference_corrected = held_pose_;
+    T_reference_raw = held_anchor_raw_pose_;
+  } else {
+    const LoopKeyframe& prev = keyframes_[n - 2];
+    T_reference_corrected =
+        Sophus::SE3d(composeYPR(prev.roll, prev.pitch, prev.yaw), prev.t_opt);
+    T_reference_raw = prev.T_w_i_raw;
+  }
+
+  Sophus::SE3d T_raw_delta = T_reference_raw.inverse() * newest.T_w_i_raw;
+  Sophus::SE3d T_predicted = T_reference_corrected * T_raw_delta;
+  double residual_m =
+      (T_newest_corrected.translation() - T_predicted.translation()).norm();
+
+  if (residual_m > kDriftGateThresholdM) {
+    if (!drift_held_) {
+      const LoopKeyframe& prev = keyframes_[n - 2];
+      held_pose_ = Sophus::SE3d(composeYPR(prev.roll, prev.pitch, prev.yaw), prev.t_opt);
+      held_anchor_raw_pose_ = prev.T_w_i_raw;
+      drift_held_ = true;
+      std::cout << "[ONLINE-LOOP] DRIFT GATE TRIPPED: kf=" << (n - 1)
+                << " residual=" << residual_m
+                << "m (threshold=" << kDriftGateThresholdM
+                << "m) -- holding live pose at kf=" << (n - 2) << std::endl;
+    }
+    drift_gate_stable_count_ = 0;
+    return;
+  }
+
+  if (!drift_held_) return;  // nothing to release
+
+  if (++drift_gate_stable_count_ >= kDriftGateReleaseCount) {
+    drift_held_ = false;
+    drift_gate_stable_count_ = 0;
+    std::cout << "[ONLINE-LOOP] DRIFT GATE RELEASED: kf=" << (n - 1)
+              << " residual back under threshold for " << kDriftGateReleaseCount
+              << " consecutive solves" << std::endl;
+  }
+}
+
+bool OnlineLoopClosure::isDriftHeld() const {
+  std::lock_guard<std::mutex> lock(state_mutex_);
+  return drift_held_;
 }
 
 Eigen::aligned_vector<Eigen::Vector3d> OnlineLoopClosure::getCorrectedTrajectory()
@@ -969,6 +1061,19 @@ bool OnlineLoopClosure::getSmoothedCorrectedPose(
     const Sophus::SE3d& current_raw_pose, Sophus::SE3d& out) const {
   std::lock_guard<std::mutex> lock(state_mutex_);
   if (keyframes_.empty()) return false;
+
+  // Drift gate (see checkDriftGate()): while held, the live pose stays
+  // fixed at the last trusted point instead of advancing -- even with
+  // real raw motion since then -- rather than following a newly-solved
+  // position whose odometry-edge residual looks implausible. The graph
+  // keeps solving normally in the background regardless (processKeyframe
+  // isn't gated by this), so it still gets a chance to self-correct;
+  // only what's published live is held back until it does.
+  if (drift_held_) {
+    out = held_pose_;
+    return true;
+  }
+
   const LoopKeyframe& kf = keyframes_.back();
   Sophus::SE3d T_w_i_corrected_kf(composeYPR(kf.roll, kf.pitch, kf.yaw),
                                    kf.t_opt);

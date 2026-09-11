@@ -503,6 +503,7 @@ int main(int argc, char** argv) {
   // attached) needs this working regardless.
   std::thread t6([&]() {
     int last_num_closures = 0;
+    bool last_drift_held = false;
     while (!terminate) {
       if (dashboard_client) {
         if (online_loop_closure) {
@@ -515,6 +516,21 @@ int main(int argc, char** argv) {
               t_ns = curr_t_ns;
             }
             dashboard_client->sendMapEvent(t_ns, "loop_closure");
+          }
+
+          // Surface the drift gate's state (see OnlineLoopClosure's
+          // checkDriftGate()) so a held pose is a clear, visible alert on
+          // the dashboard rather than the pose just silently stopping --
+          // only on the transition, not every poll.
+          bool held = online_loop_closure->isDriftHeld();
+          if (held != last_drift_held) {
+            last_drift_held = held;
+            int64_t t_ns;
+            {
+              std::lock_guard<std::mutex> lock(vio_state_mutex);
+              t_ns = curr_t_ns;
+            }
+            dashboard_client->sendMapEvent(t_ns, held ? "drift_hold" : "drift_recovered");
           }
         }
 
