@@ -32,6 +32,17 @@ cv::Mat makeCenterPixelDepth(uint16_t depth_mm) {
   return depth;
 }
 
+// Records that the calibration's own intrinsics were computed for a
+// 100x100 image (matching makeTestCalib()'s fx=fy=100, cx=cy=50), for the
+// resolution-mismatch test below -- makeTestCalib() itself leaves
+// calib.resolution empty, which every other test above relies on to keep
+// insertFrame()'s scale factor at a no-op 1.0.
+basalt::Calibration<double> makeTestCalibWithResolution(int w, int h) {
+  basalt::Calibration<double> calib = makeTestCalib();
+  calib.resolution.push_back(Eigen::Vector2i(w, h));
+  return calib;
+}
+
 // pollVoxelDelta() is fed by an async processing thread -- poll with a
 // generous timeout rather than assuming it's ready the instant
 // addDepthFrame() returns.
@@ -177,6 +188,39 @@ TEST(OccupancyMapperTest, AllInvalidDepthProducesNoDelta) {
 
   basalt::VoxelDelta delta;
   EXPECT_FALSE(pollWithTimeout(mapper, delta, /*timeout_ms=*/300));
+
+  mapper.stop();
+}
+
+TEST(OccupancyMapperTest, DepthResolutionLowerThanCalibrationIsScaled) {
+  // Reproduces the real "fan-shaped map" bug: the depth stream outputs at
+  // half the calibration's resolution (mirrors DepthAI's StereoDepth
+  // DEFAULT preset producing 320x240 depth against a 640x480 calibration).
+  // The calibration here is declared for a 100x100 image (fx=fy=100,
+  // cx=cy=50), but the depth frame is only 50x50 -- so the true principal
+  // point (50, 50) lands at (25, 25) in the actual depth image. Without
+  // the fix, pixel (25, 25) is unprojected directly, landing far off the
+  // optical axis and back-projecting to the wrong point; with the fix, it
+  // scales up to (50, 50) before unprojecting, giving exactly the same
+  // on-axis (0, 0, depth) result as SingleRayMarksOneOccupiedVoxel above.
+  basalt::OccupancyMapper mapper(makeTestCalibWithResolution(100, 100),
+                                  /*voxel_size=*/0.2, /*depth_stride=*/1);
+  mapper.start();
+
+  auto frame = std::make_shared<basalt::DepthFrameInput>();
+  frame->T_w_c = Sophus::SE3d();
+  frame->depth_mm = cv::Mat::zeros(50, 50, CV_16UC1);
+  frame->depth_mm.at<uint16_t>(25, 25) = 2100;  // half-res principal point
+  mapper.addDepthFrame(frame);
+
+  basalt::VoxelDelta delta;
+  ASSERT_TRUE(pollWithTimeout(mapper, delta));
+  ASSERT_EQ(delta.added.size(), 1u);
+
+  const Eigen::Vector3d& p = delta.added[0];
+  EXPECT_NEAR(p.x(), 0.0, 0.2);
+  EXPECT_NEAR(p.y(), 0.0, 0.2);
+  EXPECT_NEAR(p.z(), 2.1, 0.2);
 
   mapper.stop();
 }

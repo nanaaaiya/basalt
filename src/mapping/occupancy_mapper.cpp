@@ -93,6 +93,26 @@ void OccupancyMapper::insertFrame(const DepthFrameInput::Ptr& frame) {
   const auto& cam = calib_.intrinsics[frame->cam_id];
   const cv::Mat& depth = frame->depth_mm;
 
+  // The depth node is free to output at a lower resolution than the
+  // calibration's (DepthAI's StereoDepth default preset does this --
+  // observed 320x240 depth frames against a 640x480 calibration). The
+  // intrinsics (fx, fy, cx, cy) are only valid in the calibration's own
+  // resolution, so a raw depth-image pixel must be rescaled into that
+  // resolution before unprojecting -- otherwise every pixel is
+  // back-projected through the wrong focal length/principal point,
+  // distorting the point cloud more the further a pixel is from center.
+  // This keeps the fix correct at whatever resolution the depth stream
+  // actually outputs, rather than forcing the device to output at full
+  // calibration resolution (which costs real USB bandwidth and can
+  // destabilize an already-marginal connection).
+  double scale_u = 1.0, scale_v = 1.0;
+  if (static_cast<size_t>(frame->cam_id) < calib_.resolution.size() &&
+      depth.cols > 0 && depth.rows > 0) {
+    const Eigen::Vector2i& calib_res = calib_.resolution[frame->cam_id];
+    scale_u = static_cast<double>(calib_res.x()) / depth.cols;
+    scale_v = static_cast<double>(calib_res.y()) / depth.rows;
+  }
+
   // Back-project every depth_stride_'th pixel into a world-frame point
   // cloud. Each pixel's camera model unproject() gives a unit bearing
   // vector (not a z=1-plane point -- see basalt-headers' camera models),
@@ -106,7 +126,8 @@ void OccupancyMapper::insertFrame(const DepthFrameInput::Ptr& frame) {
       uint16_t d_mm = row[u];
       if (d_mm == 0) continue;  // no valid return at this pixel
 
-      Eigen::Vector2d proj(static_cast<double>(u), static_cast<double>(v));
+      Eigen::Vector2d proj(static_cast<double>(u) * scale_u,
+                            static_cast<double>(v) * scale_v);
       Eigen::Vector3d bearing;
       if (!cam.unproject(proj, bearing)) continue;
       if (bearing.z() <= 1e-6) continue;  // behind or parallel to the image plane

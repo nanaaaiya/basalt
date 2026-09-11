@@ -98,6 +98,16 @@ void OakDDevice::start() {
     // they're the same raw, unrectified outputs VIO also reads.
     auto stereo = pipeline.create<dai::node::StereoDepth>();
     stereo->setDefaultProfilePreset(dai::node::StereoDepth::PresetMode::DEFAULT);
+    // The DEFAULT preset downscales its own output resolution regardless
+    // of the 640x480 mono input (found producing 320x240 depth frames in
+    // testing). Deliberately left at that lower resolution rather than
+    // forced up to 640x480: doing so quadruples the depth data volume over
+    // USB, which reproduced this device's known connection-crash pattern
+    // in live testing. OccupancyMapper::insertFrame() instead scales pixel
+    // coordinates to match the calibration's resolution before
+    // unprojecting, so the intrinsics stay correct at whatever resolution
+    // the depth stream actually outputs -- see its comment for the fuller
+    // explanation of the fan-shaped-map bug this was fixing.
     leftOut->link(stereo->left);
     rightOut->link(stereo->right);
     q_depth = stereo->depth.createOutputQueue(8, false);
