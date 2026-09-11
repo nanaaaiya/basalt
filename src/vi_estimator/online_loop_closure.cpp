@@ -134,6 +134,20 @@ constexpr size_t kMaxCandidatesToVerify = 5;
 // keyframe-to-keyframe density.
 constexpr int64_t kMinLoopClosureTimeGapNs = 2'000'000'000;
 
+// How many independently-verified closures a single keyframe may
+// contribute as pose-graph edges, instead of stopping at the first (as
+// before). A node backed by only 1-2 edges has no competing evidence to
+// resist a single bad one dragging it off -- the one documented failure
+// case (see this file's header, KNOWN LIMITATION) had exactly this
+// shape: 2 odometry + 1 bad loop edge, 3 total, nothing else in the
+// graph to outvote the bad one with. Multiple independent edges per
+// keyframe give the solver real redundancy to outvote an occasional
+// wrong closure with, at the cost of (at most) this many PnP-RANSAC
+// verifications' worth of extra compute per keyframe -- already bounded
+// by kMaxCandidatesToVerify regardless of this cap, so the worst case
+// doesn't change, only the average shifts toward it more often.
+constexpr size_t kMaxLoopEdgesPerKeyframe = 3;
+
 // Huber threshold (meters) for robust down-weighting of loop-closure edges
 // in solvePoseGraph() -- see the comment at its use site. A residual under
 // this is treated as normal noise (full weight); beyond it, weight falls
@@ -282,6 +296,17 @@ bool triangulateMidpoint(const Eigen::Vector3d& d0, const Eigen::Vector3d& O1,
 
   return point.norm() <= 30.0;  // reject absurdly-far triangulations
 }
+
+// One verified match accepted during a single keyframe's candidate loop
+// -- see kMaxLoopEdgesPerKeyframe above for why more than one can be
+// accepted per keyframe now, instead of stopping at the first.
+struct AcceptedClosure {
+  size_t partner_idx;
+  Sophus::SE3d T_body_partner_new;
+  int num_inliers;
+
+  EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+};
 
 }  // namespace
 
@@ -433,10 +458,9 @@ void OnlineLoopClosure::processKeyframe(const MargData::Ptr& data,
   auto t2 = std::chrono::steady_clock::now();
 
   // --- Loop detection: query BoW DB restricted to earlier keyframes ---
-  bool have_loop = false;
-  size_t loop_partner_idx = 0;
-  Sophus::SE3d T_body_partner_new;
-  int loop_num_inliers = 0;
+  // Up to kMaxLoopEdgesPerKeyframe independently-verified matches get
+  // accepted here, not just the first -- see that constant's comment.
+  Eigen::aligned_vector<AcceptedClosure> accepted_closures;
 
   {
     std::vector<std::pair<TimeCamId, double>> results;
@@ -474,6 +498,8 @@ void OnlineLoopClosure::processKeyframe(const MargData::Ptr& data,
     }
 
     for (const auto& cand : above_threshold) {
+      if (accepted_closures.size() >= kMaxLoopEdgesPerKeyframe) break;
+
       const LoopKeyframe* partner = nullptr;
       size_t partner_idx = 0;
       int64_t partner_t_ns = 0;
@@ -563,9 +589,8 @@ void OnlineLoopClosure::processKeyframe(const MargData::Ptr& data,
       // be rejected anyway is pure waste, and the per-keyframe candidate
       // loop can attempt up to kMaxCandidatesToVerify of these -- so
       // checking the cheap raw count first, before paying for refinement,
-      // bounds the common case to at most one refinement call per keyframe
-      // (the loop breaks on first accepted candidate) instead of up to
-      // kMaxCandidatesToVerify of them on failed attempts.
+      // avoids that cost on every failed attempt, not just the ones after
+      // kMaxLoopEdgesPerKeyframe has already been reached.
       if ((int)ransac.inliers_.size() < config_.mapper_min_matches) {
         std::cout << "              ransac_inliers=" << ransac.inliers_.size()
                   << " (raw, pre-refinement)" << std::endl;
@@ -607,10 +632,12 @@ void OnlineLoopClosure::processKeyframe(const MargData::Ptr& data,
           ransac.model_coefficients_.topLeftCorner<3, 3>(),
           ransac.model_coefficients_.topRightCorner<3, 1>());
 
-      have_loop = true;
-      loop_partner_idx = partner_idx;
-      T_body_partner_new =
+      AcceptedClosure closure;
+      closure.partner_idx = partner_idx;
+      closure.T_body_partner_new =
           calib_.T_i_c[0] * T_partnerCam_newCam * calib_.T_i_c[0].inverse();
+      closure.num_inliers = (int)ransac.inliers_.size();
+      accepted_closures.push_back(closure);
 
       // Publish the localization result immediately -- before the
       // pose-graph insertion/solve below -- so consumers that need "where
@@ -618,24 +645,26 @@ void OnlineLoopClosure::processKeyframe(const MargData::Ptr& data,
       // slower global solve. Composed against the reference keyframe's
       // current CORRECTED pose (already reflecting any earlier loop
       // closures), not its raw VIO pose, so T_w_current is already
-      // globally-consistent without needing a fresh solve first.
+      // globally-consistent without needing a fresh solve first. Published
+      // for every accepted closure, not just one -- a consumer wanting
+      // "the freshest single answer" can just take the latest off the
+      // queue, same as before.
       {
         LocalizationResult loc;
         loc.t_ns = kf_id;
         loc.reference_t_ns = partner_t_ns;
-        loc.T_reference_current = T_body_partner_new;
+        loc.T_reference_current = closure.T_body_partner_new;
         Sophus::SE3d T_w_reference_corrected(
             composeYPR(partner->roll, partner->pitch, partner->yaw),
             partner->t_opt);
-        loc.T_w_current = T_w_reference_corrected * T_body_partner_new;
-        loc.num_inliers = (int)ransac.inliers_.size();
-        loop_num_inliers = loc.num_inliers;
+        loc.T_w_current = T_w_reference_corrected * closure.T_body_partner_new;
+        loc.num_inliers = closure.num_inliers;
         localization_queue.try_push(loc);
       }
 
-      std::cout << "              RESULT: ACCEPTED (loop closure #"
-                << (num_loop_closures.load() + 1) << ")" << std::endl;
-      break;  // first verified candidate wins -- keep it simple
+      std::cout << "              RESULT: ACCEPTED (edge " << accepted_closures.size()
+                << " of up to " << kMaxLoopEdgesPerKeyframe
+                << " for this keyframe)" << std::endl;
     }
   }
 
@@ -665,13 +694,13 @@ void OnlineLoopClosure::processKeyframe(const MargData::Ptr& data,
       edges_.push_back(e);
     }
 
-    if (have_loop) {
+    for (const auto& closure : accepted_closures) {
       PoseGraphEdge e;
-      e.i = loop_partner_idx;
+      e.i = closure.partner_idx;
       e.j = new_idx;
-      e.dt = T_body_partner_new.translation();
+      e.dt = closure.T_body_partner_new.translation();
       double r, p, y;
-      decomposeYPR(T_body_partner_new.rotationMatrix(), r, p, y);
+      decomposeYPR(closure.T_body_partner_new.rotationMatrix(), r, p, y);
       e.dyaw = y;
       // See PoseGraphEdge::weight comment (online_loop_closure.h) -- a
       // closure that just barely cleared mapper_min_matches gets the same
@@ -679,15 +708,18 @@ void OnlineLoopClosure::processKeyframe(const MargData::Ptr& data,
       // times as many inliers pulls proportionally harder, capped at 5x so
       // a single very-strong match can't dominate the graph unboundedly.
       e.weight = std::clamp(
-          loop_num_inliers / std::max(1.0, config_.mapper_min_matches), 1.0,
+          closure.num_inliers / std::max(1.0, config_.mapper_min_matches), 1.0,
           5.0);
       e.is_loop = true;
       edges_.push_back(e);
 
       num_loop_closures++;
       need_resolve = true;
+    }
 
-      std::cout << "              (graph updated, total_closures="
+    if (!accepted_closures.empty()) {
+      std::cout << "              (graph updated, " << accepted_closures.size()
+                << " loop edge(s) added this keyframe, total_closures="
                 << num_loop_closures.load() << ")" << std::endl;
     }
 

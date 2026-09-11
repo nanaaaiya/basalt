@@ -80,6 +80,15 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 //      graph to outvote a bad edge with, so the solver just satisfies all
 //      three edges by bending to the wrong position instead of the bad
 //      edge showing up as a residual outlier.
+//   4. Accepting more than one independently-verified closure per
+//      keyframe (up to kMaxLoopEdgesPerKeyframe, .cpp), instead of
+//      stopping at the first -- targets exactly the "corrupted node had
+//      only 3 edges" gap #3 describes, by giving the solver a real
+//      chance at competing evidence from the start rather than relying
+//      on some later, unrelated closure to happen to touch the same
+//      node. On a branch (loop-closure-multi-edge-redundancy), pending
+//      live/EuRoC verification before merging -- update this note with
+//      the outcome once tested.
 // The real fix would be a richer graph with actual landmark-level
 // redundancy (multiple independent point observations per closure, like
 // Basalt's own offline basalt_mapper) -- deliberately NOT pursued now:
@@ -273,6 +282,10 @@ class OnlineLoopClosure {
   int64_t home_keyframe_t_ns_ = -1;
 
   mutable std::mutex state_mutex_;
+  // Counts accepted loop EDGES, not keyframes that found a match -- a
+  // single keyframe can now contribute more than one (see
+  // kMaxLoopEdgesPerKeyframe in the .cpp), so this can exceed the number
+  // of keyframes that ever closed a loop.
   std::atomic<int> num_loop_closures{0};
 
   std::atomic<bool> running{false};
