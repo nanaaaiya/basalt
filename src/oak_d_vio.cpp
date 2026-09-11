@@ -448,7 +448,12 @@ int main(int argc, char** argv) {
 
         if (online_loop_closure) {
           Sophus::SE3d T_corrected;
-          if (online_loop_closure->getLatestCorrectedPose(T_corrected)) {
+          // Smoothed (rebased-by-raw-motion), not the newest pose-graph
+          // node's own position directly -- see getSmoothedCorrectedPose()
+          // comment. The latter jumped visibly on every re-solve, most
+          // noticeably with the camera near-stationary (confirmed live:
+          // 197 closures over 325 keyframes in one such test).
+          if (online_loop_closure->getSmoothedCorrectedPose(T_w_i, T_corrected)) {
             Eigen::Quaterniond qc = T_corrected.so3().unit_quaternion();
             dashboard_client->sendPose(
                 t_ns, /*corrected=*/true, T_corrected.translation(),
@@ -549,13 +554,23 @@ int main(int argc, char** argv) {
         if (now - last_processed < min_interval) continue;  // rate budget
         last_processed = now;
 
-        Sophus::SE3d pose;
-        bool have_pose = online_loop_closure &&
-                         online_loop_closure->getLatestCorrectedPose(pose);
-        if (!have_pose) {
+        Sophus::SE3d raw_now;
+        {
           std::lock_guard<std::mutex> lock(vio_state_mutex);
           if (curr_t_ns < 0) continue;  // no VIO pose yet at all
-          pose = curr_raw_pose;
+          raw_now = curr_raw_pose;
+        }
+
+        // Smoothed, same reasoning as t4's dashboard send above -- using
+        // the raw jump-prone getLatestCorrectedPose() here would place
+        // voxels at a wobbling position even while the camera holds
+        // still, distorting the map with no real motion behind it.
+        Sophus::SE3d pose = raw_now;
+        if (online_loop_closure) {
+          Sophus::SE3d corrected;
+          if (online_loop_closure->getSmoothedCorrectedPose(raw_now, corrected)) {
+            pose = corrected;
+          }
         }
 
         double t_sec = std::chrono::duration<double>(
@@ -647,17 +662,19 @@ int main(int argc, char** argv) {
         // closure snap, which used to make the camera chase the wrong
         // trajectory. Falls back to the raw pose only when loop closure
         // isn't running at all (or hasn't produced a keyframe yet).
+        // Smoothed, not the newest node's raw position, for the same
+        // reason as t4/t7 above -- see getSmoothedCorrectedPose().
         Sophus::SE3d T_w_i;
         bool have_pose = false;
 
-        if (online_loop_closure && online_loop_closure->getLatestCorrectedPose(T_w_i)) {
-          have_pose = true;
-        } else {
-          auto vis_data = get_curr_vis_data_snapshot();
-          if (vis_data.get()) {
-            T_w_i = vis_data->states.back();
-            have_pose = true;
+        auto vis_data = get_curr_vis_data_snapshot();
+        if (vis_data.get() && !vis_data->states.empty()) {
+          Sophus::SE3d raw_now = vis_data->states.back();
+          if (!(online_loop_closure &&
+                online_loop_closure->getSmoothedCorrectedPose(raw_now, T_w_i))) {
+            T_w_i = raw_now;
           }
+          have_pose = true;
         }
 
         if (have_pose) {
@@ -804,7 +821,7 @@ void draw_image_overlay(pangolin::View& v, size_t cam_id) {
 
     if (online_loop_closure) {
       Sophus::SE3d T_corrected;
-      if (online_loop_closure->getLatestCorrectedPose(T_corrected)) {
+      if (online_loop_closure->getSmoothedCorrectedPose(T_w_i, T_corrected)) {
         Eigen::Vector3d pc = T_corrected.translation();
         glColor3f(0.0, 0.5, 1.0);
         pangolin::default_font()
@@ -888,10 +905,11 @@ void draw_scene() {
     // can sit meters away from the corrected pose right after a big loop
     // closure snap and looks like the marker "teleported" relative to what
     // the screen otherwise reports.
-    if (online_loop_closure) {
+    if (online_loop_closure && vis_data.get() && !vis_data->states.empty()) {
       static const uint8_t corrected_cam_color[3]{0, 128, 255};
       Sophus::SE3d T_w_i_corrected;
-      if (online_loop_closure->getLatestCorrectedPose(T_w_i_corrected)) {
+      if (online_loop_closure->getSmoothedCorrectedPose(vis_data->states.back(),
+                                                          T_w_i_corrected)) {
         for (const auto& t_i_c : calib.T_i_c)
           render_camera((T_w_i_corrected * t_i_c).matrix(), 2.0f,
                         corrected_cam_color, 0.1f);

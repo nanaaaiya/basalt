@@ -933,6 +933,22 @@ bool OnlineLoopClosure::getLatestCorrectedPose(Sophus::SE3d& out) const {
   return true;
 }
 
+bool OnlineLoopClosure::getSmoothedCorrectedPose(
+    const Sophus::SE3d& current_raw_pose, Sophus::SE3d& out) const {
+  std::lock_guard<std::mutex> lock(state_mutex_);
+  if (keyframes_.empty()) return false;
+  const LoopKeyframe& kf = keyframes_.back();
+  Sophus::SE3d T_w_i_corrected_kf(composeYPR(kf.roll, kf.pitch, kf.yaw),
+                                   kf.t_opt);
+  // Raw motion since this keyframe was captured -- kf.T_w_i_raw and
+  // current_raw_pose are both raw VIO poses in the same (uncorrected)
+  // world frame, so this delta is meaningful even though that frame's
+  // origin/yaw is arbitrary.
+  Sophus::SE3d T_kf_to_current = kf.T_w_i_raw.inverse() * current_raw_pose;
+  out = T_w_i_corrected_kf * T_kf_to_current;
+  return true;
+}
+
 Eigen::aligned_vector<Eigen::Vector3d> OnlineLoopClosure::buildPointCloud()
     const {
   std::lock_guard<std::mutex> lock(state_mutex_);

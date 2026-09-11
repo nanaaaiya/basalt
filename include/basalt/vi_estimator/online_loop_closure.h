@@ -151,7 +151,35 @@ class OnlineLoopClosure {
   // Thread-safe snapshot of the latest globally-corrected trajectory,
   // ordered by keyframe arrival (== time order).
   Eigen::aligned_vector<Eigen::Vector3d> getCorrectedTrajectory() const;
+
+  // Returns the newest pose-graph node's own position directly. Real, but
+  // architecturally the LEAST stable pose to show live: the newest node
+  // has the fewest accumulated edges of any node in the graph, so its own
+  // position shifts the most every time the graph gets re-solved (i.e. on
+  // every new loop closure). With a stationary or slow-moving camera in a
+  // visually repetitive scene, closures can fire almost continuously
+  // (confirmed live: 197 closures over 325 keyframes in one near-
+  // stationary Pi5 test), and each re-solve's nudge to this node reads as
+  // a visible jump with no real motion to absorb it. Prefer
+  // getSmoothedCorrectedPose() for anything drawn/streamed live; this one
+  // remains for existing offline/dataset callers (see vio.cpp) not yet
+  // migrated.
   bool getLatestCorrectedPose(Sophus::SE3d& out) const;
+
+  // Live-display alternative to getLatestCorrectedPose() that doesn't
+  // inherit the newest node's volatility: rebases the latest corrected
+  // KEYFRAME's pose forward by the raw VIO motion since that keyframe
+  // (T_corrected_kf * T_kf_raw^-1 * current_raw_pose), rather than
+  // exposing the newest node's own position directly. This updates
+  // smoothly every call by following real, high-rate raw motion, and only
+  // ever "steps" when the reference keyframe itself changes or gets a
+  // fresh correction -- the same loop-closure-snap behavior already
+  // expected elsewhere in this codebase (see oak_d_vio.cpp's
+  // camera-follow comment), just no longer amplified by re-solve noise on
+  // top of it. Returns false under the same condition as
+  // getLatestCorrectedPose() (no keyframes yet).
+  bool getSmoothedCorrectedPose(const Sophus::SE3d& current_raw_pose,
+                                 Sophus::SE3d& out) const;
 
   // Same as getCorrectedTrajectory(), but paired with each keyframe's
   // timestamp -- needed for logging/analysis (matching timestamps up
