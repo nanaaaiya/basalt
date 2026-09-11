@@ -1,0 +1,31 @@
+# systemd unit for dashboard_agent.py -- keeps the remote start/stop
+# agent running across reboots and restarts it if it ever crashes.
+#
+# One-time setup on the Pi5:
+#   sudo cp scripts/dashboard-agent.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now dashboard-agent
+#
+# Check on it any time with:
+#   systemctl status dashboard-agent
+#   journalctl -u dashboard-agent -f
+
+[Unit]
+Description=VIO Dashboard remote start/stop agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi52
+WorkingDirectory=/home/pi52/vio_ws/basalt
+ExecStart=/usr/bin/python3 /home/pi52/vio_ws/basalt/scripts/dashboard_agent.py
+Restart=always
+RestartSec=5
+# Match backend/app/control_agent.py's defaults if you change either one.
+Environment=DASHBOARD_HOST=192.168.1.135
+Environment=DASHBOARD_CONTROL_PORT=8766
+Environment=DASHBOARD_DATA_PORT=8765
+
+[Install]
+WantedBy=multi-user.target
