@@ -177,6 +177,22 @@ constexpr double kDriftGateThresholdM = 1.0;
 // to look real, not a single lucky solve amid ongoing instability.
 constexpr int kDriftGateReleaseCount = 3;
 
+// How many keyframes back the drift-gate check reaches for its
+// "trusted" reference, instead of always just the immediate predecessor.
+// Added after a real EuRoC test on the multi-edge-redundancy branch
+// showed 0 gate trips despite the run's corrected ATE still being ~30x
+// worse than raw -- with multiple independent closures now allowed per
+// keyframe (see kMaxLoopEdgesPerKeyframe), a systematically-biased
+// (not random) scene can spread its error across MANY nodes as small,
+// individually-sub-threshold nudges rather than one dramatic single-node
+// jump, since correlated wrong closures reinforce each other gradually
+// instead of one edge overpowering odometry outright. A 1-back check
+// only ever sees each individual small nudge, never the accumulation.
+// Reaching back further catches slow accumulation over the window, not
+// just a sudden jump, while a single big jump within the window still
+// trips it too (it's a superset of the 1-back check, not a replacement).
+constexpr size_t kDriftGateWindowKeyframes = 15;
+
 // Decompose R = Rz(yaw) * Ry(pitch) * Rx(roll). Assumes no gimbal lock
 // (pitch away from +-90 deg), a reasonable assumption for a handheld/mobile
 // device that isn't doing full vertical flips.
@@ -962,14 +978,15 @@ void OnlineLoopClosure::solvePoseGraph() {
 // See kDriftGateThresholdM's comment for the full reasoning. Short
 // version: compares the newest keyframe's just-solved corrected position
 // against what chaining its real raw-VIO motion off a trusted reference
-// would predict. Not held: the reference is simply the previous
-// keyframe (a lightweight, always-on tripwire). Held: the reference is
-// the frozen anchor (held_pose_/held_anchor_raw_pose_) instead of the
-// immediately preceding node, since a corrupted region can have
-// adjacent nodes that agree with each other while still being
-// collectively wrong relative to the last point actually known good --
-// deliberately asymmetric (quick to trip, more carefully verified to
-// release), which is the right shape for a safety gate.
+// would predict. Not held: the reference is up to kDriftGateWindowKeyframes
+// back (see that constant's comment -- catches slow accumulation over the
+// window, not just a sudden single-node jump). Held: the reference is
+// the frozen anchor (held_pose_/held_anchor_raw_pose_) instead of a
+// window-back node, since a corrupted region can have several nearby
+// nodes that agree with each other while still being collectively wrong
+// relative to the last point actually known good -- deliberately
+// asymmetric (quick to trip, more carefully verified to release), which
+// is the right shape for a safety gate.
 void OnlineLoopClosure::checkDriftGate() {
   size_t n = keyframes_.size();
   if (n < 2) return;
@@ -984,10 +1001,17 @@ void OnlineLoopClosure::checkDriftGate() {
     T_reference_corrected = held_pose_;
     T_reference_raw = held_anchor_raw_pose_;
   } else {
-    const LoopKeyframe& prev = keyframes_[n - 2];
-    T_reference_corrected =
-        Sophus::SE3d(composeYPR(prev.roll, prev.pitch, prev.yaw), prev.t_opt);
-    T_reference_raw = prev.T_w_i_raw;
+    // Reach back up to kDriftGateWindowKeyframes instead of always just
+    // the immediate predecessor -- see that constant's comment: a
+    // systematically-biased (not random) region can accumulate real
+    // drift as many small, individually-sub-threshold nudges spread
+    // across several nodes, which a 1-back check never sees since each
+    // individual step looks fine in isolation.
+    size_t window = std::min(kDriftGateWindowKeyframes, n - 1);
+    const LoopKeyframe& reference = keyframes_[n - 1 - window];
+    T_reference_corrected = Sophus::SE3d(
+        composeYPR(reference.roll, reference.pitch, reference.yaw), reference.t_opt);
+    T_reference_raw = reference.T_w_i_raw;
   }
 
   Sophus::SE3d T_raw_delta = T_reference_raw.inverse() * newest.T_w_i_raw;
