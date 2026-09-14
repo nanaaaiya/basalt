@@ -142,11 +142,21 @@ constexpr int64_t kMinLoopClosureTimeGapNs = 2'000'000'000;
 // shape: 2 odometry + 1 bad loop edge, 3 total, nothing else in the
 // graph to outvote the bad one with. Multiple independent edges per
 // keyframe give the solver real redundancy to outvote an occasional
-// wrong closure with, at the cost of (at most) this many PnP-RANSAC
-// verifications' worth of extra compute per keyframe -- already bounded
-// by kMaxCandidatesToVerify regardless of this cap, so the worst case
-// doesn't change, only the average shifts toward it more often.
-constexpr size_t kMaxLoopEdgesPerKeyframe = 3;
+// wrong closure with.
+//
+// Was 3; lowered to 2 after a real live Pi5 test froze the whole
+// process (--show-gui true) and EuRoC timing confirmed why: even after
+// skipping the diagnostic-only countMatchStages() call and the
+// expensive optimize_nonlinear() refinement for redundant candidates
+// (both real fixes, kept), the still-necessary matchDescriptors() +
+// RANSAC cost per extra candidate is not free, and worst-case
+// per-keyframe latency was still 1.6-1.8s at 3 -- multiple seconds in
+// exactly the "revisiting a well-mapped place" scenario this feature is
+// meant to help with. 2 keeps most of the redundancy benefit (a node
+// still gets a second, independent piece of evidence instead of just
+// one) while meaningfully cutting the worst-case multiplier. Still
+// bounded by kMaxCandidatesToVerify regardless of this cap.
+constexpr size_t kMaxLoopEdgesPerKeyframe = 2;
 
 // Huber threshold (meters) for robust down-weighting of loop-closure edges
 // in solvePoseGraph() -- see the comment at its use site. A residual under
