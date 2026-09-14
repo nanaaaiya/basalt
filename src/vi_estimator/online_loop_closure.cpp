@@ -1009,6 +1009,10 @@ void OnlineLoopClosure::solvePoseGraph() {
 // Held: check against the frozen held_pose_/held_anchor_raw_pose_
 // instead -- deliberately asymmetric (quick to trip, more carefully
 // verified to release), which is the right shape for a safety gate.
+// Note: drift_anchor_idx_ is only ever used to DETECT a trip -- what
+// actually gets frozen (held_pose_) comes from last_published_pose_
+// instead, not from the detection anchor's own node (see that member's
+// header comment for why).
 void OnlineLoopClosure::checkDriftGate() {
   size_t n = keyframes_.size();
   if (n < 2) return;
@@ -1037,17 +1041,28 @@ void OnlineLoopClosure::checkDriftGate() {
 
   if (residual_m > kDriftGateThresholdM) {
     if (!drift_held_) {
-      // Freeze at the anchor's own pose (the reference this exact check
-      // just used), not "the previous node" -- the anchor is the last
-      // point this gate actually verified was consistent.
-      held_pose_ = T_reference_corrected;
-      held_anchor_raw_pose_ = T_reference_raw;
+      // Freeze at wherever the live pose actually was an instant ago
+      // (last_published_pose_/last_raw_pose_seen_, cached by
+      // getSmoothedCorrectedPose()), NOT at the detection anchor's node
+      // -- see held_pose_'s header comment. The anchor can be far
+      // enough behind (even still keyframe 0, the VIO world origin) that
+      // freezing there would teleport the live pose backwards instead of
+      // holding it in place. Falls back to the anchor only in the
+      // practically-unreachable case that no live pose was ever
+      // published before the very first trip.
+      if (have_last_published_pose_) {
+        held_pose_ = last_published_pose_;
+        held_anchor_raw_pose_ = last_raw_pose_seen_;
+      } else {
+        held_pose_ = T_reference_corrected;
+        held_anchor_raw_pose_ = T_reference_raw;
+      }
       drift_held_ = true;
       std::cout << "[ONLINE-LOOP] DRIFT GATE TRIPPED: kf=" << (n - 1)
                 << " residual=" << residual_m
                 << "m (threshold=" << kDriftGateThresholdM
-                << "m) -- holding live pose at anchor kf=" << drift_anchor_idx_
-                << std::endl;
+                << "m, detected vs anchor kf=" << drift_anchor_idx_
+                << ") -- holding live pose in place" << std::endl;
     }
     drift_gate_stable_count_ = 0;
     return;
@@ -1143,6 +1158,15 @@ bool OnlineLoopClosure::getSmoothedCorrectedPose(
   // origin/yaw is arbitrary.
   Sophus::SE3d T_kf_to_current = kf.T_w_i_raw.inverse() * current_raw_pose;
   out = T_w_i_corrected_kf * T_kf_to_current;
+
+  // Cache for checkDriftGate() to freeze onto if it trips before the
+  // next call -- see that member's comment in the header for why this
+  // matters (freezing at a stale detection anchor instead of "wherever
+  // the live pose actually was" was a real bug found on a live test).
+  last_published_pose_ = out;
+  last_raw_pose_seen_ = current_raw_pose;
+  have_last_published_pose_ = true;
+
   return true;
 }
 

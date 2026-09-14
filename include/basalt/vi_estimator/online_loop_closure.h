@@ -295,15 +295,30 @@ class OnlineLoopClosure {
   // pose (getSmoothedCorrectedPose()) freezes at held_pose_ instead of
   // advancing, and the graph keeps solving normally in the background so
   // it still has a chance to self-correct before the hold is released.
+  //
+  // held_pose_/held_anchor_raw_pose_ are seeded from last_published_pose_/
+  // last_raw_pose_seen_ at the moment of tripping -- i.e. wherever the
+  // live pose actually was an instant ago -- NOT from drift_anchor_idx_'s
+  // node. A real live test caught this: the detection anchor only
+  // refreshes every kDriftGateAnchorRefreshKeyframes solve events, which
+  // can span far more real time/keyframes than that if closures are
+  // sparse, so it can still be sitting at keyframe 0 (the VIO world
+  // origin) when a trip happens well into a flight -- freezing there
+  // teleports the live pose back to (0,0,0) instead of holding it in
+  // place, which is a worse failure than the drift it's meant to guard
+  // against.
   bool drift_held_ = false;
   Sophus::SE3d held_pose_;
-  // Raw pose of the keyframe held_pose_ was taken from -- lets recovery
-  // checks chain real raw motion since the anchor forward, rather than
-  // just comparing adjacent nodes (two adjacent corrupted nodes can
-  // agree with each other while both still being wrong relative to the
-  // last point actually known to be good).
   Sophus::SE3d held_anchor_raw_pose_;
   int drift_gate_stable_count_ = 0;
+
+  // Continuously updated by getSmoothedCorrectedPose() (mutable: that
+  // method is const) every time it publishes a live, not-held pose --
+  // this is what checkDriftGate() actually freezes onto, per the comment
+  // above.
+  mutable Sophus::SE3d last_published_pose_;
+  mutable Sophus::SE3d last_raw_pose_seen_;
+  mutable bool have_last_published_pose_ = false;
 
   // The FIXED reference node used for detecting a NEW trip (separate
   // from held_pose_/held_anchor_raw_pose_, which only matter once
