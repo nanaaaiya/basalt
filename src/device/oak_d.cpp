@@ -152,6 +152,29 @@ void OakDDevice::deviceLoop() {
   std::deque<StampedFrame> left_queue, right_queue;
   double last_imu_time = -1.0;
 
+  // DepthAI's own device reconnection (after an X_LINK_ERROR/crash) is
+  // transparent to this queue-pull API -- tryGet() just silently starts
+  // returning data again once reconnected, with no explicit "reconnected"
+  // event exposed here. A timestamp discontinuity in the IMU stream is
+  // the most direct, robust signal available instead, regardless of the
+  // stall's specific cause. Normal IMU_RATE=200Hz means consecutive
+  // samples are ~5ms apart, so this threshold is a huge margin above any
+  // ordinary jitter.
+  constexpr double kDeviceGapThresholdSeconds = 0.5;
+  // How long to discard data for after a detected gap, before trusting
+  // it again. Root-caused via a real bad-initialization case: the very
+  // first frame available right after a device crash+reconnect had only
+  // 12 corners detected (vs. a normal 300-700+), and VIO's one-shot
+  // gravity-alignment step used the first available IMU sample from that
+  // same window as its sole reference, producing a badly wrong initial
+  // orientation (confirmed live: a near-inverted Z axis) that then
+  // leaked into every subsequent pose as a steady, uncancelled-gravity
+  // drift for the rest of the session. Discarding a brief settle window
+  // gives the stream a chance to stabilize before anything downstream --
+  // VIO's initialization above all -- ever sees it.
+  constexpr double kDeviceGapSettleSeconds = 1.0;
+  double discard_until = -1.0;
+
   while (running.load() && pipeline.isRunning()) {
     bool got_data = false;
 
@@ -182,6 +205,18 @@ void OakDDevice::deviceLoop() {
       for (auto& packet : imuData->packets) {
         double t = to_seconds(packet.acceleroMeter.getTimestamp());
 
+        if (last_imu_time >= 0 && t - last_imu_time > kDeviceGapThresholdSeconds) {
+          discard_until = t + kDeviceGapSettleSeconds;
+          left_queue.clear();
+          right_queue.clear();
+          std::cout << "[OAKD] stream gap detected (" << (t - last_imu_time)
+                    << "s) -- discarding data for " << kDeviceGapSettleSeconds
+                    << "s while the stream settles" << std::endl;
+        }
+        last_imu_time = t;
+
+        if (t < discard_until) continue;  // still settling -- drop this sample
+
         ImuData<double>::Ptr data;
         data.reset(new ImuData<double>);
         data->t_ns = (int64_t)(t * 1e9);
@@ -191,17 +226,20 @@ void OakDDevice::deviceLoop() {
             packet.gyroscope.z;
 
         if (queues.imu_data_queue) queues.imu_data_queue->push(data);
-        last_imu_time = t;
       }
     }
 
     while (auto frame = q_left->tryGet<dai::ImgFrame>()) {
       got_data = true;
-      left_queue.push_back({to_seconds(frame->getTimestamp()), frame});
+      double t = to_seconds(frame->getTimestamp());
+      if (t < discard_until) continue;  // still settling after a stream gap
+      left_queue.push_back({t, frame});
     }
     while (auto frame = q_right->tryGet<dai::ImgFrame>()) {
       got_data = true;
-      right_queue.push_back({to_seconds(frame->getTimestamp()), frame});
+      double t = to_seconds(frame->getTimestamp());
+      if (t < discard_until) continue;
+      right_queue.push_back({t, frame});
     }
 
     while (!left_queue.empty() && !right_queue.empty()) {
