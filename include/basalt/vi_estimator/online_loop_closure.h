@@ -154,6 +154,17 @@ class OnlineLoopClosure {
   // so a slow/absent consumer never stalls keyframe processing.
   tbb::concurrent_bounded_queue<LocalizationResult> localization_queue;
 
+  // Pushed every time the drift gate's held state actually CHANGES (true
+  // = just tripped, false = just released/force-released) -- a consumer
+  // polling isDriftHeld() at a fixed interval (e.g. for a dashboard
+  // alert) can otherwise miss rapid trip/release cycles that happen
+  // faster than its poll rate, confirmed on a real live test where
+  // several undercounted cycles made the gate look like one continuous,
+  // unexplained freeze instead of the flapping it actually was. Drain
+  // this instead of (or alongside) polling isDriftHeld() to report every
+  // transition faithfully.
+  tbb::concurrent_bounded_queue<bool> drift_gate_events;
+
   void start();
   void stop();
 
@@ -311,6 +322,11 @@ class OnlineLoopClosure {
   Sophus::SE3d held_pose_;
   Sophus::SE3d held_anchor_raw_pose_;
   int drift_gate_stable_count_ = 0;
+  // t_ns the current hold started at -- see kDriftGateMaxHoldSeconds:
+  // a real live test found this staying stuck (never confirmed
+  // recovered) for 40+ seconds straight, which is worse for a live
+  // display than resuming with an unconfirmed correction.
+  int64_t drift_held_since_t_ns_ = -1;
 
   // Continuously updated by getSmoothedCorrectedPose() (mutable: that
   // method is const) every time it publishes a live, not-held pose --

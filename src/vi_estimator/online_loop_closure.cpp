@@ -201,21 +201,16 @@ constexpr int kDriftGateReleaseCount = 3;
 // still-fixed anchor catches up with it.
 constexpr size_t kDriftGateAnchorRefreshKeyframes = 20;
 
-// How many keyframes back the drift-gate check reaches for its
-// "trusted" reference, instead of always just the immediate predecessor.
-// Added after a real EuRoC test on the multi-edge-redundancy branch
-// showed 0 gate trips despite the run's corrected ATE still being ~30x
-// worse than raw -- with multiple independent closures now allowed per
-// keyframe (see kMaxLoopEdgesPerKeyframe), a systematically-biased
-// (not random) scene can spread its error across MANY nodes as small,
-// individually-sub-threshold nudges rather than one dramatic single-node
-// jump, since correlated wrong closures reinforce each other gradually
-// instead of one edge overpowering odometry outright. A 1-back check
-// only ever sees each individual small nudge, never the accumulation.
-// Reaching back further catches slow accumulation over the window, not
-// just a sudden jump, while a single big jump within the window still
-// trips it too (it's a superset of the 1-back check, not a replacement).
-constexpr size_t kDriftGateWindowKeyframes = 15;
+// Maximum time the drift gate is allowed to hold the live pose before
+// force-releasing regardless of whether the residual check ever passes.
+// A real live test found it stuck, never confirmed recovered, for 40+
+// seconds straight in a genuinely hard case -- for a live display,
+// resuming with a possibly-still-imperfect correction is better than
+// looking permanently hung. Force-release also refreshes the detection
+// anchor to right now (same as a normal release), so detection resumes
+// cleanly from this point rather than immediately re-tripping against
+// the same stale reference.
+constexpr double kDriftGateMaxHoldSeconds = 30.0;
 
 // Decompose R = Rz(yaw) * Ry(pitch) * Rx(roll). Assumes no gimbal lock
 // (pitch away from +-90 deg), a reasonable assumption for a handheld/mobile
@@ -376,6 +371,7 @@ OnlineLoopClosure::OnlineLoopClosure(const Calibration<double>& calib,
   hash_bow_.reset(new HashBow<256>(config_.mapper_bow_num_bits));
   input_queue.set_capacity(1000);
   localization_queue.set_capacity(1000);
+  drift_gate_events.set_capacity(1000);
 }
 
 OnlineLoopClosure::~OnlineLoopClosure() { stop(); }
@@ -1022,6 +1018,27 @@ void OnlineLoopClosure::checkDriftGate() {
   Sophus::SE3d T_newest_corrected(composeYPR(newest.roll, newest.pitch, newest.yaw),
                                   newest.t_opt);
 
+  // Force-release regardless of residual once the hold has gone on too
+  // long -- see kDriftGateMaxHoldSeconds's comment. Checked before the
+  // normal residual-based path since a live display shouldn't stay
+  // stuck indefinitely waiting for the graph to look right again.
+  if (drift_held_ && drift_held_since_t_ns_ >= 0) {
+    double held_seconds = (newest.t_ns - drift_held_since_t_ns_) / 1e9;
+    if (held_seconds >= kDriftGateMaxHoldSeconds) {
+      drift_held_ = false;
+      drift_gate_stable_count_ = 0;
+      drift_anchor_idx_ = n - 1;
+      keyframes_since_anchor_refresh_ = 0;
+      drift_gate_events.try_push(false);
+      std::cout << "[ONLINE-LOOP] DRIFT GATE FORCE-RELEASED: kf=" << (n - 1)
+                << " after " << held_seconds << "s (max hold "
+                << kDriftGateMaxHoldSeconds
+                << "s exceeded) -- resuming with unconfirmed correction"
+                << std::endl;
+      return;
+    }
+  }
+
   Sophus::SE3d T_reference_corrected;
   Sophus::SE3d T_reference_raw;
   if (drift_held_) {
@@ -1058,6 +1075,8 @@ void OnlineLoopClosure::checkDriftGate() {
         held_anchor_raw_pose_ = T_reference_raw;
       }
       drift_held_ = true;
+      drift_held_since_t_ns_ = newest.t_ns;
+      drift_gate_events.try_push(true);
       std::cout << "[ONLINE-LOOP] DRIFT GATE TRIPPED: kf=" << (n - 1)
                 << " residual=" << residual_m
                 << "m (threshold=" << kDriftGateThresholdM
@@ -1077,6 +1096,7 @@ void OnlineLoopClosure::checkDriftGate() {
       // pre-trip anchor.
       drift_anchor_idx_ = n - 1;
       keyframes_since_anchor_refresh_ = 0;
+      drift_gate_events.try_push(false);
       std::cout << "[ONLINE-LOOP] DRIFT GATE RELEASED: kf=" << (n - 1)
                 << " residual back under threshold for " << kDriftGateReleaseCount
                 << " consecutive solves" << std::endl;

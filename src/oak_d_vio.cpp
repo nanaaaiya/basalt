@@ -503,7 +503,6 @@ int main(int argc, char** argv) {
   // attached) needs this working regardless.
   std::thread t6([&]() {
     int last_num_closures = 0;
-    bool last_drift_held = false;
     while (!terminate) {
       if (dashboard_client) {
         if (online_loop_closure) {
@@ -518,13 +517,16 @@ int main(int argc, char** argv) {
             dashboard_client->sendMapEvent(t_ns, "loop_closure");
           }
 
-          // Surface the drift gate's state (see OnlineLoopClosure's
-          // checkDriftGate()) so a held pose is a clear, visible alert on
-          // the dashboard rather than the pose just silently stopping --
-          // only on the transition, not every poll.
-          bool held = online_loop_closure->isDriftHeld();
-          if (held != last_drift_held) {
-            last_drift_held = held;
+          // Drains OnlineLoopClosure::drift_gate_events instead of
+          // polling isDriftHeld() -- a real live test found polling
+          // (even at this loop's own ~200ms cadence) can miss rapid
+          // trip/release cycles entirely, undercounting a genuinely
+          // flapping gate down to what looked like one long, unexplained
+          // freeze. Draining the queue reports every transition that
+          // actually happened, in order, regardless of how fast they
+          // cycled between two checks of this loop.
+          bool held = false;
+          while (online_loop_closure->drift_gate_events.try_pop(held)) {
             int64_t t_ns;
             {
               std::lock_guard<std::mutex> lock(vio_state_mutex);
