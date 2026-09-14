@@ -159,23 +159,47 @@ constexpr double kLoopEdgeHuberDeltaM = 0.5;
 
 // Drift gate (see OnlineLoopClosure::checkDriftGate()): how far the
 // newest keyframe's just-solved corrected position is allowed to diverge
-// from what smoothly chaining raw odometry off the PREVIOUS (trusted)
-// node's own corrected position would predict, before the live pose
-// freezes instead of advancing onto it. This is deliberately NOT an
-// absolute jump-distance threshold (that would false-trigger during
-// genuinely fast real motion) -- it's measured against what raw motion
-// alone already explains, so it stays near-zero under normal conditions
-// regardless of how fast the platform is actually moving, and only spikes
-// when a correction is fighting hard against what the raw odometry chain
-// says actually happened. 1.0m is well above normal solve-to-solve noise
-// (observed sub-cm to a few cm on real Pi5 sessions) and well below a
-// genuine bad-closure jump (multi-meter, per the documented EuRoC case).
+// from what smoothly chaining raw odometry off a FIXED, periodically-
+// refreshed anchor node would predict, before the live pose freezes
+// instead of advancing onto it. This is deliberately NOT an absolute
+// jump-distance threshold (that would false-trigger during genuinely
+// fast real motion) -- it's measured against what raw motion alone
+// already explains, so it stays near-zero under normal conditions
+// regardless of how fast the platform is actually moving, and only
+// spikes when a correction is fighting hard against what the raw
+// odometry chain says actually happened. 1.0m is well above normal
+// solve-to-solve noise (observed sub-cm to a few cm on real Pi5
+// sessions) and well below a genuine bad-closure jump (multi-meter, per
+// the documented EuRoC case).
+//
+// IMPORTANT: the anchor must be periodically refreshed (see
+// kDriftGateAnchorRefreshKeyframes below), not just "the previous node"
+// or "N keyframes back" recomputed fresh every check. A real live Pi5
+// test caught this: a sliding reference that always recomputes N-back
+// only ever measures the CHANGE in (corrected - raw) offset over the
+// last N keyframes, never the TOTAL accumulated offset since a fixed
+// point -- so a slow, steady creep smaller than threshold/N per keyframe
+// can never trip it, no matter how many times it's checked. Confirmed
+// on real data: corrected vs raw diverged to over 4m across a 67-second,
+// 152-sample episode with no single trip, because the accumulation was
+// spread out rather than concentrated. A FIXED anchor, refreshed only
+// occasionally during confirmed-good stretches, bounds the worst-case
+// undetected drift to whatever accumulates within one refresh interval,
+// regardless of whether that happened in one jump or spread across it.
 constexpr double kDriftGateThresholdM = 1.0;
 
 // How many consecutive solves must show the residual back under
 // kDriftGateThresholdM before the hold releases -- requires the recovery
 // to look real, not a single lucky solve amid ongoing instability.
 constexpr int kDriftGateReleaseCount = 3;
+
+// How many keyframes the anchor stays fixed before it's allowed to
+// refresh forward (only refreshes if the check at that moment still
+// passes) -- see kDriftGateThresholdM's comment. This directly bounds
+// the worst-case undetected cumulative drift: a slow creep has at most
+// this many keyframes to stay under kDriftGateThresholdM before the
+// still-fixed anchor catches up with it.
+constexpr size_t kDriftGateAnchorRefreshKeyframes = 20;
 
 // How many keyframes back the drift-gate check reaches for its
 // "trusted" reference, instead of always just the immediate predecessor.
@@ -977,19 +1001,18 @@ void OnlineLoopClosure::solvePoseGraph() {
 //
 // See kDriftGateThresholdM's comment for the full reasoning. Short
 // version: compares the newest keyframe's just-solved corrected position
-// against what chaining its real raw-VIO motion off a trusted reference
-// would predict. Not held: the reference is up to kDriftGateWindowKeyframes
-// back (see that constant's comment -- catches slow accumulation over the
-// window, not just a sudden single-node jump). Held: the reference is
-// the frozen anchor (held_pose_/held_anchor_raw_pose_) instead of a
-// window-back node, since a corrupted region can have several nearby
-// nodes that agree with each other while still being collectively wrong
-// relative to the last point actually known good -- deliberately
-// asymmetric (quick to trip, more carefully verified to release), which
-// is the right shape for a safety gate.
+// against what chaining its real raw-VIO motion off a FIXED reference
+// (drift_anchor_idx_, refreshed only periodically -- see
+// kDriftGateAnchorRefreshKeyframes) would predict. Not held: check
+// against drift_anchor_idx_, and refresh it forward every
+// kDriftGateAnchorRefreshKeyframes keyframes if that check still passes.
+// Held: check against the frozen held_pose_/held_anchor_raw_pose_
+// instead -- deliberately asymmetric (quick to trip, more carefully
+// verified to release), which is the right shape for a safety gate.
 void OnlineLoopClosure::checkDriftGate() {
   size_t n = keyframes_.size();
   if (n < 2) return;
+  if (drift_anchor_idx_ >= n) drift_anchor_idx_ = 0;  // safety, shouldn't happen
 
   const LoopKeyframe& newest = keyframes_[n - 1];
   Sophus::SE3d T_newest_corrected(composeYPR(newest.roll, newest.pitch, newest.yaw),
@@ -1001,17 +1024,10 @@ void OnlineLoopClosure::checkDriftGate() {
     T_reference_corrected = held_pose_;
     T_reference_raw = held_anchor_raw_pose_;
   } else {
-    // Reach back up to kDriftGateWindowKeyframes instead of always just
-    // the immediate predecessor -- see that constant's comment: a
-    // systematically-biased (not random) region can accumulate real
-    // drift as many small, individually-sub-threshold nudges spread
-    // across several nodes, which a 1-back check never sees since each
-    // individual step looks fine in isolation.
-    size_t window = std::min(kDriftGateWindowKeyframes, n - 1);
-    const LoopKeyframe& reference = keyframes_[n - 1 - window];
-    T_reference_corrected = Sophus::SE3d(
-        composeYPR(reference.roll, reference.pitch, reference.yaw), reference.t_opt);
-    T_reference_raw = reference.T_w_i_raw;
+    const LoopKeyframe& anchor = keyframes_[drift_anchor_idx_];
+    T_reference_corrected =
+        Sophus::SE3d(composeYPR(anchor.roll, anchor.pitch, anchor.yaw), anchor.t_opt);
+    T_reference_raw = anchor.T_w_i_raw;
   }
 
   Sophus::SE3d T_raw_delta = T_reference_raw.inverse() * newest.T_w_i_raw;
@@ -1021,27 +1037,47 @@ void OnlineLoopClosure::checkDriftGate() {
 
   if (residual_m > kDriftGateThresholdM) {
     if (!drift_held_) {
-      const LoopKeyframe& prev = keyframes_[n - 2];
-      held_pose_ = Sophus::SE3d(composeYPR(prev.roll, prev.pitch, prev.yaw), prev.t_opt);
-      held_anchor_raw_pose_ = prev.T_w_i_raw;
+      // Freeze at the anchor's own pose (the reference this exact check
+      // just used), not "the previous node" -- the anchor is the last
+      // point this gate actually verified was consistent.
+      held_pose_ = T_reference_corrected;
+      held_anchor_raw_pose_ = T_reference_raw;
       drift_held_ = true;
       std::cout << "[ONLINE-LOOP] DRIFT GATE TRIPPED: kf=" << (n - 1)
                 << " residual=" << residual_m
                 << "m (threshold=" << kDriftGateThresholdM
-                << "m) -- holding live pose at kf=" << (n - 2) << std::endl;
+                << "m) -- holding live pose at anchor kf=" << drift_anchor_idx_
+                << std::endl;
     }
     drift_gate_stable_count_ = 0;
     return;
   }
 
-  if (!drift_held_) return;  // nothing to release
+  if (drift_held_) {
+    if (++drift_gate_stable_count_ >= kDriftGateReleaseCount) {
+      drift_held_ = false;
+      drift_gate_stable_count_ = 0;
+      // Recovery also refreshes the anchor to right now -- resume normal
+      // tracking from the point just confirmed good, not the stale
+      // pre-trip anchor.
+      drift_anchor_idx_ = n - 1;
+      keyframes_since_anchor_refresh_ = 0;
+      std::cout << "[ONLINE-LOOP] DRIFT GATE RELEASED: kf=" << (n - 1)
+                << " residual back under threshold for " << kDriftGateReleaseCount
+                << " consecutive solves" << std::endl;
+    }
+    return;
+  }
 
-  if (++drift_gate_stable_count_ >= kDriftGateReleaseCount) {
-    drift_held_ = false;
-    drift_gate_stable_count_ = 0;
-    std::cout << "[ONLINE-LOOP] DRIFT GATE RELEASED: kf=" << (n - 1)
-              << " residual back under threshold for " << kDriftGateReleaseCount
-              << " consecutive solves" << std::endl;
+  // Not held and this check passed -- eligible to refresh the anchor
+  // forward, but only after a real stretch of confirmed-good keyframes
+  // (see kDriftGateAnchorRefreshKeyframes), not on every passing check.
+  // Refreshing every time would recreate exactly the sliding-reference
+  // bug this design replaced: a slow, steady creep would keep resetting
+  // the accumulator before it ever crossed the threshold.
+  if (++keyframes_since_anchor_refresh_ >= kDriftGateAnchorRefreshKeyframes) {
+    drift_anchor_idx_ = n - 1;
+    keyframes_since_anchor_refresh_ = 0;
   }
 }
 

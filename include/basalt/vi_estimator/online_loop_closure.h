@@ -305,6 +305,14 @@ class OnlineLoopClosure {
   Sophus::SE3d held_anchor_raw_pose_;
   int drift_gate_stable_count_ = 0;
 
+  // The FIXED reference node used for detecting a NEW trip (separate
+  // from held_pose_/held_anchor_raw_pose_, which only matter once
+  // already held). Deliberately not recomputed as "N keyframes back"
+  // every check -- see kDriftGateAnchorRefreshKeyframes's comment for
+  // why that let a slow, real accumulation go undetected on a live test.
+  size_t drift_anchor_idx_ = 0;
+  size_t keyframes_since_anchor_refresh_ = 0;
+
   mutable std::mutex state_mutex_;
   // Counts accepted loop EDGES, not keyframes that found a match -- a
   // single keyframe can now contribute more than one (see
