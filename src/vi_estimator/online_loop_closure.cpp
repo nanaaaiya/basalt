@@ -569,11 +569,31 @@ void OnlineLoopClosure::processKeyframe(const MargData::Ptr& data,
         if (partner->pts3d.empty()) continue;
       }
 
-      int after_hamming = 0, after_ratio = 0;
-      countMatchStages(kf.kd0.corner_descriptors, partner->kd0.corner_descriptors,
-                       (int)config_.mapper_max_hamming_distance,
-                       config_.mapper_second_best_test_ratio, after_hamming,
-                       after_ratio);
+      // Whether this is the first candidate this keyframe attempts --
+      // reused below to also skip the (real, not diagnostic-only) non-
+      // linear refinement for redundant candidates. Computed once here
+      // since it doesn't change within this iteration.
+      bool is_first_candidate_attempt = accepted_closures.empty();
+
+      // countMatchStages() is diagnostic-only logging (see its own
+      // comment -- doesn't affect the actual matches used downstream),
+      // but it's a full O(corners0 x corners_partner) brute-force pass,
+      // same cost class as matchDescriptors() right below. Multi-edge
+      // redundancy means up to kMaxCandidatesToVerify candidates can
+      // reach this point per keyframe regardless of how many end up
+      // accepted/refined, so running this a second time per candidate
+      // for pure logging was real, unnecessary cost contributing to the
+      // multi-second per-keyframe stalls found on a live Pi5 test (see
+      // the refinement-skip fix above this loop). Only pay for it on the
+      // first candidate, where the detailed breakdown is most useful
+      // anyway (it's the one most likely to actually get accepted).
+      int after_hamming = -1, after_ratio = -1;
+      if (is_first_candidate_attempt) {
+        countMatchStages(kf.kd0.corner_descriptors, partner->kd0.corner_descriptors,
+                         (int)config_.mapper_max_hamming_distance,
+                         config_.mapper_second_best_test_ratio, after_hamming,
+                         after_ratio);
+      }
 
       std::vector<std::pair<int, int>> matches;
       matchDescriptors(kf.kd0.corner_descriptors, partner->kd0.corner_descriptors,
@@ -601,9 +621,12 @@ void OnlineLoopClosure::processKeyframe(const MargData::Ptr& data,
                 << "              best_candidate=kf" << partner_idx
                 << " (t_ns=" << partner_t_ns << ") bow_score=" << cand.second
                 << "\n"
-                << "              matches_after_hamming=" << after_hamming
+                << "              matches_after_hamming="
+                << (after_hamming < 0 ? "n/a (skipped, redundant candidate)"
+                                      : std::to_string(after_hamming))
                 << "\n"
-                << "              matches_after_ratio_test=" << after_ratio
+                << "              matches_after_ratio_test="
+                << (after_ratio < 0 ? "n/a" : std::to_string(after_ratio))
                 << " (mutual_cross_check=" << matches.size() << ")\n"
                 << "              pnp_ready_points=" << bearingVectors.size()
                 << " | partner_triangulated=" << partner->pts3d.size() << "/"
@@ -647,8 +670,8 @@ void OnlineLoopClosure::processKeyframe(const MargData::Ptr& data,
       // checking the cheap raw count first, before paying for refinement,
       // avoids that cost on every failed attempt. Refinement itself is
       // additionally capped to at most once per keyframe regardless of
-      // how many candidates pass this check -- see is_best_candidate
-      // below.
+      // how many candidates pass this check -- see
+      // is_first_candidate_attempt below.
       if ((int)ransac.inliers_.size() < config_.mapper_min_matches) {
         std::cout << "              ransac_inliers=" << ransac.inliers_.size()
                   << " (raw, pre-refinement)" << std::endl;
@@ -681,8 +704,7 @@ void OnlineLoopClosure::processKeyframe(const MargData::Ptr& data,
       // cleared the same inlier-count floor just above. Redundancy's
       // whole point is resisting a bad edge with OTHER evidence, not
       // needing every piece of that evidence to be maximally precise.
-      bool is_best_candidate = accepted_closures.empty();
-      if (is_best_candidate) {
+      if (is_first_candidate_attempt) {
         adapter.sett(ransac.model_coefficients_.topRightCorner<3, 1>());
         adapter.setR(ransac.model_coefficients_.topLeftCorner<3, 3>());
         opengv::transformation_t refined =
@@ -702,7 +724,7 @@ void OnlineLoopClosure::processKeyframe(const MargData::Ptr& data,
       Eigen::Vector3d ransac_t =
           ransac.model_coefficients_.topRightCorner<3, 1>();
       std::cout << "              ransac_inliers=" << ransac.inliers_.size()
-                << (is_best_candidate ? " (refined)" : " (raw, redundant edge)")
+                << (is_first_candidate_attempt ? " (refined)" : " (raw, redundant edge)")
                 << "  ransac_pose_t=[" << ransac_t.x() << ", "
                 << ransac_t.y() << ", " << ransac_t.z() << "]" << std::endl;
 
