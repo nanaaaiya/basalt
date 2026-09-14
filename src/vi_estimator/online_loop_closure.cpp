@@ -645,8 +645,10 @@ void OnlineLoopClosure::processKeyframe(const MargData::Ptr& data,
       // be rejected anyway is pure waste, and the per-keyframe candidate
       // loop can attempt up to kMaxCandidatesToVerify of these -- so
       // checking the cheap raw count first, before paying for refinement,
-      // avoids that cost on every failed attempt, not just the ones after
-      // kMaxLoopEdgesPerKeyframe has already been reached.
+      // avoids that cost on every failed attempt. Refinement itself is
+      // additionally capped to at most once per keyframe regardless of
+      // how many candidates pass this check -- see is_best_candidate
+      // below.
       if ((int)ransac.inliers_.size() < config_.mapper_min_matches) {
         std::cout << "              ransac_inliers=" << ransac.inliers_.size()
                   << " (raw, pre-refinement)" << std::endl;
@@ -663,26 +665,46 @@ void OnlineLoopClosure::processKeyframe(const MargData::Ptr& data,
       // a least-squares-optimal fit over every inlier; this refines it and
       // re-selects inliers against the refined model, same as the existing
       // relative-pose pattern.
-      adapter.sett(ransac.model_coefficients_.topRightCorner<3, 1>());
-      adapter.setR(ransac.model_coefficients_.topLeftCorner<3, 3>());
-      opengv::transformation_t refined =
-          opengv::absolute_pose::optimize_nonlinear(adapter, ransac.inliers_);
-      ransac.sac_model_->selectWithinDistance(refined, ransac.threshold_,
-                                              ransac.inliers_);
-      ransac.model_coefficients_ = refined;
+      //
+      // Only for the FIRST accepted candidate this keyframe (candidates
+      // are processed in BoW-score order, so that's the best-scoring
+      // one) -- multi-edge redundancy (kMaxLoopEdgesPerKeyframe) means up
+      // to kMaxLoopEdgesPerKeyframe candidates can reach this point per
+      // keyframe, and optimize_nonlinear() doesn't scale with that: a
+      // real live test measured up to 3.1s for a SINGLE keyframe's
+      // candidate loop once multiple candidates each paid for their own
+      // refinement (73-455ms each, per the pre-refinement-reject comment
+      // above) -- exactly the "revisiting a well-mapped place" scenario
+      // multi-edge is meant to help with, made unusably slow by it
+      // instead, badly stalling a live Pi5 session. Later (redundant)
+      // candidates use the raw RANSAC model directly -- it already
+      // cleared the same inlier-count floor just above. Redundancy's
+      // whole point is resisting a bad edge with OTHER evidence, not
+      // needing every piece of that evidence to be maximally precise.
+      bool is_best_candidate = accepted_closures.empty();
+      if (is_best_candidate) {
+        adapter.sett(ransac.model_coefficients_.topRightCorner<3, 1>());
+        adapter.setR(ransac.model_coefficients_.topLeftCorner<3, 3>());
+        opengv::transformation_t refined =
+            opengv::absolute_pose::optimize_nonlinear(adapter, ransac.inliers_);
+        ransac.sac_model_->selectWithinDistance(refined, ransac.threshold_,
+                                                ransac.inliers_);
+        ransac.model_coefficients_ = refined;
+
+        if ((int)ransac.inliers_.size() < config_.mapper_min_matches) {
+          std::cout << "              RESULT: rejected (refined inliers "
+                    << ransac.inliers_.size() << " < mapper_min_matches "
+                    << config_.mapper_min_matches << ")" << std::endl;
+          continue;
+        }
+      }
 
       Eigen::Vector3d ransac_t =
           ransac.model_coefficients_.topRightCorner<3, 1>();
       std::cout << "              ransac_inliers=" << ransac.inliers_.size()
-                << " (refined)  ransac_pose_t=[" << ransac_t.x() << ", "
+                << (is_best_candidate ? " (refined)" : " (raw, redundant edge)")
+                << "  ransac_pose_t=[" << ransac_t.x() << ", "
                 << ransac_t.y() << ", " << ransac_t.z() << "]" << std::endl;
-
-      if ((int)ransac.inliers_.size() < config_.mapper_min_matches) {
-        std::cout << "              RESULT: rejected (refined inliers "
-                  << ransac.inliers_.size() << " < mapper_min_matches "
-                  << config_.mapper_min_matches << ")" << std::endl;
-        continue;
-      }
 
       Sophus::SE3d T_partnerCam_newCam(
           ransac.model_coefficients_.topLeftCorner<3, 3>(),
