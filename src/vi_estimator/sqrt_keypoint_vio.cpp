@@ -290,6 +290,19 @@ SqrtKeypointVioEstimator<Scalar_>::popFromImuDataQueue() {
   ImuData<double>::Ptr data;
   imu_data_queue.pop(data);
 
+  // Single chokepoint for every IMU sample this estimator ever consumes --
+  // record rotation rate here (rather than at each of this function's
+  // several call sites) so every caller benefits automatically. This is
+  // the VIO-synchronized counterpart to OakDDevice's raw driver-level tap
+  // (setImuTapQueue): that one gives rotation rate on its own free-running
+  // clock, this one gives it at the timestamp of what VIO actually just
+  // consumed, which is what a live confidence signal wants.
+  if (data) {
+    latest_gyro_norm = data->gyro.norm();
+    std::lock_guard<std::mutex> lock(latest_gyro_mutex);
+    latest_gyro = data->gyro.template cast<double>();
+  }
+
   if constexpr (std::is_same_v<Scalar, double>) {
     return data;
   } else {
@@ -367,8 +380,15 @@ bool SqrtKeypointVioEstimator<Scalar_>::measure(
     }
   }
 
-  if (Scalar(connected0) / (connected0 + unconnected_obs0.size()) <
-          Scalar(config.vio_new_kf_keypoints_thresh) &&
+  // Previously a pure local, used only for the keyframe-insertion decision
+  // right below -- exposed here (getLatestTrackedRatio()) since this is
+  // exactly the "how much of the current frame is still tracked" signal
+  // a confidence score (vio_health.h) wants, and there was no reason to
+  // compute it twice.
+  latest_tracked_ratio =
+      Scalar(connected0) / Scalar(connected0 + unconnected_obs0.size());
+
+  if (latest_tracked_ratio < Scalar(config.vio_new_kf_keypoints_thresh) &&
       frames_after_kf > config.vio_min_frames_after_kf)
     take_kf = true;
 
@@ -730,7 +750,22 @@ void SqrtKeypointVioEstimator<Scalar_>::marginalize(
           this, aom, lqr_options, &marg_data, &ild, &kfs_to_marg,
           &lost_landmaks, last_state_to_marg);
 
-      lqr->linearizeProblem();
+      // Unlike optimize()'s linearizeProblem() call, this one previously
+      // passed no numerically_valid pointer at all -- a degenerate
+      // linearization here was silently ignored and would bake a bad
+      // prior into the marginalization data with zero signal. Route it
+      // through the same vio_health flag optimize() now uses instead of
+      // aborting.
+      bool marg_numerically_valid;
+      lqr->linearizeProblem(&marg_numerically_valid);
+      if (!marg_numerically_valid) {
+        std::cerr << "Numerical failure during marginalization "
+                     "linearization (t_ns "
+                  << last_state_t_ns << ")" << std::endl;
+        vio_health.degraded = true;
+        vio_health.last_degraded_t_ns = last_state_t_ns;
+        vio_health.consecutive_degraded_count++;
+      }
       lqr->performQR();
 
       if (is_lin_sqrt && marg_data.is_sqrt) {
@@ -1110,10 +1145,33 @@ void SqrtKeypointVioEstimator<Scalar_>::optimize() {
         // linearize residuals
         bool numerically_valid;
         error_total = lqr->linearizeProblem(&numerically_valid);
-        BASALT_ASSERT_STREAM(
-            numerically_valid,
-            "did not expect numerical failure during linearization");
         stats.add("linearizeProblem", t.reset()).format("ms");
+
+        // A degenerate/ill-conditioned linearization used to abort() the
+        // whole process here (BASALT_ASSERT_STREAM) -- unacceptable on
+        // real flight hardware (total, unrecoverable loss of position
+        // estimate with no warning). Instead: skip this outer iteration's
+        // performQR()/solve/backsubstitution entirely (frame_poses/
+        // frame_states are still untouched at this exact point, so
+        // stopping here is equivalent to "keep the last good state"),
+        // terminate this optimize() call, and record the failure on
+        // vio_health so a caller can tell the published pose is stale
+        // instead of silently trusting it. This is a scoped mitigation,
+        // not a validated recovery system: it only helps if something
+        // downstream actually checks vio_health.degraded.
+        if (!numerically_valid) {
+          std::cerr << "Numerical failure during linearization -- skipping "
+                       "this optimize() iteration, keeping last good state "
+                       "(t_ns "
+                    << last_state_t_ns << ")" << std::endl;
+          vio_health.degraded = true;
+          vio_health.last_degraded_t_ns = last_state_t_ns;
+          vio_health.consecutive_degraded_count++;
+          terminated = true;
+          message = "Numerical failure during linearization";
+          break;
+        }
+        vio_health.consecutive_degraded_count = 0;
 
         //        // compute pose jacobian norm squared for Jacobian scaling
         //        if (scale_Jp) {

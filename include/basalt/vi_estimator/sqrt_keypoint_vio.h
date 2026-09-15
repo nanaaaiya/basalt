@@ -34,6 +34,8 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 */
 #pragma once
 
+#include <atomic>
+#include <mutex>
 #include <thread>
 
 #include <basalt/imu/preintegration.h>
@@ -204,6 +206,38 @@ class SqrtKeypointVioEstimator : public VioEstimatorBase,
     return T_w_i_init.template cast<double>();
   }
 
+  // Set (not aborted) when optimize()'s linearization hits a degenerate/
+  // numerically-invalid case -- see optimize() in the .cpp for the failure
+  // this replaces (a hard abort()). No consumer reads this yet in this
+  // repo; it exists so the live app / a future fusion layer can decide
+  // whether to trust the published pose, since this class can no longer
+  // guarantee that on its own by crashing instead.
+  struct VioHealth {
+    std::atomic<bool> degraded{false};
+    std::atomic<int64_t> last_degraded_t_ns{-1};
+    std::atomic<int> consecutive_degraded_count{0};
+  };
+  VioHealth vio_health;
+
+  // Rotation rate at the timestamp of the most recent IMU sample VIO has
+  // actually consumed (see popFromImuDataQueue() in the .cpp) -- "how
+  // fast is this rotating right now," for a confidence signal or
+  // scenario-characterization tooling. gyro is bias-corrected by the
+  // time it reaches here (see the .cpp call sites).
+  // Fraction of the current frame's cam0 observations that matched an
+  // existing landmark (vs. never-before-seen) -- the same ratio
+  // vio_new_kf_keypoints_thresh already gates keyframe insertion on, now
+  // also exposed as a standalone tracking-quality signal.
+  double getLatestTrackedRatio() const override { return latest_tracked_ratio; }
+
+  double getLatestGyroNorm() const override { return latest_gyro_norm; }
+  Eigen::Vector3d getLatestGyro() const {
+    std::lock_guard<std::mutex> lock(latest_gyro_mutex);
+    return latest_gyro;
+  }
+
+  bool isDegraded() const override { return vio_health.degraded; }
+
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 
  private:
@@ -220,6 +254,11 @@ class SqrtKeypointVioEstimator : public VioEstimatorBase,
   std::set<int64_t> kf_ids;
 
   int64_t last_state_t_ns;
+
+  std::atomic<double> latest_tracked_ratio{1.0};
+  std::atomic<double> latest_gyro_norm{0.0};
+  mutable std::mutex latest_gyro_mutex;
+  Eigen::Vector3d latest_gyro{Eigen::Vector3d::Zero()};
   Eigen::aligned_map<int64_t, IntegratedImuMeasurement<Scalar>> imu_meas;
 
   const Vec3 g;

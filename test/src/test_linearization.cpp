@@ -173,6 +173,68 @@ TEST(LinearizationTestSuite, VoNoMargLinearizationTest) {
 }
 #endif
 
+// Confirms the signal SqrtKeypointVioEstimator::optimize() (sqrt_keypoint_
+// vio.cpp) now checks instead of aborting the whole process actually
+// propagates correctly: a single landmark with a non-finite bearing
+// direction should make LandmarkBlockAbsDynamic::linearizeLandmark()
+// (landmark_block_abs_dynamic.hpp) set State::NumericalFailure, which
+// LinearizationAbsQR::linearizeProblem() must reduce into a false
+// numerically_valid output. This only exercises the ABS_QR path (the
+// default, and the only one that performs this check at all -- ABS_SC/
+// REL_SC unconditionally report numerically_valid=true and are not
+// expected to catch this).
+#ifdef BASALT_INSTANTIATIONS_DOUBLE
+TEST(LinearizationTestSuite, AbsQrDegenerateLandmarkReportsNumericalFailure) {
+  using Scalar = double;
+  static constexpr int POSE_SIZE = 6;
+  static constexpr int NUM_FRAMES = 4;
+
+  basalt::BundleAdjustmentBase<Scalar> estimator;
+  basalt::AbsOrderMap aom;
+
+  get_vo_estimator<Scalar>(NUM_FRAMES, estimator, aom);
+
+  // Sanity check first: the healthy fixture must report valid on its own,
+  // otherwise the corrupted-landmark check below wouldn't be meaningful.
+  {
+    typename basalt::LinearizationBase<Scalar, POSE_SIZE>::Options options;
+    options.lb_options.huber_parameter = estimator.huber_thresh;
+    options.lb_options.obs_std_dev = estimator.obs_std_dev;
+    options.linearization_type = basalt::LinearizationType::ABS_QR;
+
+    auto lqr = basalt::LinearizationBase<Scalar, POSE_SIZE>::create(
+        &estimator, aom, options);
+    bool numerically_valid = false;
+    lqr->linearizeProblem(&numerically_valid);
+    EXPECT_TRUE(numerically_valid);
+  }
+
+  // Corrupt one landmark's inverse depth to an extreme (but finite) value.
+  // linearizePoint() (ba_utils.h) only checks the projected RESIDUAL for
+  // finiteness before accepting an observation as "valid" -- but the
+  // reprojection JACOBIAN scales directly with the raw inv_dist magnitude
+  // (d_point_d_xi's diagonal block is Identity * inv_dist), so a huge
+  // inv_dist can push the Jacobian past double's range while the
+  // (ratio-based) residual itself stays finite -- exactly the gap
+  // LandmarkBlockAbsDynamic::linearizeLandmark()'s explicit Jacobian-
+  // finiteness check (separate from the residual check) exists to catch.
+  estimator.lmdb.getLandmark(0).inv_dist = Scalar(1e250);
+
+  {
+    typename basalt::LinearizationBase<Scalar, POSE_SIZE>::Options options;
+    options.lb_options.huber_parameter = estimator.huber_thresh;
+    options.lb_options.obs_std_dev = estimator.obs_std_dev;
+    options.linearization_type = basalt::LinearizationType::ABS_QR;
+
+    auto lqr = basalt::LinearizationBase<Scalar, POSE_SIZE>::create(
+        &estimator, aom, options);
+    bool numerically_valid = true;
+    lqr->linearizeProblem(&numerically_valid);
+    EXPECT_FALSE(numerically_valid);
+  }
+}
+#endif
+
 #ifdef BASALT_INSTANTIATIONS_DOUBLE
 TEST(LinearizationTestSuite, VoMargLinearizationTest) {
   using Scalar = double;
