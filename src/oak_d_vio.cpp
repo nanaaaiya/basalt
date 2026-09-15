@@ -543,10 +543,20 @@ int main(int argc, char** argv) {
           int n = online_loop_closure->numLoopClosures();
           if (n > last_num_closures) {
             last_num_closures = n;
+            // NOT curr_t_ns -- that's only ever set once, to the very
+            // first pose (see t4: "if (curr_t_ns < 0) curr_t_ns = t_ns;"),
+            // so every loop_closure event was previously stamped with the
+            // session's start time regardless of when the closure
+            // actually happened (harmless for the real-time dashboard
+            // toast, which still popped up at roughly the right moment,
+            // but useless for any after-the-fact analysis of the stored
+            // JSONL). vio_t_ns.back() is the actual latest timestamp VIO
+            // has processed, updated every t4 iteration under the same
+            // mutex.
             int64_t t_ns;
             {
               std::lock_guard<std::mutex> lock(vio_state_mutex);
-              t_ns = curr_t_ns;
+              t_ns = vio_t_ns.empty() ? curr_t_ns : vio_t_ns.back();
             }
             dashboard_client->sendMapEvent(t_ns, "loop_closure");
           }
@@ -561,10 +571,12 @@ int main(int argc, char** argv) {
           // cycled between two checks of this loop.
           bool held = false;
           while (online_loop_closure->drift_gate_events.try_pop(held)) {
+            // Same curr_t_ns bug as the loop_closure event above -- use
+            // the actual latest processed timestamp instead.
             int64_t t_ns;
             {
               std::lock_guard<std::mutex> lock(vio_state_mutex);
-              t_ns = curr_t_ns;
+              t_ns = vio_t_ns.empty() ? curr_t_ns : vio_t_ns.back();
             }
             dashboard_client->sendMapEvent(t_ns, held ? "drift_hold" : "drift_recovered");
           }
