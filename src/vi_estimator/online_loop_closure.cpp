@@ -84,7 +84,8 @@ constexpr double kStereoEpipolarErrorThreshold = 1e-3;
 // triangulation yield (observed anywhere from under 1% to 20%+ of detected
 // corners across a real session).
 //
-// This must never go below mapper_min_matches (currently 13): a partner
+// This must never go below the active config's mapper_min_matches (default
+// 20 in vio_config.cpp; the OAK-D live config overrides it to 13): a partner
 // with fewer triangulated points than that can *never* produce enough
 // PnP-ready matches to pass, no matter how good the descriptor matching is
 // (pnp_ready_points is upper-bounded by the partner's own triangulated
@@ -519,6 +520,11 @@ void OnlineLoopClosure::processKeyframe(const MargData::Ptr& data,
               << " raw_matches=" << md.matches.size()
               << " epipolar_inliers=" << md.inliers.size()
               << " triangulated=" << kf.pts3d.size() << std::endl;
+
+    // Exposed for a live confidence signal (vio_health.h) / scenario-
+    // characterization tooling -- this line was already printed every
+    // keyframe, just never retained anywhere queryable.
+    latest_triangulated_points = (int)kf.pts3d.size();
   }
 
   auto t2 = std::chrono::steady_clock::now();

@@ -86,9 +86,29 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 //      only 3 edges" gap #3 describes, by giving the solver a real
 //      chance at competing evidence from the start rather than relying
 //      on some later, unrelated closure to happen to touch the same
-//      node. On a branch (loop-closure-multi-edge-redundancy), pending
-//      live/EuRoC verification before merging -- update this note with
-//      the outcome once tested.
+//      node. VERIFIED via scripts/eval_full/run_loop_closure_eval.sh on
+//      V1_01_easy (same build, same commit, only kMaxLoopEdgesPerKeyframe
+//      changed) -- but note the pipeline is NOT deterministic run-to-run
+//      (RANSAC randomization and/or TBB parallel-reduce floating-point
+//      order both plausible causes: re-running the *identical* binary on
+//      the *identical* input produced corrected_ate_rmse ranging
+//      1.296-1.392m across 3 runs), so a single-run comparison would have
+//      been misleading. Across 3 runs each: 2 edges -> corrected_ate_rmse
+//      {1.296, 1.392, 1.303}m (mean 1.330m), 178/175/176 closures; 1 edge
+//      -> {1.341, 1.388, 1.468}m (mean 1.399m), 114/112/111 closures.
+//      Direction is consistent (2 edges beat 1 edge's mean in all 3
+//      samples) but the ~5% effect size is close to the ~5% run-to-run
+//      noise band, so treat this as a small, directionally-consistent,
+//      NOT strongly statistically confident improvement -- not a crisp
+//      fixed percentage. Either way, it does NOT fix this failure mode:
+//      every single sample from both configurations remains over 25x
+//      worse than raw VIO (0.043m) on this exact repro case. Do not
+//      treat multi-edge redundancy as a solution to perceptual aliasing;
+//      it is at most a modest mitigation. This result (and the noise
+//      characterization itself) is the actual merge-readiness evidence
+//      for the loop-closure-multi-edge-redundancy branch -- if tighter
+//      confidence is needed before merging, re-run with a larger sample
+//      per configuration rather than trusting either single number.
 // The real fix would be a richer graph with actual landmark-level
 // redundancy (multiple independent point observations per closure, like
 // Basalt's own offline basalt_mapper) -- deliberately NOT pursued now:
@@ -220,6 +240,14 @@ class OnlineLoopClosure {
 
   int numLoopClosures() const { return num_loop_closures.load(); }
 
+  // Stereo-triangulated point count from the most recently processed
+  // keyframe (already printed every keyframe as [STEREO-DIAG]
+  // "triangulated=", now also queryable) -- a confidence signal
+  // (vio_health.h) / scenario-characterization input.
+  int getLatestTriangulatedPoints() const {
+    return latest_triangulated_points.load();
+  }
+
   // Every stereo-triangulated point from every keyframe, transformed into
   // the corrected world frame -- for live map-saving (see
   // DashboardClient::sendMapFile()). Deliberately NOT routed through the
@@ -350,6 +378,7 @@ class OnlineLoopClosure {
   // kMaxLoopEdgesPerKeyframe in the .cpp), so this can exceed the number
   // of keyframes that ever closed a loop.
   std::atomic<int> num_loop_closures{0};
+  std::atomic<int> latest_triangulated_points{0};
 
   std::atomic<bool> running{false};
   std::thread worker_thread_;

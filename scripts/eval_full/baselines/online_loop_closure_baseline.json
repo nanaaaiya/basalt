@@ -1,0 +1,11 @@
+{
+  "_notes": "V1_01_easy values are the mean of 3 back-to-back runs on the identical binary/commit (876ed13, kMaxLoopEdgesPerKeyframe=2), not a single run -- this pipeline is NOT deterministic run-to-run (observed corrected_ate_rmse range 1.296-1.392m across those 3 runs, num_loop_closures 175-178). See the VERIFIED note in online_loop_closure.h for the full sample set and the kMaxLoopEdgesPerKeyframe=1 comparison. Use gen_loop_closure_results.py's 10%/1cm regression tolerance as-is -- it was sized to cover this observed noise band, not tightened further.",
+  "V1_01_easy": {
+    "raw_start_to_end": 0.429223,
+    "corrected_start_to_end": 0.429554,
+    "raw_ate_rmse": 0.0432002,
+    "corrected_ate_rmse": 1.33007,
+    "num_loop_closures": 176,
+    "num_stored_keyframes": 372
+  }
+}
