@@ -28,10 +28,19 @@
 # For multi-lap runs, give each pass its own waypoint entry with a
 # distinguishing label and a t_hint_s so each is matched unambiguously.
 #
+# IMPORTANT -- frame alignment: VIO's world frame has an arbitrary yaw at
+# startup (only gravity/roll/pitch is constrained by the init step, not
+# heading), so tape-measured (x, y) coordinates will essentially never line
+# up with VIO's own frame as-is. Use --align rigid (solves rotation +
+# translation from your first two waypoints) for any waypoint file whose
+# coordinates come from a real physical layout -- without it, a perfectly
+# accurate trajectory can show a large false error purely from this
+# rotation mismatch, not real VIO drift.
+#
 # Usage:
-#   ./score_live_run.py --jsonl run.jsonl --waypoints waypoints.yaml
+#   ./score_live_run.py --jsonl run.jsonl --waypoints waypoints.yaml --align rigid
 #   ./score_live_run.py --jsonl run.jsonl --waypoints waypoints.json \
-#       --frame both --strict-bar-cm 5 --relaxed-bar-cm 30
+#       --frame both --align rigid --strict-bar-cm 5 --relaxed-bar-cm 30
 
 import argparse
 import json
@@ -130,13 +139,20 @@ def main():
         "(default: 30, matching the product spec's dark-tunnel allowance)",
     )
     ap.add_argument(
-        "--align-first-waypoint",
-        action="store_true",
-        help="shift the whole trajectory (translation only, no rotation) so "
-        "the first waypoint's matched sample lines up exactly with its "
-        "ground-truth position -- makes later errors reflect accumulated "
-        "drift rather than a starting-frame offset. Off by default: this "
-        "can hide a real initial-alignment error if used carelessly.",
+        "--align",
+        choices=["none", "translation", "rigid"],
+        default="none",
+        help="none (default): compare raw (x,y) as-is -- only valid if your "
+        "ground-truth waypoints are already expressed in VIO's own world "
+        "frame. translation: shift the trajectory so the FIRST waypoint "
+        "lines up exactly, rotation untouched. rigid: translation AND "
+        "rotation (2D, solved from the first TWO waypoints) -- needed "
+        "whenever your waypoint (x,y) values come from a taped/measured "
+        "layout, since VIO's world-frame yaw is arbitrary at startup (only "
+        "gravity/roll/pitch is constrained by init, not heading) and will "
+        "essentially never match your tape measure's coordinate axes. "
+        "Without 'rigid', a perfectly accurate VIO trajectory can show a "
+        "large false error purely from this frame-rotation mismatch.",
     )
     args = ap.parse_args()
 
@@ -152,23 +168,60 @@ def main():
             continue
 
         t0_ns = poses[0][0]
+
+        # cos_a/sin_a implement a 2D rotation about (x,y); z only ever gets
+        # a plain offset (roll/pitch, and therefore z, are gravity-
+        # observable at init -- only yaw is arbitrary, so only x/y need a
+        # rotation, never z).
+        cos_a, sin_a = 1.0, 0.0
         offset = (0.0, 0.0, 0.0)
 
-        if args.align_first_waypoint and waypoints:
+        if args.align in ("translation", "rigid") and waypoints:
             first_wp = waypoints[0]
-            matched_t, matched_p = match_waypoint(first_wp, poses, t0_ns)
+            _, p1 = match_waypoint(first_wp, poses, t0_ns)
+
+            if args.align == "rigid":
+                if len(waypoints) < 2:
+                    print(
+                        "error: --align rigid needs at least 2 waypoints to "
+                        "solve for rotation",
+                        file=sys.stderr,
+                    )
+                    sys.exit(1)
+                second_wp = waypoints[1]
+                _, p2 = match_waypoint(second_wp, poses, t0_ns)
+
+                gt_dx = second_wp["x"] - first_wp["x"]
+                gt_dy = second_wp["y"] - first_wp["y"]
+                est_dx = p2[0] - p1[0]
+                est_dy = p2[1] - p1[1]
+
+                gt_angle = math.atan2(gt_dy, gt_dx)
+                est_angle = math.atan2(est_dy, est_dx)
+                rot = gt_angle - est_angle
+                cos_a, sin_a = math.cos(rot), math.sin(rot)
+
+            # Rotate p1 first (if rigid), then solve the translation that
+            # makes the (possibly-rotated) first waypoint land exactly on
+            # its ground-truth position.
+            p1_rot_x = cos_a * p1[0] - sin_a * p1[1]
+            p1_rot_y = sin_a * p1[0] + cos_a * p1[1]
             offset = (
-                first_wp["x"] - matched_p[0],
-                first_wp["y"] - matched_p[1],
-                first_wp["z"] - matched_p[2],
+                first_wp["x"] - p1_rot_x,
+                first_wp["y"] - p1_rot_y,
+                first_wp["z"] - p1[2],
             )
 
         def aligned(p):
-            return (p[0] + offset[0], p[1] + offset[1], p[2] + offset[2])
+            x = cos_a * p[0] - sin_a * p[1] + offset[0]
+            y = sin_a * p[0] + cos_a * p[1] + offset[1]
+            z = p[2] + offset[2]
+            return (x, y, z)
 
         print(f"\n=== frame={frame} ===")
-        if args.align_first_waypoint:
-            print(f"  (translation-only alignment applied: {offset})")
+        if args.align != "none":
+            rot_deg = math.degrees(math.atan2(sin_a, cos_a))
+            print(f"  (align={args.align}: rotation={rot_deg:+.1f}deg, translation={offset})")
 
         print(f"{'label':<20}{'gt (x,y)':<20}{'matched (x,y)':<20}{'t_s':<10}{'error_cm':<10}{'bar':<8}")
 
