@@ -159,6 +159,21 @@ def main():
     waypoints = load_waypoints(args.waypoints)
     frames_to_score = ["raw", "corrected"] if args.frame == "both" else [args.frame]
 
+    # t_hint_s needs ONE shared "t=0" reference across both frames -- always
+    # the raw frame's first pose, never each frame's own first pose. raw
+    # publishes from the very first processed frame, but corrected doesn't
+    # start until OnlineLoopClosure has produced its first valid smoothed
+    # pose (needs at least one keyframe), which is measurably LATER. Using
+    # each frame's own first sample as "t=0" silently points "t_hint_s=X"
+    # at two different real moments for raw vs corrected -- this looks
+    # exactly like a bad correction (wildly different matched positions)
+    # but is actually just two mismatched clocks.
+    raw_poses_for_t0 = load_poses(args.jsonl, "raw")
+    if not raw_poses_for_t0:
+        print("error: no raw poses found in this file -- can't establish a t=0 reference", file=sys.stderr)
+        sys.exit(1)
+    shared_t0_ns = raw_poses_for_t0[0][0]
+
     exit_code = 0
 
     for frame in frames_to_score:
@@ -166,8 +181,6 @@ def main():
         if len(poses) < 2:
             print(f"[{frame}] no poses found for this frame -- skipping", file=sys.stderr)
             continue
-
-        t0_ns = poses[0][0]
 
         # cos_a/sin_a implement a 2D rotation about (x,y); z only ever gets
         # a plain offset (roll/pitch, and therefore z, are gravity-
@@ -178,7 +191,7 @@ def main():
 
         if args.align in ("translation", "rigid") and waypoints:
             first_wp = waypoints[0]
-            _, p1 = match_waypoint(first_wp, poses, t0_ns)
+            _, p1 = match_waypoint(first_wp, poses, shared_t0_ns)
 
             if args.align == "rigid":
                 if len(waypoints) < 2:
@@ -189,7 +202,7 @@ def main():
                     )
                     sys.exit(1)
                 second_wp = waypoints[1]
-                _, p2 = match_waypoint(second_wp, poses, t0_ns)
+                _, p2 = match_waypoint(second_wp, poses, shared_t0_ns)
 
                 gt_dx = second_wp["x"] - first_wp["x"]
                 gt_dy = second_wp["y"] - first_wp["y"]
@@ -229,7 +242,7 @@ def main():
         any_fail = False
 
         for w in waypoints:
-            matched_t, matched_p = match_waypoint(w, poses, t0_ns)
+            matched_t, matched_p = match_waypoint(w, poses, shared_t0_ns)
             matched_p = aligned(matched_p)
             gt = (w["x"], w["y"])
             err_cm = planar_dist(gt, matched_p) * 100.0
@@ -240,7 +253,7 @@ def main():
             if status == "FAIL":
                 any_fail = True
 
-            t_s = (matched_t - t0_ns) / 1e9
+            t_s = (matched_t - shared_t0_ns) / 1e9
             print(
                 f"{w['label']:<20}"
                 f"({gt[0]:+.3f},{gt[1]:+.3f}){'':<4}"
