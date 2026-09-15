@@ -215,8 +215,6 @@ void OakDDevice::deviceLoop() {
         }
         last_imu_time = t;
 
-        if (t < discard_until) continue;  // still settling -- drop this sample
-
         ImuData<double>::Ptr data;
         data.reset(new ImuData<double>);
         data->t_ns = (int64_t)(t * 1e9);
@@ -224,6 +222,15 @@ void OakDDevice::deviceLoop() {
             packet.acceleroMeter.z;
         data->gyro << packet.gyroscope.x, packet.gyroscope.y,
             packet.gyroscope.z;
+
+        // Raw tap: pushed unconditionally, even during a post-gap settle
+        // window -- a gyro reading itself isn't corrupted by a stream
+        // gap the way vision-derived data is, so a consumer that only
+        // wants rotation-rate (not VIO's own fragile init) shouldn't be
+        // starved by VIO-specific discard logic.
+        if (queues.imu_tap_queue) queues.imu_tap_queue->try_push(data);
+
+        if (t < discard_until) continue;  // still settling -- drop this sample
 
         if (queues.imu_data_queue) queues.imu_data_queue->push(data);
       }
@@ -274,10 +281,27 @@ void OakDDevice::deviceLoop() {
         uint16_t* data_out = data->img_data[i].img->ptr;
 
         size_t full_size = (size_t)img.cols * (size_t)img.rows;
+
+        // A "low light" signal was deliberately never built here via
+        // dai::CameraControl exposure/gain queries -- that path
+        // previously crashed the OAK-D firmware (see the pipeline setup
+        // above). This computes mean brightness directly from pixel data
+        // already being read for the bit-shift conversion below (folded
+        // into the same pass, not a second scan) -- zero camera-control
+        // calls, cam0/left only (matches this file's existing
+        // diagnostic convention of treating cam0 as the reference).
+        uint64_t brightness_sum = 0;
+
         for (size_t j = 0; j < full_size; j++) {
           int val = data_in[j];
+          if (i == 0) brightness_sum += (unsigned)val;
           val = val << 8;
           data_out[j] = val;
+        }
+
+        if (i == 0 && full_size > 0) {
+          latest_cam0_mean_brightness =
+              (double)brightness_sum / (double)full_size;
         }
       }
 
@@ -310,6 +334,12 @@ void OakDDevice::setDepthOutputQueue(
         depth_queue) {
   std::lock_guard<std::mutex> lock(output_queues_mutex);
   output_queues.depth_data_queue = depth_queue;
+}
+
+void OakDDevice::setImuTapQueue(
+    tbb::concurrent_bounded_queue<ImuData<double>::Ptr>* imu_tap_queue) {
+  std::lock_guard<std::mutex> lock(output_queues_mutex);
+  output_queues.imu_tap_queue = imu_tap_queue;
 }
 
 void OakDDevice::detachOutputQueues() {

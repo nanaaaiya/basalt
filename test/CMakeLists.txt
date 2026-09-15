@@ -22,6 +22,9 @@ target_link_libraries(test_patch GTest::gtest GTest::gtest_main basalt)
 add_executable(test_occupancy_mapper src/test_occupancy_mapper.cpp)
 target_link_libraries(test_occupancy_mapper GTest::gtest GTest::gtest_main basalt)
 
+add_executable(test_vio_health src/test_vio_health.cpp)
+target_link_libraries(test_vio_health GTest::gtest GTest::gtest_main basalt)
+
 set(BASALT_TEST_INCLUDE_DIRS
     ${CMAKE_SOURCE_DIR}/include
     ${CMAKE_SOURCE_DIR}/include/basalt/utils)
@@ -33,6 +36,7 @@ target_include_directories(test_qr PRIVATE ${BASALT_TEST_INCLUDE_DIRS})
 target_include_directories(test_linearization PRIVATE ${BASALT_TEST_INCLUDE_DIRS})
 target_include_directories(test_patch PRIVATE ${BASALT_TEST_INCLUDE_DIRS})
 target_include_directories(test_occupancy_mapper PRIVATE ${BASALT_TEST_INCLUDE_DIRS})
+target_include_directories(test_vio_health PRIVATE ${BASALT_TEST_INCLUDE_DIRS})
 
 enable_testing()
 
@@ -49,3 +53,4 @@ gtest_add_tests(TARGET test_qr AUTO)
 gtest_add_tests(TARGET test_linearization AUTO)
 gtest_add_tests(TARGET test_patch AUTO)
 gtest_add_tests(TARGET test_occupancy_mapper AUTO)
+gtest_add_tests(TARGET test_vio_health AUTO)

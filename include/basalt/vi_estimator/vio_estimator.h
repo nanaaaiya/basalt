@@ -119,6 +119,16 @@ class VioEstimatorBase {
 
   virtual void addIMUToQueue(const ImuData<double>::Ptr& data) = 0;
   virtual void addVisionToQueue(const OpticalFlowResult::Ptr& data) = 0;
+
+  // Health/confidence-signal accessors (see basalt/utils/vio_health.h for
+  // how these get combined into one score) -- virtual with trivial
+  // defaults here so callers holding only a VioEstimatorBase::Ptr (e.g.
+  // oak_d_vio.cpp) can query them without downcasting to a concrete
+  // estimator type. Only SqrtKeypointVioEstimator overrides these with
+  // real values today.
+  virtual double getLatestTrackedRatio() const { return 1.0; }
+  virtual double getLatestGyroNorm() const { return 0.0; }
+  virtual bool isDegraded() const { return false; }
 };
 
 class VioEstimatorFactory {

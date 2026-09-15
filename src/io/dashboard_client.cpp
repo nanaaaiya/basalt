@@ -242,6 +242,20 @@ void DashboardClient::sendPose(int64_t t_ns, bool corrected,
   out_queue_.try_push(j.dump());
 }
 
+void DashboardClient::sendHealth(int64_t t_ns, double confidence,
+                                   const std::string& primary_reason,
+                                   bool degraded, double gyro_norm) {
+  nlohmann::json j;
+  j["type"] = "health";
+  j["run_id"] = "ignored";
+  j["t_ns"] = t_ns;
+  j["confidence"] = confidence;
+  j["primary_reason"] = primary_reason;
+  j["degraded"] = degraded;
+  j["gyro_norm"] = gyro_norm;
+  out_queue_.try_push(j.dump());
+}
+
 void DashboardClient::sendMapEvent(int64_t t_ns, const std::string& event,
                                     const std::string& detail_json) {
   nlohmann::json j;

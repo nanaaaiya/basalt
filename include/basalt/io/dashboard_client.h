@@ -104,6 +104,15 @@ class DashboardClient {
                 const Eigen::Vector4d& quat_xyzw,
                 const Eigen::Vector3d* vel_w_i = nullptr);
 
+  // A live VIO health/confidence snapshot (see basalt/utils/vio_health.h)
+  // -- its own message type ("health"), not folded into sendPose()'s
+  // always-null "covariance" placeholder, since this isn't pose
+  // uncertainty and shouldn't be mistaken for it. Non-blocking,
+  // best-effort, same as sendPose().
+  void sendHealth(int64_t t_ns, double confidence,
+                  const std::string& primary_reason, bool degraded,
+                  double gyro_norm);
+
   // event: one of "loop_closure" | "keyframe" | "map_saved" | "reinit",
   // matching MapEventType in schema.py exactly (any other string is
   // forwarded as-is and the dashboard will just show it verbatim in a

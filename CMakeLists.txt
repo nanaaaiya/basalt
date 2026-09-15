@@ -339,6 +339,7 @@ target_sources(basalt
     ${CMAKE_CURRENT_SOURCE_DIR}/src/utils/system_utils.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/utils/time_utils.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/utils/vio_config.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/utils/vio_health.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/vi_estimator/ba_base.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/vi_estimator/landmark_database.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/vi_estimator/marg_helper.cpp

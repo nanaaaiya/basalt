@@ -72,6 +72,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <basalt/io/marg_data_io.h>
 #include <basalt/mapping/occupancy_mapper.h>
 #include <basalt/utils/filesystem.h>
+#include <basalt/utils/vio_health.h>
 #include <basalt/spline/se3_spline.h>
 #include <basalt/vi_estimator/online_loop_closure.h>
 #include <basalt/vi_estimator/vio_estimator.h>
@@ -459,6 +460,39 @@ int main(int argc, char** argv) {
                 t_ns, /*corrected=*/true, T_corrected.translation(),
                 Eigen::Vector4d(qc.x(), qc.y(), qc.z(), qc.w()));
           }
+        }
+      }
+
+      // Confidence/health signal (see basalt/utils/vio_health.h) --
+      // published from this thread specifically because it runs
+      // unconditionally on the live drone path, unlike out_vis_queue
+      // (only wired when show_gui is true, dead on a real headless
+      // flight). Logged locally regardless of whether a dashboard is
+      // connected, so this also works fully offline on the bench.
+      {
+        basalt::VioConfidenceInputs health_in;
+        health_in.tracked_ratio = vio->getLatestTrackedRatio();
+        health_in.numerically_degraded = vio->isDegraded();
+        health_in.gyro_norm = vio->getLatestGyroNorm();
+        if (online_loop_closure) {
+          health_in.triangulated_points =
+              online_loop_closure->getLatestTriangulatedPoints();
+        }
+
+        basalt::VioConfidence health = basalt::computeVioConfidence(health_in);
+
+        if (health.primary_reason != "nominal") {
+          std::cout << "[VIO-HEALTH] t_ns=" << t_ns
+                    << " confidence=" << health.score
+                    << " reason=" << health.primary_reason
+                    << " gyro_norm=" << health_in.gyro_norm << std::endl;
+        }
+
+        if (dashboard_client) {
+          dashboard_client->sendHealth(t_ns, health.score,
+                                       health.primary_reason,
+                                       health_in.numerically_degraded,
+                                       health_in.gyro_norm);
         }
       }
 

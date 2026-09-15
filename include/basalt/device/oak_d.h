@@ -100,7 +100,25 @@ class OakDDevice {
       tbb::concurrent_bounded_queue<std::shared_ptr<dai::ImgFrame>>*
           depth_queue);
 
+  // A raw, unconsumed tap of every IMU sample, independent of
+  // setOutputQueues()'s imu_queue above (which VIO drains/consumes for
+  // preintegration). Exists because gyro data currently dies inside the
+  // VIO estimator once used -- nothing downstream of it can query
+  // "how fast is this rotating right now" today. Anything that wants raw
+  // IMU regardless of whether VIO has even initialized yet (a future
+  // fusion layer, scenario-characterization tooling) should read from
+  // here instead of trying to intercept setOutputQueues()'s queue.
+  void setImuTapQueue(
+      tbb::concurrent_bounded_queue<ImuData<double>::Ptr>* imu_tap_queue);
+
   OpticalFlowInput::Ptr getLastImageData() const;
+
+  // Mean pixel intensity (0-255) of the most recent cam0/left frame --
+  // a "low light" proxy computed directly from pixel data, deliberately
+  // NOT via dai::CameraControl exposure/gain queries (see deviceLoop()).
+  double getLatestCam0MeanBrightness() const {
+    return latest_cam0_mean_brightness;
+  }
 
  private:
   void deviceLoop();
@@ -119,6 +137,8 @@ class OakDDevice {
   mutable std::mutex last_img_data_mutex;
   OpticalFlowInput::Ptr last_img_data;
 
+  std::atomic<double> latest_cam0_mean_brightness{255.0};
+
   struct OutputQueues {
     tbb::concurrent_bounded_queue<OpticalFlowInput::Ptr>* image_data_queue =
         nullptr;
@@ -126,6 +146,8 @@ class OakDDevice {
         nullptr;
     tbb::concurrent_bounded_queue<std::shared_ptr<dai::ImgFrame>>*
         depth_data_queue = nullptr;
+    tbb::concurrent_bounded_queue<ImuData<double>::Ptr>* imu_tap_queue =
+        nullptr;
   };
 
   mutable std::mutex output_queues_mutex;
