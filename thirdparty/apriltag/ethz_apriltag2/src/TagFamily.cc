@@ -28,7 +28,33 @@ namespace AprilTags {
 TagFamily::TagFamily(const TagCodes& tagCodes, const size_t blackBorder)
   : blackBorder(blackBorder), bits(tagCodes.bits), dimension((int)std::sqrt((float)bits)),
     minimumHammingDistance(tagCodes.minHammingDistance),
-    errorRecoveryBits(1), codes() {
+    // Was hardcoded to 1 -- unusually conservative for tag36h11
+    // (minimumHammingDistance=11, which safely supports correcting up to
+    // (11-1)/2=5 bit errors: any two valid codes differ by >=11 bits, so a
+    // 5-bit correction can never accidentally match the wrong codeword).
+    // Confirmed via a real capture (basalt calibration on OAK-D Lite
+    // AprilGrid photos) that the old default of 1 was rejecting genuine,
+    // correctly-printed tag detections with observed hamming distances of
+    // 3-5 as "not good enough" purely due to this threshold -- not a
+    // sensor, printing, or lighting problem. thisTagFamily is const on
+    // TagDetector, so this has to be set here at construction rather than
+    // via setErrorRecoveryBits()/setErrorRecoveryFraction() afterward.
+    //
+    // Deliberately NOT the theoretical max (5): raising it that far let
+    // enough marginal/borderline reads through that calibration kept
+    // converging to a bad-but-stable local minimum (~31px mean
+    // reprojection error) regardless of optimizer strategy -- consistent
+    // with some accepted detections being genuinely mis-decoded (a wrong
+    // codeword that happens to land within the correction budget of the
+    // true one), corrupting the 2D<->3D correspondence for those points.
+    // 3 and 4 were both tried: 3 is too strict (zero valid frames again,
+    // same failure as the old broken default of 1); 4 gave very little
+    // data (5-6 frames) but the SAME ~30px reprojection bias as 5's 196
+    // frames -- that data-volume-independence pointed at a systematic
+    // intrinsics-seeding bug (see cam_calib.cpp's xi/alpha fix), not a
+    // wrong-decode-rate problem after all. Back to the max (5) now that
+    // the actual cause is fixed, since it gave the most usable data.
+    errorRecoveryBits(5), codes() {
   if ( bits != dimension*dimension )
     cerr << "Error: TagFamily constructor called with bits=" << bits << "; must be a square number!" << endl;
   codes = tagCodes.codes;
