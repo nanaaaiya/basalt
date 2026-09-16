@@ -361,6 +361,20 @@ target_include_directories(basalt PUBLIC
 target_compile_definitions(basalt PUBLIC ${BASALT_COMPILE_DEFINITIONS})
 #target_compile_definitions(basalt PUBLIC BASALT_DISABLE_ASSERTS)
 
+add_executable(basalt_inspect_calib_corners src/inspect_calib_corners.cpp)
+target_link_libraries(basalt_inspect_calib_corners basalt)
+
+add_executable(basalt_inspect_init_poses src/inspect_init_poses.cpp)
+target_link_libraries(basalt_inspect_init_poses basalt)
+
+add_executable(basalt_test_apriltag_render src/test_apriltag_render.cpp)
+target_link_libraries(basalt_test_apriltag_render basalt apriltag)
+
+add_executable(basalt_gen_aprilgrid_target src/gen_aprilgrid_target.cpp)
+target_include_directories(basalt_gen_aprilgrid_target PRIVATE
+                            thirdparty/apriltag/ethz_apriltag2/include)
+target_link_libraries(basalt_gen_aprilgrid_target basalt apriltag)
+
 add_executable(basalt_calibrate src/calibrate.cpp src/calibration/cam_calib.cpp)
 target_link_libraries(basalt_calibrate basalt ${BASALT_PANGO_TARGETS} basalt::cli11)
 basalt_add_gui_link_options(basalt_calibrate)
@@ -475,6 +489,16 @@ if(depthai_FOUND)
   target_link_libraries(basalt_oak_d_vio basalt depthai::core ${BASALT_PANGO_TARGETS} basalt::cli11)
   basalt_add_gui_link_options(basalt_oak_d_vio)
   basalt_add_macos_runtime_paths(basalt_oak_d_vio)
+
+  # Writes an EuRoC-format dataset to disk for basalt_calibrate/
+  # basalt_calibrate_imu, mirroring what basalt_rs_t265_record does for the
+  # RealSense T265 (no OAK-D equivalent existed yet). Shows both raw camera
+  # feeds live via Pangolin while recording (see the file's own comment for
+  # why this matters, not just a nicety).
+  add_executable(basalt_oak_d_calib_record src/oak_d_calib_record.cpp src/device/oak_d.cpp)
+  target_link_libraries(basalt_oak_d_calib_record basalt depthai::core ${BASALT_PANGO_TARGETS} basalt::cli11)
+  basalt_add_gui_link_options(basalt_oak_d_calib_record)
+  basalt_add_macos_runtime_paths(basalt_oak_d_calib_record)
 else()
   message(WARNING "depthai-core not found, skipping basalt_oak_d_vio target")
 endif()
@@ -504,7 +528,7 @@ if(realsense2_FOUND)
 endif()
 
 if(depthai_FOUND)
-    install(TARGETS basalt_oak_d_vio
+    install(TARGETS basalt_oak_d_vio basalt_oak_d_calib_record
       EXPORT BasaltTargets
       RUNTIME DESTINATION ${CMAKE_INSTALL_PREFIX}/bin
       LIBRARY DESTINATION ${CMAKE_INSTALL_PREFIX}/lib
