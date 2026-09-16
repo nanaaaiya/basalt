@@ -68,6 +68,17 @@ int main(int argc, char** argv) {
       ->required();
   app.add_flag("--no-gui", no_gui, "Run calibration without opening the GUI");
 
+  bool skip_vign = false;
+  app.add_flag("--skip-vign", skip_vign,
+              "Skip compute_vign() in the --no-gui path. Vignette estimation "
+              "requires a target with dedicated vignette-sampling markers "
+              "(printed by Kalibr's default AprilGrid PDF, absent from a "
+              "plain AprilTag grid) and a static-target/moving-camera "
+              "capture with constant lighting -- on data that doesn't meet "
+              "that, it has been observed to crash with an out-of-bounds "
+              "RdSpline assertion. Harmless to skip whenever vignette "
+              "calibration isn't actually needed.");
+
   try {
     app.parse(argc, argv);
   } catch (const CLI::ParseError& e) {
@@ -84,9 +95,32 @@ int main(int argc, char** argv) {
     cv.initCamPoses();
     cv.initCamExtrinsics();
     cv.initOptimization();
+
+    // Two-phase optimization, per doc/Calibration.md's own documented
+    // remedy for exactly this failure mode ("opt_intr controls if the
+    // optimization can change the intrinsics. For some datasets it might
+    // be helpful to disable this option for several first iterations"):
+    // on a real OAK-D Lite handheld capture, letting intrinsics move
+    // jointly with poses/extrinsics from the very first iteration let the
+    // optimizer wander from a good, known-correct intrinsics seed to a
+    // converged-but-wrong one (~31px mean reprojection error, fx drifting
+    // from the seeded ~461 to ~630-760). Locking intrinsics first gives
+    // poses/extrinsics a chance to settle around the good seed before
+    // intrinsics are allowed to move at all.
+    std::cout << "Phase 1: optimizing poses/extrinsics with intrinsics "
+                 "locked at their seed values..."
+              << std::endl;
+    cv.setOptIntrinsics(false);
+    for (int i = 0; i < 30 && !cv.optimizeWithParam(true); i++) {
+    }
+
+    std::cout << "Phase 2: joint optimization with intrinsics unlocked..."
+              << std::endl;
+    cv.setOptIntrinsics(true);
     while (!cv.optimizeWithParam(true)) {
     }
-    cv.computeVign();
+
+    if (!skip_vign) cv.computeVign();
     cv.saveCalib();
     return 0;
   }

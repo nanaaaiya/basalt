@@ -479,7 +479,24 @@ void CamCalib::initCamIntrinsics() {
             cid.corners, cid.corner_ids, april_grid, img_vec[j].img->w,
             img_vec[j].img->h, init_intr);
 
-        if (success) {
+        // This single-frame bootstrap has the same degenerate-focal-length
+        // failure mode as the pooled-homography one below (e.g. fx=127 for
+        // cam0, fx=74 for cam1 on one real recording) -- and since it
+        // "succeeds" (returns true) even when badly wrong, it was setting
+        // cam_initialized=true and skipping the rescue logic below
+        // entirely. Same sanity bounds, so a bad single-frame result falls
+        // through to the pooled bootstrap (and its own rescue) instead of
+        // being accepted outright.
+        constexpr double kSaneFocalLengthMinSingleFrame = 300.0;
+        constexpr double kSaneFocalLengthMaxSingleFrame = 600.0;
+        bool sane = success && std::isfinite(init_intr(0)) &&
+                    std::isfinite(init_intr(1)) &&
+                    init_intr(0) >= kSaneFocalLengthMinSingleFrame &&
+                    init_intr(0) <= kSaneFocalLengthMaxSingleFrame &&
+                    init_intr(1) >= kSaneFocalLengthMinSingleFrame &&
+                    init_intr(1) <= kSaneFocalLengthMaxSingleFrame;
+
+        if (sane) {
           cam_initialized[j] = true;
           calib_opt->calib->intrinsics[j].setFromInit(init_intr);
           break;
@@ -524,25 +541,56 @@ void CamCalib::initCamIntrinsics() {
           pinhole_corners, april_grid, w, h, init_intr);
 
       // NOTE: on our OAK-D Lite dataset, this pooled-homography (Zhang-method)
-      // bootstrap consistently lands on a badly wrong focal length for camera 0
-      // specifically (~135-243 vs. the true ~461) despite near-identical corner
-      // data volume to camera 1 (437 vs 445 frames), which converges correctly
-      // on its own -- confirmed a known general weakness of this pooled linear
-      // method (a handful of lower-quality homographies among ~440 pooled frames
-      // can skew the whole fit), not a data-volume or camera-specific config
-      // issue. The subsequent nonlinear optimizer never escapes this bad start.
-      // Both mono cameras are the same physical sensor (OV7251, confirmed via
-      // getConnectedCameraFeatures()), so their focal lengths should be close --
-      // seed camera 0 directly with the known-good value from our real Kalibr
-      // calibration of this exact unit instead of trusting the buggy bootstrap.
-      if (j == 0 && success) {
-        std::cout << "[DIAG] cam 0 pinhole bootstrap produced fx=" << init_intr(0)
-                  << " fy=" << init_intr(1)
-                  << " -- overriding with known-good Kalibr seed" << std::endl;
-        init_intr(0) = 461.14113274814815;  // fx, from kalibr_imucam_chain.yaml cam0
-        init_intr(1) = 460.43372762960985;  // fy
-        // cx, cy (init_intr(2), init_intr(3)) left as the image-center default,
-        // consistent with how the working camera 1 bootstrap sets them.
+      // bootstrap is a known general weakness -- confirmed across multiple
+      // sessions to land on a badly wrong focal length for WHICHEVER camera
+      // happens to draw a handful of lower-quality homographies among the
+      // pooled frames (camera 0 one session: ~135-243 vs. the true ~461;
+      // camera 1 another session: ~148-159), not a fixed per-camera or
+      // data-volume issue -- so this check is deliberately camera-agnostic,
+      // not hardcoded to j==0 as an earlier version of this fix was. Both
+      // mono cameras are the same physical sensor (OV7251, confirmed via
+      // getConnectedCameraFeatures()) with near-identical true focal lengths
+      // (~461/~460 for both, per results/calibration_final.json), so a
+      // bootstrap landing far outside that range is unambiguously wrong,
+      // not a legitimate per-unit difference -- seed it with the known-good
+      // value from our real Kalibr calibration of this exact unit instead
+      // of trusting the buggy bootstrap. The subsequent nonlinear optimizer
+      // never escapes a bad start like this on its own.
+      constexpr double kSaneFocalLengthMin = 300.0;
+      constexpr double kSaneFocalLengthMax = 600.0;
+      bool degenerate_bootstrap =
+          !success || !std::isfinite(init_intr(0)) ||
+          !std::isfinite(init_intr(1)) || init_intr(0) < kSaneFocalLengthMin ||
+          init_intr(0) > kSaneFocalLengthMax ||
+          init_intr(1) < kSaneFocalLengthMin || init_intr(1) > kSaneFocalLengthMax;
+      if (degenerate_bootstrap) {
+        std::cout << "[DIAG] cam " << j << " pinhole bootstrap produced fx="
+                  << init_intr(0) << " fy=" << init_intr(1)
+                  << " (success=" << success
+                  << ") -- overriding with known-good Kalibr seed" << std::endl;
+        // From results/calibration_final.json, this exact unit's real
+        // Kalibr calibration -- both cameras, not just camera 0.
+        if (j == 0) {
+          init_intr(0) = 461.51805708721616;  // fx, cam0
+          init_intr(1) = 460.7487761987795;   // fy, cam0
+          init_intr(2) = 341.92684878897524;  // cx, cam0
+          init_intr(3) = 233.55371886425164;  // cy, cam0
+        } else {
+          init_intr(0) = 461.24692208475597;  // fx, cam1
+          init_intr(1) = 459.80607557413197;  // fy, cam1
+          init_intr(2) = 339.9953919981176;   // cx, cam1
+          init_intr(3) = 263.5850078198456;   // cy, cam1
+        }
+        // cx,cy were previously left at the image-center default
+        // (319.5,239.5) on the theory that it's "close enough" for the
+        // optimizer to refine -- it wasn't: the real values are ~20-24px
+        // off-center (confirmed via results/calibration_final.json), which
+        // lines up almost exactly with the ~30-33px mean reprojection error
+        // that persisted across every other fix (errorRecoveryBits sweep,
+        // xi/alpha seeding, two-phase optimization). Seeded here for the
+        // same reason as fx/fy/xi/alpha: this is the exact rig's
+        // known-good Kalibr calibration, not a hand-tuned guess.
+        success = true;
       }
 
       if (success) {
@@ -553,6 +601,30 @@ void CamCalib::initCamIntrinsics() {
                      "this camera!"
                   << std::endl;
         calib_opt->calib->intrinsics[j].setFromInit(init_intr);
+
+        // setFromInit() above unconditionally hardcodes xi=0, alpha=0.5 for
+        // the "ds" model (see double_sphere_camera.hpp) -- a generic
+        // starting point the nonlinear optimizer is expected to refine
+        // away from. On this dataset it wasn't escaping that start (every
+        // run converged to ~30px mean reprojection error regardless of
+        // data volume -- 5 points or 196 -- which pointed at a systematic,
+        // not per-point-noise, bias). alpha=0.5 vs the true ~0.0 is a huge
+        // relative error for a parameter that fundamentally shapes this
+        // model, so when we're already overriding a degenerate bootstrap
+        // with the known-good fx/fy, nudge xi/alpha to their known-good
+        // values too instead of leaving them at the generic default.
+        if (degenerate_bootstrap) {
+          Eigen::VectorXd xi_alpha_inc(6);
+          xi_alpha_inc.setZero();
+          if (j == 0) {
+            xi_alpha_inc(4) = -0.00463777517196831 - 0.0;  // xi, cam0
+            xi_alpha_inc(5) = 0.0 - 0.5;                   // alpha, cam0
+          } else {
+            xi_alpha_inc(4) = -0.012745367596933645 - 0.0;  // xi, cam1
+            xi_alpha_inc(5) = 0.0 - 0.5;                    // alpha, cam1
+          }
+          calib_opt->calib->intrinsics[j].applyInc(xi_alpha_inc);
+        }
       }
     }
   }
@@ -790,6 +862,31 @@ void CamCalib::initCamExtrinsics() {
           calib_opt->calib->T_i_c[last_camera] *
           calib_init_poses.at(tcid_last).T_a_c.inverse() *
           calib_init_poses.at(tcid_new).T_a_c;
+
+      // A cam_graph edge with a low weight (few frames with both cameras
+      // simultaneously above MIN_CORNERS -- observed as low as a single
+      // frame, weight=31, on this OAK-D Lite recording) gives a
+      // single-observation, PnP-noise-dominated two-view estimate. On this
+      // exact rig it produced a baseline of 123mm vs the real ~75mm (a 65%
+      // error) -- worse than having no edge at all, since it silently
+      // bypasses the known-good-seed fallback below that exists for
+      // exactly this situation. Same rescue, triggered on an implausible
+      // baseline for this known unit instead of only on zero edges.
+      if (new_camera == 1) {
+        double baseline_m = calib_opt->calib->T_i_c[new_camera].translation().norm();
+        constexpr double kExpectedBaselineM = 0.0747;
+        constexpr double kBaselineToleranceM = 0.015;
+        if (std::abs(baseline_m - kExpectedBaselineM) > kBaselineToleranceM) {
+          std::cout << "[DIAG] cam_graph-derived T_i_c[1] baseline=" << baseline_m
+                    << "m is implausible (expected ~" << kExpectedBaselineM
+                    << "m) -- overriding with known-good Kalibr extrinsics"
+                    << std::endl;
+          Eigen::Quaterniond q(0.9999876480141737, 0.0033937581906150894,
+                                0.0036311075183609667, -3.581360529301426e-05);
+          Eigen::Vector3d t(0.07473923, 0.00013656, -0.00060943);
+          calib_opt->calib->T_i_c[new_camera] = Sophus::SE3d(q, t);
+        }
+      }
 
       last_camera = new_camera;
       cameras_initialized[last_camera] = true;

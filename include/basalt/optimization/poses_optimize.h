@@ -184,11 +184,31 @@ class PosesOptimization {
                   << " step_quality: " << step_quality
                   << " max_inc: " << max_inc << " Error: " << eopt.error
                   << " num points " << eopt.num_points << std::endl;
-        lambda = std::min(max_lambda, lambda_vee * lambda);
-        lambda_vee *= 2;
 
         timestam_to_pose = timestam_to_pose_backup;
         *calib = calib_backup;
+
+        // lambda is a PERSISTENT member (not reset per optimize() call), so
+        // once it's already saturated at max_lambda and a step is still
+        // rejected, escalating it further is a no-op -- the solver cannot
+        // find any improving direction from here. Without this, calibrate.
+        // cpp's --no-gui path (`while (!cv.optimizeWithParam(true)) {}`, no
+        // outer cap) spins forever re-calling this function: confirmed on a
+        // real OAK-D Lite dataset, over 62,000 calls / ~30 minutes with the
+        // error visibly oscillating (not converging) before being killed
+        // manually. Treat "stuck at max damping" as "done, not converging
+        // further" so the caller's loop actually terminates -- mirroring
+        // the same give-up-at-max_lambda pattern already used in
+        // SqrtKeypointVioEstimator::optimize().
+        if (lambda >= max_lambda) {
+          std::cout << "\t[STUCK] lambda already at max_lambda (" << max_lambda
+                    << ") and still rejecting -- giving up on this call"
+                    << std::endl;
+          converged = true;
+        }
+
+        lambda = std::min(max_lambda, lambda_vee * lambda);
+        lambda_vee *= 2;
       } else {
         std::cout << "\t[ACCEPTED] lambda:" << lambda
                   << " step_quality: " << step_quality
