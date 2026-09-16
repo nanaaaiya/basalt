@@ -11,3 +11,12 @@ __pycache__
 # keep only the final calibration actually used by the OAK-D live driver.
 results/*
 !results/calibration_final.json
+
+# Same idea for the AprilGrid-target recalibration work: raw recordings
+# (thousands of PNG frames each), regenerated corner/pose caches, and
+# per-run console logs are all regenerable from basalt_oak_d_calib_record
+# + basalt_calibrate, not source artifacts worth versioning.
+calib_recordings/
+calib_results/
+calib_*.log
+calib_results_*.log
