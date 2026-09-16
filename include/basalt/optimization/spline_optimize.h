@@ -482,13 +482,30 @@ class SplineOptimization {
                     << " step_quality: " << step_quality
                     << " max_inc: " << max_inc << " Error: " << eopt.error
                     << " num points " << eopt.num_points << std::endl;
-        lambda = std::min(max_lambda, lambda_vee * lambda);
-        lambda_vee *= 2;
 
         spline = spline_backup;
         *calib = calib_backup;
         *mocap_calib = mocap_calib_backup;
         g = g_backup;
+
+        // Same persistent-lambda infinite-loop bug already fixed in
+        // PosesOptimization::optimize() (poses_optimize.h): lambda is a
+        // class member that isn't reset per call, and the outer
+        // while(!optimizeWithParam(true)){} caller has no cap of its own.
+        // Observed hanging indefinitely here too (11+ min, still rejecting
+        // at lambda already pinned to max_lambda) on a real IMU-camera
+        // calibration run -- give up on this call instead of spinning.
+        if (lambda >= max_lambda) {
+          if (print_info)
+            std::cout << "\t[STUCK] lambda already at max_lambda ("
+                      << max_lambda << ") and still rejecting -- giving up "
+                                       "on this call"
+                      << std::endl;
+          return true;
+        }
+
+        lambda = std::min(max_lambda, lambda_vee * lambda);
+        lambda_vee *= 2;
 
       } else {
         if (print_info)
