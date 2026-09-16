@@ -55,8 +55,22 @@ AprilGrid::AprilGrid(const std::string& config_path) {
     std::abort();
   }
 
-  double x_corner_offsets[4] = {0, tagSize, tagSize, 0};
-  double y_corner_offsets[4] = {0, 0, tagSize, tagSize};
+  // Corner-offset convention was {0,tagSize,tagSize,0}/{0,0,tagSize,tagSize}
+  // (corner1 = local +x/right, corner3 = local +y/down), the textbook
+  // AprilGrid layout. Empirically that does NOT match what
+  // ApriltagDetector::detectTags() (thirdparty/apriltag, unmodified)
+  // actually reports for tags rendered by basalt_gen_aprilgrid_target
+  // (solid-square rasterization): corner1 comes out at local +y/down and
+  // corner3 at local +x/right -- verified two ways before changing this:
+  // (1) a synthetic render->detect->compare round trip inside
+  // basalt_gen_aprilgrid_target with zero corner mismatches, and (2) five
+  // real handheld photos of the printed target, each fit with a plain 2D
+  // homography (no distortion model) giving <1.1px mean / <2.2px max
+  // reprojection error and zero RANSAC outliers under this swapped
+  // convention (vs. ~30px systematic error and near-random corner
+  // assignment under the original one). Swapped indices 1 and 3 to match.
+  double x_corner_offsets[4] = {0, 0, tagSize, tagSize};
+  double y_corner_offsets[4] = {0, tagSize, tagSize, 0};
 
   aprilgrid_corner_pos_3d.resize(tagCols * tagRows * 4);
 
