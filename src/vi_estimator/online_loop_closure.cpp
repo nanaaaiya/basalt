@@ -1089,7 +1089,7 @@ void OnlineLoopClosure::checkDriftGate() {
       drift_gate_stable_count_ = 0;
       drift_anchor_idx_ = n - 1;
       keyframes_since_anchor_refresh_ = 0;
-      drift_gate_events.try_push(false);
+      drift_gate_events.try_push(DriftGateEvent::kReleasedForced);
       std::cout << "[ONLINE-LOOP] DRIFT GATE FORCE-RELEASED: kf=" << (n - 1)
                 << " after " << held_seconds << "s (max hold "
                 << kDriftGateMaxHoldSeconds
@@ -1136,7 +1136,7 @@ void OnlineLoopClosure::checkDriftGate() {
       }
       drift_held_ = true;
       drift_held_since_t_ns_ = newest.t_ns;
-      drift_gate_events.try_push(true);
+      drift_gate_events.try_push(DriftGateEvent::kTripped);
       std::cout << "[ONLINE-LOOP] DRIFT GATE TRIPPED: kf=" << (n - 1)
                 << " residual=" << residual_m
                 << "m (threshold=" << kDriftGateThresholdM
@@ -1156,7 +1156,7 @@ void OnlineLoopClosure::checkDriftGate() {
       // pre-trip anchor.
       drift_anchor_idx_ = n - 1;
       keyframes_since_anchor_refresh_ = 0;
-      drift_gate_events.try_push(false);
+      drift_gate_events.try_push(DriftGateEvent::kReleasedConfirmed);
       std::cout << "[ONLINE-LOOP] DRIFT GATE RELEASED: kf=" << (n - 1)
                 << " residual back under threshold for " << kDriftGateReleaseCount
                 << " consecutive solves" << std::endl;

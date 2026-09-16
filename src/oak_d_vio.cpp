@@ -481,18 +481,34 @@ int main(int argc, char** argv) {
 
         basalt::VioConfidence health = basalt::computeVioConfidence(health_in);
 
+        // Raw counts behind tracked_ratio -- see
+        // getLatestTrackedCount()/getLatestTotalObservedCount()'s comment:
+        // separates "few features exist this frame" (detection/texture/
+        // exposure) from "plenty exist but few matched" (tracking/motion
+        // blur), which the ratio alone can't distinguish.
+        int tracked_count = vio->getLatestTrackedCount();
+        int total_observed_count = vio->getLatestTotalObservedCount();
+
         if (health.primary_reason != "nominal") {
           std::cout << "[VIO-HEALTH] t_ns=" << t_ns
                     << " confidence=" << health.score
                     << " reason=" << health.primary_reason
+                    << " tracked_ratio=" << health_in.tracked_ratio
+                    << " tracked_count=" << tracked_count
+                    << " total_observed_count=" << total_observed_count
+                    << " triangulated_points="
+                    << (health_in.triangulated_points
+                            ? std::to_string(*health_in.triangulated_points)
+                            : "n/a")
                     << " gyro_norm=" << health_in.gyro_norm << std::endl;
         }
 
         if (dashboard_client) {
-          dashboard_client->sendHealth(t_ns, health.score,
-                                       health.primary_reason,
-                                       health_in.numerically_degraded,
-                                       health_in.gyro_norm);
+          dashboard_client->sendHealth(
+              t_ns, health.score, health.primary_reason,
+              health_in.numerically_degraded, health_in.gyro_norm,
+              health_in.tracked_ratio, health_in.triangulated_points,
+              tracked_count, total_observed_count);
         }
       }
 
@@ -569,8 +585,8 @@ int main(int argc, char** argv) {
           // freeze. Draining the queue reports every transition that
           // actually happened, in order, regardless of how fast they
           // cycled between two checks of this loop.
-          bool held = false;
-          while (online_loop_closure->drift_gate_events.try_pop(held)) {
+          basalt::DriftGateEvent gate_event = basalt::DriftGateEvent::kTripped;
+          while (online_loop_closure->drift_gate_events.try_pop(gate_event)) {
             // Same curr_t_ns bug as the loop_closure event above -- use
             // the actual latest processed timestamp instead.
             int64_t t_ns;
@@ -578,7 +594,23 @@ int main(int argc, char** argv) {
               std::lock_guard<std::mutex> lock(vio_state_mutex);
               t_ns = vio_t_ns.empty() ? curr_t_ns : vio_t_ns.back();
             }
-            dashboard_client->sendMapEvent(t_ns, held ? "drift_hold" : "drift_recovered");
+            // MapEventType (schema.py) only has "drift_hold"/"drift_recovered"
+            // -- the confirmed-vs-forced distinction (see DriftGateEvent's
+            // comment) rides in `detail` instead of a new event string, so
+            // it doesn't require a dashboard-side enum change to consume.
+            switch (gate_event) {
+              case basalt::DriftGateEvent::kTripped:
+                dashboard_client->sendMapEvent(t_ns, "drift_hold");
+                break;
+              case basalt::DriftGateEvent::kReleasedConfirmed:
+                dashboard_client->sendMapEvent(t_ns, "drift_recovered",
+                                               R"({"forced": false})");
+                break;
+              case basalt::DriftGateEvent::kReleasedForced:
+                dashboard_client->sendMapEvent(t_ns, "drift_recovered",
+                                               R"({"forced": true})");
+                break;
+            }
           }
         }
 

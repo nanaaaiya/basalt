@@ -244,7 +244,11 @@ void DashboardClient::sendPose(int64_t t_ns, bool corrected,
 
 void DashboardClient::sendHealth(int64_t t_ns, double confidence,
                                    const std::string& primary_reason,
-                                   bool degraded, double gyro_norm) {
+                                   bool degraded, double gyro_norm,
+                                   double tracked_ratio,
+                                   std::optional<int> triangulated_points,
+                                   int tracked_count,
+                                   int total_observed_count) {
   nlohmann::json j;
   j["type"] = "health";
   j["run_id"] = "ignored";
@@ -253,6 +257,14 @@ void DashboardClient::sendHealth(int64_t t_ns, double confidence,
   j["primary_reason"] = primary_reason;
   j["degraded"] = degraded;
   j["gyro_norm"] = gyro_norm;
+  j["tracked_ratio"] = tracked_ratio;
+  if (triangulated_points.has_value()) {
+    j["triangulated_points"] = *triangulated_points;
+  } else {
+    j["triangulated_points"] = nullptr;
+  }
+  j["tracked_count"] = tracked_count;
+  j["total_observed_count"] = total_observed_count;
   out_queue_.try_push(j.dump());
 }
 

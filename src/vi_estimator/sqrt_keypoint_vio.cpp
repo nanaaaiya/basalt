@@ -387,6 +387,9 @@ bool SqrtKeypointVioEstimator<Scalar_>::measure(
   // compute it twice.
   latest_tracked_ratio =
       Scalar(connected0) / Scalar(connected0 + unconnected_obs0.size());
+  latest_tracked_count = connected0;
+  latest_total_observed_count =
+      static_cast<int>(connected0 + unconnected_obs0.size());
 
   if (latest_tracked_ratio < Scalar(config.vio_new_kf_keypoints_thresh) &&
       frames_after_kf > config.vio_min_frames_after_kf)

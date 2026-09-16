@@ -127,6 +127,8 @@ class VioEstimatorBase {
   // estimator type. Only SqrtKeypointVioEstimator overrides these with
   // real values today.
   virtual double getLatestTrackedRatio() const { return 1.0; }
+  virtual int getLatestTrackedCount() const { return 0; }
+  virtual int getLatestTotalObservedCount() const { return 0; }
   virtual double getLatestGyroNorm() const { return 0.0; }
   virtual bool isDegraded() const { return false; }
 };

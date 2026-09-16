@@ -67,6 +67,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #include <atomic>
 #include <memory>
+#include <optional>
 #include <string>
 #include <thread>
 
@@ -111,7 +112,9 @@ class DashboardClient {
   // best-effort, same as sendPose().
   void sendHealth(int64_t t_ns, double confidence,
                   const std::string& primary_reason, bool degraded,
-                  double gyro_norm);
+                  double gyro_norm, double tracked_ratio,
+                  std::optional<int> triangulated_points,
+                  int tracked_count, int total_observed_count);
 
   // event: one of "loop_closure" | "keyframe" | "map_saved" | "reinit",
   // matching MapEventType in schema.py exactly (any other string is

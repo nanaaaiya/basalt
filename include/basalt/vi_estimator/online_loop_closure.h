@@ -159,6 +159,17 @@ struct LocalizationResult {
   int num_inliers = 0;
 };
 
+// See OnlineLoopClosure::checkDriftGate() (.cpp) for what triggers each of
+// these. The two release cases look identical from outside if only a
+// bool is reported -- kReleasedConfirmed means 3 consecutive solves
+// actually agreed with raw-chained motion again, kReleasedForced means
+// the kDriftGateMaxHoldSeconds timeout gave up waiting and accepted
+// whatever the graph currently says, with no confirmation at all. A
+// consumer judging how much to trust the pose right after a release
+// needs that distinction -- "confirmed" and "forced" carry very
+// different reliability even though both end the hold.
+enum class DriftGateEvent { kTripped, kReleasedConfirmed, kReleasedForced };
+
 class OnlineLoopClosure {
  public:
   using Ptr = std::shared_ptr<OnlineLoopClosure>;
@@ -174,16 +185,16 @@ class OnlineLoopClosure {
   // so a slow/absent consumer never stalls keyframe processing.
   tbb::concurrent_bounded_queue<LocalizationResult> localization_queue;
 
-  // Pushed every time the drift gate's held state actually CHANGES (true
-  // = just tripped, false = just released/force-released) -- a consumer
-  // polling isDriftHeld() at a fixed interval (e.g. for a dashboard
-  // alert) can otherwise miss rapid trip/release cycles that happen
-  // faster than its poll rate, confirmed on a real live test where
+  // Pushed every time the drift gate's held state actually CHANGES -- a
+  // consumer polling isDriftHeld() at a fixed interval (e.g. for a
+  // dashboard alert) can otherwise miss rapid trip/release cycles that
+  // happen faster than its poll rate, confirmed on a real live test where
   // several undercounted cycles made the gate look like one continuous,
   // unexplained freeze instead of the flapping it actually was. Drain
   // this instead of (or alongside) polling isDriftHeld() to report every
-  // transition faithfully.
-  tbb::concurrent_bounded_queue<bool> drift_gate_events;
+  // transition faithfully. See DriftGateEvent above for what each value
+  // means, in particular the confirmed-vs-forced release distinction.
+  tbb::concurrent_bounded_queue<DriftGateEvent> drift_gate_events;
 
   void start();
   void stop();

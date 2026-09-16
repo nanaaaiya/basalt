@@ -230,6 +230,17 @@ class SqrtKeypointVioEstimator : public VioEstimatorBase,
   // also exposed as a standalone tracking-quality signal.
   double getLatestTrackedRatio() const override { return latest_tracked_ratio; }
 
+  // Raw counts behind getLatestTrackedRatio() -- added to distinguish "few
+  // features exist at all this frame" (a detection/texture/exposure
+  // problem) from "plenty exist but few matched an existing landmark" (a
+  // frame-to-frame tracking/motion-blur problem), which the ratio alone
+  // can't tell apart. tracked_count = connected0, total_observed_count =
+  // connected0 + unconnected_obs0.size() (see measure() in the .cpp).
+  int getLatestTrackedCount() const override { return latest_tracked_count; }
+  int getLatestTotalObservedCount() const override {
+    return latest_total_observed_count;
+  }
+
   double getLatestGyroNorm() const override { return latest_gyro_norm; }
   Eigen::Vector3d getLatestGyro() const {
     std::lock_guard<std::mutex> lock(latest_gyro_mutex);
@@ -256,6 +267,8 @@ class SqrtKeypointVioEstimator : public VioEstimatorBase,
   int64_t last_state_t_ns;
 
   std::atomic<double> latest_tracked_ratio{1.0};
+  std::atomic<int> latest_tracked_count{0};
+  std::atomic<int> latest_total_observed_count{0};
   std::atomic<double> latest_gyro_norm{0.0};
   mutable std::mutex latest_gyro_mutex;
   Eigen::Vector3d latest_gyro{Eigen::Vector3d::Zero()};
