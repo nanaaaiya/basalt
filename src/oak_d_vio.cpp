@@ -477,6 +477,8 @@ int main(int argc, char** argv) {
         if (online_loop_closure) {
           health_in.triangulated_points =
               online_loop_closure->getLatestTriangulatedPoints();
+          health_in.recently_forced_drift_release =
+              online_loop_closure->isRecentlyForceReleased();
         }
 
         basalt::VioConfidence health = basalt::computeVioConfidence(health_in);

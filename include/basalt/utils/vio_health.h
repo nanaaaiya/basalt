@@ -25,6 +25,16 @@ struct VioConfidenceInputs {
   // Source: SqrtKeypointVioEstimator::vio_health.degraded.
   bool numerically_degraded = false;
 
+  // True for a short cooldown after the loop-closure drift gate's
+  // max-hold timeout gave up waiting and accepted an unconfirmed
+  // correction (as opposed to 3 consecutive solves actually confirming
+  // it) -- see DriftGateEvent::kReleasedForced and
+  // OnlineLoopClosure::isRecentlyForceReleased(). The corrected pose
+  // right after this is one the system itself never verified, which is
+  // exactly what a confidence consumer needs to know, separately from
+  // whatever tracked_ratio happens to read at that instant.
+  bool recently_forced_drift_release = false;
+
   // Rotation rate at the timestamp of the most recently consumed IMU
   // sample, rad/s. Informational only in this version: there is not yet
   // real scenario data (fast-rotation characterization, still pending)

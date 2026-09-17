@@ -81,6 +81,42 @@ TEST(VioHealthTestSuite, ThresholdsAreConfigurableNotHardcoded) {
   EXPECT_EQ(out.primary_reason, "nominal");
 }
 
+TEST(VioHealthTestSuite, RecentForcedDriftReleaseReportedEvenIfOtherwiseNominal) {
+  basalt::VioConfidenceInputs in;
+  in.tracked_ratio = 0.95;       // otherwise perfect
+  in.triangulated_points = 40;
+  in.recently_forced_drift_release = true;
+
+  auto out = basalt::computeVioConfidence(in);
+
+  EXPECT_EQ(out.primary_reason, "recent_forced_drift_release");
+  EXPECT_LT(out.score, 1.0);
+}
+
+TEST(VioHealthTestSuite, RecentForcedDriftReleaseReportedBeforeLowTrackedRatio) {
+  // Both weak -- the more specific, time-bounded signal (we KNOW this
+  // exact pose was never confirmed) should win over the inferred one.
+  basalt::VioConfidenceInputs in;
+  in.tracked_ratio = 0.3;  // also below default 0.7 threshold
+  in.recently_forced_drift_release = true;
+
+  auto out = basalt::computeVioConfidence(in);
+
+  EXPECT_EQ(out.primary_reason, "recent_forced_drift_release");
+}
+
+TEST(VioHealthTestSuite, NumericalDegradationTrumpsForcedDriftReleaseToo) {
+  basalt::VioConfidenceInputs in;
+  in.tracked_ratio = 0.99;
+  in.recently_forced_drift_release = true;
+  in.numerically_degraded = true;
+
+  auto out = basalt::computeVioConfidence(in);
+
+  EXPECT_DOUBLE_EQ(out.score, 0.0);
+  EXPECT_EQ(out.primary_reason, "numerically_degraded");
+}
+
 TEST(VioHealthTestSuite, GyroNormIsCarriedThroughButDoesNotAffectScoreYet) {
   // Documented as informational-only until Phase 5's scenario data
   // exists to calibrate a real threshold -- a high rotation rate alone

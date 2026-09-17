@@ -178,10 +178,16 @@ constexpr double kLoopEdgeHuberDeltaM = 0.5;
 // already explains, so it stays near-zero under normal conditions
 // regardless of how fast the platform is actually moving, and only
 // spikes when a correction is fighting hard against what the raw
-// odometry chain says actually happened. 1.0m is well above normal
-// solve-to-solve noise (observed sub-cm to a few cm on real Pi5
-// sessions) and well below a genuine bad-closure jump (multi-meter, per
-// the documented EuRoC case).
+// odometry chain says actually happened. Lowered from 1.0m to 0.5m
+// after a real live-test session (chronically poor keypoint tracking,
+// tracked_ratio rarely above ~0.15) showed forced releases -- see
+// kDriftGateMaxHoldSeconds -- snapping over a meter at once: the wider
+// threshold was letting more drift accumulate before tripping at all.
+// 0.5m is still well above normal solve-to-solve noise (observed
+// sub-cm to a few cm on real Pi5 sessions) and below a genuine
+// bad-closure jump (multi-meter, per the documented EuRoC case), just
+// with less margin than before -- watch for false trips during fast
+// real motion if this proves too tight on a better-tracked session.
 //
 // IMPORTANT: the anchor must be periodically refreshed (see
 // kDriftGateAnchorRefreshKeyframes below), not just "the previous node"
@@ -197,7 +203,7 @@ constexpr double kLoopEdgeHuberDeltaM = 0.5;
 // occasionally during confirmed-good stretches, bounds the worst-case
 // undetected drift to whatever accumulates within one refresh interval,
 // regardless of whether that happened in one jump or spread across it.
-constexpr double kDriftGateThresholdM = 1.0;
+constexpr double kDriftGateThresholdM = 0.5;
 
 // How many consecutive solves must show the residual back under
 // kDriftGateThresholdM before the hold releases -- requires the recovery
@@ -221,7 +227,17 @@ constexpr size_t kDriftGateAnchorRefreshKeyframes = 20;
 // anchor to right now (same as a normal release), so detection resumes
 // cleanly from this point rather than immediately re-tripping against
 // the same stale reference.
-constexpr double kDriftGateMaxHoldSeconds = 30.0;
+//
+// Lowered from 30.0 to 15.0: on the same real session referenced above,
+// forced releases were observed snapping ~4.8cm/s of accumulated drift
+// for the full hold duration (a 34.8s hold producing a ~166cm jump) --
+// the cap doesn't reduce the drift rate, but it directly bounds how much
+// of it compounds before a forced release accepts it. Extrapolating that
+// session's own rate, 15s caps the same failure mode to roughly 70cm
+// instead of ~170cm. Tradeoff: gives up on waiting for a confirmed
+// (kDriftGateReleaseCount consecutive good solves) recovery sooner,
+// accepting an unconfirmed correction more readily.
+constexpr double kDriftGateMaxHoldSeconds = 15.0;
 
 // Decompose R = Rz(yaw) * Ry(pitch) * Rx(roll). Assumes no gimbal lock
 // (pitch away from +-90 deg), a reasonable assumption for a handheld/mobile
@@ -1085,11 +1101,7 @@ void OnlineLoopClosure::checkDriftGate() {
   if (drift_held_ && drift_held_since_t_ns_ >= 0) {
     double held_seconds = (newest.t_ns - drift_held_since_t_ns_) / 1e9;
     if (held_seconds >= kDriftGateMaxHoldSeconds) {
-      drift_held_ = false;
-      drift_gate_stable_count_ = 0;
-      drift_anchor_idx_ = n - 1;
-      keyframes_since_anchor_refresh_ = 0;
-      drift_gate_events.try_push(DriftGateEvent::kReleasedForced);
+      forceReleaseDriftHoldLocked();
       std::cout << "[ONLINE-LOOP] DRIFT GATE FORCE-RELEASED: kf=" << (n - 1)
                 << " after " << held_seconds << "s (max hold "
                 << kDriftGateMaxHoldSeconds
@@ -1136,6 +1148,7 @@ void OnlineLoopClosure::checkDriftGate() {
       }
       drift_held_ = true;
       drift_held_since_t_ns_ = newest.t_ns;
+      drift_held_since_wall_ = std::chrono::steady_clock::now();
       drift_gate_events.try_push(DriftGateEvent::kTripped);
       std::cout << "[ONLINE-LOOP] DRIFT GATE TRIPPED: kf=" << (n - 1)
                 << " residual=" << residual_m
@@ -1156,6 +1169,9 @@ void OnlineLoopClosure::checkDriftGate() {
       // pre-trip anchor.
       drift_anchor_idx_ = n - 1;
       keyframes_since_anchor_refresh_ = 0;
+      release_blending_ = true;
+      release_blend_start_pose_ = held_pose_;
+      release_blend_start_wall_ = std::chrono::steady_clock::now();
       drift_gate_events.try_push(DriftGateEvent::kReleasedConfirmed);
       std::cout << "[ONLINE-LOOP] DRIFT GATE RELEASED: kf=" << (n - 1)
                 << " residual back under threshold for " << kDriftGateReleaseCount
@@ -1179,6 +1195,29 @@ void OnlineLoopClosure::checkDriftGate() {
 bool OnlineLoopClosure::isDriftHeld() const {
   std::lock_guard<std::mutex> lock(state_mutex_);
   return drift_held_;
+}
+
+void OnlineLoopClosure::forceReleaseDriftHoldLocked() const {
+  drift_held_ = false;
+  drift_gate_stable_count_ = 0;
+  drift_anchor_idx_ = keyframes_.empty() ? 0 : keyframes_.size() - 1;
+  keyframes_since_anchor_refresh_ = 0;
+  release_blending_ = true;
+  release_blend_start_pose_ = held_pose_;
+  release_blend_start_wall_ = std::chrono::steady_clock::now();
+  last_forced_release_wall_ = release_blend_start_wall_;
+  had_forced_release_ = true;
+  drift_gate_events.try_push(DriftGateEvent::kReleasedForced);
+}
+
+bool OnlineLoopClosure::isRecentlyForceReleased() const {
+  std::lock_guard<std::mutex> lock(state_mutex_);
+  if (!had_forced_release_) return false;
+  double elapsed_s = std::chrono::duration<double>(
+                          std::chrono::steady_clock::now() -
+                          last_forced_release_wall_)
+                          .count();
+  return elapsed_s < kForcedReleaseCooldownS;
 }
 
 Eigen::aligned_vector<Eigen::Vector3d> OnlineLoopClosure::getCorrectedTrajectory()
@@ -1225,8 +1264,29 @@ bool OnlineLoopClosure::getSmoothedCorrectedPose(
   // isn't gated by this), so it still gets a chance to self-correct;
   // only what's published live is held back until it does.
   if (drift_held_) {
-    out = held_pose_;
-    return true;
+    // Wall-clock watchdog for kDriftGateMaxHoldSeconds -- see
+    // drift_held_since_wall_'s comment. checkDriftGate()'s own timeout
+    // check only runs when solvePoseGraph() processes a new keyframe; if
+    // tracking is bad enough that keyframes stop arriving, that check
+    // never gets a chance to fire. This one runs here instead, since
+    // getSmoothedCorrectedPose() is called at full pose-publish rate
+    // regardless of keyframe activity. Falls through to the normal
+    // (not-held) path below on release, rather than returning
+    // held_pose_ one more time, so this call already produces a fresh
+    // (blended) pose instead of waiting for the next one.
+    double held_seconds_wall = std::chrono::duration<double>(
+                                    std::chrono::steady_clock::now() -
+                                    drift_held_since_wall_)
+                                    .count();
+    if (held_seconds_wall >= kDriftGateMaxHoldSeconds) {
+      forceReleaseDriftHoldLocked();
+      std::cout << "[ONLINE-LOOP] DRIFT GATE FORCE-RELEASED (wall-clock "
+                   "watchdog, no recent keyframe activity): held for "
+                << held_seconds_wall << "s" << std::endl;
+    } else {
+      out = held_pose_;
+      return true;
+    }
   }
 
   const LoopKeyframe& kf = keyframes_.back();
@@ -1238,6 +1298,27 @@ bool OnlineLoopClosure::getSmoothedCorrectedPose(
   // origin/yaw is arbitrary.
   Sophus::SE3d T_kf_to_current = kf.T_w_i_raw.inverse() * current_raw_pose;
   out = T_w_i_corrected_kf * T_kf_to_current;
+
+  // For kReleaseBlendDurationS after a hold releases (either way -- see
+  // checkDriftGate() and release_blending_'s header comment), glide from
+  // where the pose was frozen to the freshly-computed target instead of
+  // jumping to it in one step. SE3 geodesic interpolation (linear on
+  // translation, exponential-map on the log of the relative rotation) so
+  // the blend is a single consistent rigid-body motion, not independently
+  // lerped translation/rotation.
+  if (release_blending_) {
+    double elapsed_s = std::chrono::duration<double>(
+                            std::chrono::steady_clock::now() -
+                            release_blend_start_wall_)
+                            .count();
+    if (elapsed_s >= kReleaseBlendDurationS) {
+      release_blending_ = false;
+    } else {
+      double alpha = std::clamp(elapsed_s / kReleaseBlendDurationS, 0.0, 1.0);
+      Sophus::SE3d delta = release_blend_start_pose_.inverse() * out;
+      out = release_blend_start_pose_ * Sophus::SE3d::exp(alpha * delta.log());
+    }
+  }
 
   // Cache for checkDriftGate() to freeze onto if it trips before the
   // next call -- see that member's comment in the header for why this

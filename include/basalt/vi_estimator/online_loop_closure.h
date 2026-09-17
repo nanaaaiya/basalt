@@ -126,6 +126,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
@@ -194,7 +195,9 @@ class OnlineLoopClosure {
   // this instead of (or alongside) polling isDriftHeld() to report every
   // transition faithfully. See DriftGateEvent above for what each value
   // means, in particular the confirmed-vs-forced release distinction.
-  tbb::concurrent_bounded_queue<DriftGateEvent> drift_gate_events;
+  // mutable: pushed to from forceReleaseDriftHoldLocked(), which is const
+  // (see its declaration) so it's callable from getSmoothedCorrectedPose().
+  mutable tbb::concurrent_bounded_queue<DriftGateEvent> drift_gate_events;
 
   void start();
   void stop();
@@ -240,6 +243,14 @@ class OnlineLoopClosure {
   // (e.g. oak_d_vio.cpp) can surface a clear alert when this changes,
   // rather than the pose just silently stopping.
   bool isDriftHeld() const;
+
+  // True for kForcedReleaseCooldownS after a FORCED drift-gate release
+  // (the max-hold timeout gave up waiting, not a confirmed-good recovery
+  // -- see DriftGateEvent and last_forced_release_wall_'s comment). Lets
+  // computeVioConfidence() report reduced confidence for a pose that was
+  // just resynced without confirmation, instead of the derived score
+  // snapping straight back to "nominal" the instant the hold ends.
+  bool isRecentlyForceReleased() const;
 
   // Same as getCorrectedTrajectory(), but paired with each keyframe's
   // timestamp -- needed for logging/analysis (matching timestamps up
@@ -323,6 +334,15 @@ class OnlineLoopClosure {
   void solvePoseGraph();
   void checkDriftGate();  // called by solvePoseGraph() -- see its .cpp comment
 
+  // Shared by checkDriftGate()'s keyframe-gated timeout and
+  // getSmoothedCorrectedPose()'s wall-clock watchdog (see
+  // drift_held_since_wall_) -- both need to trigger the exact same
+  // force-release bookkeeping, just from different call paths. Assumes
+  // state_mutex_ is already held by the caller (const so it's callable
+  // from getSmoothedCorrectedPose() too; the mutable members it writes
+  // are the reason those are mutable).
+  void forceReleaseDriftHoldLocked() const;
+
   Calibration<double> calib_;
   VioConfig config_;
 
@@ -357,15 +377,64 @@ class OnlineLoopClosure {
   // teleports the live pose back to (0,0,0) instead of holding it in
   // place, which is a worse failure than the drift it's meant to guard
   // against.
-  bool drift_held_ = false;
+  // mutable: forceReleaseDriftHoldLocked() is called from
+  // getSmoothedCorrectedPose() (const, protected by state_mutex_ like
+  // every other method here) as well as checkDriftGate() (non-const) --
+  // see that method's comment for why a release needs to be triggerable
+  // from both places.
+  mutable bool drift_held_ = false;
   Sophus::SE3d held_pose_;
   Sophus::SE3d held_anchor_raw_pose_;
-  int drift_gate_stable_count_ = 0;
+  mutable int drift_gate_stable_count_ = 0;
   // t_ns the current hold started at -- see kDriftGateMaxHoldSeconds:
   // a real live test found this staying stuck (never confirmed
   // recovered) for 40+ seconds straight, which is worse for a live
-  // display than resuming with an unconfirmed correction.
+  // display than resuming with an unconfirmed correction. Only checked
+  // from checkDriftGate(), which runs on keyframe arrival -- see
+  // drift_held_since_wall_ for the gap that left.
   int64_t drift_held_since_t_ns_ = -1;
+
+  // Wall-clock twin of drift_held_since_t_ns_, checked from
+  // getSmoothedCorrectedPose() instead of checkDriftGate(). Necessary
+  // because checkDriftGate() only runs when solvePoseGraph() processes a
+  // new keyframe -- confirmed on a real live test: tracking got bad
+  // enough that no keyframe was processed for 33+ seconds, during which
+  // the keyframe-gated timeout above simply never got a chance to run,
+  // so a hold meant to cap at 15s instead ran for 39.79s. This is
+  // checked from getSmoothedCorrectedPose() specifically because that's
+  // called at full pose-publish rate regardless of keyframe activity,
+  // so the max-hold promise holds even when nothing else is running.
+  mutable std::chrono::steady_clock::time_point drift_held_since_wall_;
+
+  // When a hold releases (either way -- see checkDriftGate()), the very
+  // next getSmoothedCorrectedPose() call would otherwise jump straight
+  // from held_pose_ to wherever the graph currently says, in one step --
+  // a real live test observed this as a visible "teleport" on the GUI,
+  // confirmed to coincide with a release event down to the second. This
+  // doesn't make the destination any more correct (a bad correction
+  // glided-to is still bad), but it removes the discontinuity itself,
+  // which matters beyond cosmetics: a downstream consumer (e.g. a flight
+  // controller) seeing an instantaneous, physically-impossible position
+  // jump could react to it as if it were real motion. Timed off wall
+  // clock rather than threaded through every getSmoothedCorrectedPose()
+  // call site (there are several) with a VIO timestamp -- this is a
+  // fixed real-world duration for display/consumer smoothness, not tied
+  // to VIO's own logical time.
+  mutable bool release_blending_ = false;
+  mutable Sophus::SE3d release_blend_start_pose_;
+  mutable std::chrono::steady_clock::time_point release_blend_start_wall_;
+  static constexpr double kReleaseBlendDurationS = 0.4;
+
+  // Set on a FORCED release specifically (kDriftGateMaxHoldSeconds timeout
+  // gave up waiting, not confirmed by kDriftGateReleaseCount consecutive
+  // good solves -- see DriftGateEvent) and read by
+  // isRecentlyForceReleased() for a short cooldown afterward, so
+  // computeVioConfidence() can report reduced confidence for a pose that
+  // was just resynced without confirmation instead of snapping straight
+  // back to "nominal".
+  mutable std::chrono::steady_clock::time_point last_forced_release_wall_;
+  mutable bool had_forced_release_ = false;
+  static constexpr double kForcedReleaseCooldownS = 5.0;
 
   // Continuously updated by getSmoothedCorrectedPose() (mutable: that
   // method is const) every time it publishes a live, not-held pose --
@@ -380,8 +449,8 @@ class OnlineLoopClosure {
   // already held). Deliberately not recomputed as "N keyframes back"
   // every check -- see kDriftGateAnchorRefreshKeyframes's comment for
   // why that let a slow, real accumulation go undetected on a live test.
-  size_t drift_anchor_idx_ = 0;
-  size_t keyframes_since_anchor_refresh_ = 0;
+  mutable size_t drift_anchor_idx_ = 0;
+  mutable size_t keyframes_since_anchor_refresh_ = 0;
 
   mutable std::mutex state_mutex_;
   // Counts accepted loop EDGES, not keyframes that found a match -- a
