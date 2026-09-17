@@ -1,0 +1,11 @@
+{
+  "waypoints": [
+    {"label": "A_lap1", "x": 0.0, "y": 0.0, "t_hint_s": 5.0},
+    {"label": "B_lap1", "x": 3.0, "y": 0.0, "t_hint_s": 20.8},
+    {"label": "A_lap2", "x": 0.0, "y": 0.0, "t_hint_s": 45.3},
+    {"label": "B_lap2", "x": 3.0, "y": 0.0, "t_hint_s": 64.5},
+    {"label": "C_lap2", "x": 3.0, "y": 2.5, "t_hint_s": 73.9},
+    {"label": "D_lap2", "x": 0.0, "y": 2.5, "t_hint_s": 79.85},
+    {"label": "A_final", "x": 0.0, "y": 0.0, "t_hint_s": 93.0}
+  ]
+}
