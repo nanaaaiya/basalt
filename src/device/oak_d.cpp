@@ -77,6 +77,17 @@ void OakDDevice::start() {
   auto camRight = pipeline.create<dai::node::Camera>()->build(
       dai::CameraBoardSocket::CAM_C, std::nullopt, (float)CAM_FPS);
 
+  // See MAX_EXPOSURE_US's header comment: caps auto-exposure's max
+  // exposure time to reduce motion blur, verified safe via
+  // basalt_test_camera_exposure before ever being added here. Set via
+  // initialControl (applied once, before pipeline.start() below) rather
+  // than a runtime inputControl queue message, matching what was actually
+  // tested.
+  camLeft->initialControl.setAutoExposureLimit(
+      std::chrono::microseconds(MAX_EXPOSURE_US));
+  camRight->initialControl.setAutoExposureLimit(
+      std::chrono::microseconds(MAX_EXPOSURE_US));
+
   auto* leftOut = camLeft->requestOutput(std::make_pair(640u, 480u));
   auto* rightOut = camRight->requestOutput(std::make_pair(640u, 480u));
 

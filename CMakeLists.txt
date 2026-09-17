@@ -499,6 +499,15 @@ if(depthai_FOUND)
   target_link_libraries(basalt_oak_d_calib_record basalt depthai::core ${BASALT_PANGO_TARGETS} basalt::cli11)
   basalt_add_gui_link_options(basalt_oak_d_calib_record)
   basalt_add_macos_runtime_paths(basalt_oak_d_calib_record)
+
+  # Isolated exposure-control test -- deliberately does NOT link basalt or
+  # reuse OakDDevice/oak_d.cpp, to keep it fully separate from the live
+  # VIO pipeline while testing whether dai::CameraControl::
+  # setAutoExposureLimit() (a write) crashes the firmware the way a past
+  # exposure/gain QUERY did (see oak_d.cpp's comments and this file's own
+  # header comment).
+  add_executable(basalt_test_camera_exposure src/test_camera_exposure.cpp)
+  target_link_libraries(basalt_test_camera_exposure basalt::opencv depthai::core)
 else()
   message(WARNING "depthai-core not found, skipping basalt_oak_d_vio target")
 endif()

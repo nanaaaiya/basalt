@@ -71,6 +71,22 @@ class OakDDevice {
   static constexpr int CAM_FPS = 30;
   static constexpr int NUM_CAMS = 2;
 
+  // Caps auto-exposure's maximum exposure time (still adapts to lighting,
+  // just never chooses an exposure long enough to blur under real motion)
+  // -- set via dai::CameraControl::setAutoExposureLimit() in start(). This
+  // is a WRITE to the camera (telling it what to do), not a QUERY (asking
+  // it for its current state) -- the latter is documented elsewhere in
+  // this file as having previously crashed the OAK-D firmware; the former
+  // was verified safe first, in complete isolation from this pipeline,
+  // via basalt_test_camera_exposure (see that tool's own comment).
+  // Confirmed on real handheld footage: 8ms holds the camera to
+  // Laplacian-variance sharpness in the same range as genuinely
+  // stationary footage during moderate motion, only degrading on the
+  // fastest deliberate whips -- a real, measured improvement over
+  // uncapped auto-exposure's much wider blur range, not a full fix for
+  // arbitrarily fast motion.
+  static constexpr int MAX_EXPOSURE_US = 8000;
+
   // enable_stereo_depth: builds and runs the on-device StereoDepth node
   // (for the future occupancy-grid mapper) alongside the existing raw
   // mono + IMU streams VIO uses. This has to be a constructor-time
