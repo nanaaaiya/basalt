@@ -213,8 +213,15 @@ void DashboardClient::readerThreadMain(int fd) {
           incoming_save_map_queue_.try_push(j.value("run_id", ""));
         }
       } catch (const std::exception& e) {
+        // The exception message alone (e.g. "last read: 'H'") isn't
+        // enough to diagnose what's actually arriving on the wire --
+        // logging the raw line itself (length-capped) means the next
+        // occurrence is self-diagnosing instead of needing a live packet
+        // capture to reproduce.
         std::cerr << "[DashboardClient] bad JSON from backend, skipping: "
-                  << e.what() << std::endl;
+                  << e.what() << " -- raw line (" << line.size()
+                  << " bytes): \""
+                  << line.substr(0, 200) << "\"" << std::endl;
       }
     }
   }
