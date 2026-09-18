@@ -45,7 +45,7 @@ TEST(VioHealthTestSuite, LowTrackedRatioReportedBeforeLowTriangulation) {
   // not an average of the two.
   basalt::VioConfidenceInputs in;
   in.tracked_ratio = 0.3;         // below default 0.7 threshold
-  in.triangulated_points = 5;     // also below default 25 threshold
+  in.triangulated_points = 5;     // also below default 20 threshold
   in.numerically_degraded = false;
 
   auto out = basalt::computeVioConfidence(in);
@@ -56,7 +56,7 @@ TEST(VioHealthTestSuite, LowTrackedRatioReportedBeforeLowTriangulation) {
 TEST(VioHealthTestSuite, LowTriangulationYieldAloneIsReported) {
   basalt::VioConfidenceInputs in;
   in.tracked_ratio = 0.95;        // fine on its own
-  in.triangulated_points = 8;     // below default 25 threshold -- matches
+  in.triangulated_points = 8;     // below default 20 threshold -- matches
                                   // the stereo-yield-collapse bug this
                                   // signal is meant to help surface
   in.numerically_degraded = false;
@@ -109,6 +109,44 @@ TEST(VioHealthTestSuite, NumericalDegradationTrumpsForcedDriftReleaseToo) {
   basalt::VioConfidenceInputs in;
   in.tracked_ratio = 0.99;
   in.recently_forced_drift_release = true;
+  in.numerically_degraded = true;
+
+  auto out = basalt::computeVioConfidence(in);
+
+  EXPECT_DOUBLE_EQ(out.score, 0.0);
+  EXPECT_EQ(out.primary_reason, "numerically_degraded");
+}
+
+TEST(VioHealthTestSuite, ImuVisionDisagreementReportedEvenIfOtherwiseNominal) {
+  basalt::VioConfidenceInputs in;
+  in.tracked_ratio = 0.95;  // otherwise perfect
+  in.triangulated_points = 40;
+  in.imu_vision_disagreement = true;
+
+  auto out = basalt::computeVioConfidence(in);
+
+  EXPECT_EQ(out.primary_reason, "imu_vision_disagreement");
+  EXPECT_LT(out.score, 1.0);
+}
+
+TEST(VioHealthTestSuite, ImuVisionDisagreementReportedBeforeLowTrackedRatio) {
+  // Both weak -- the dynamic-scene-violation signal should win over the
+  // generic tracking-quality one, since it's the more specific/actionable
+  // explanation (and tracked_ratio alone can look fine even when a large,
+  // coherently-moving object like water dominates the tracked points).
+  basalt::VioConfidenceInputs in;
+  in.tracked_ratio = 0.3;  // also below default 0.7 threshold
+  in.imu_vision_disagreement = true;
+
+  auto out = basalt::computeVioConfidence(in);
+
+  EXPECT_EQ(out.primary_reason, "imu_vision_disagreement");
+}
+
+TEST(VioHealthTestSuite, NumericalDegradationTrumpsImuVisionDisagreementToo) {
+  basalt::VioConfidenceInputs in;
+  in.tracked_ratio = 0.99;
+  in.imu_vision_disagreement = true;
   in.numerically_degraded = true;
 
   auto out = basalt::computeVioConfidence(in);

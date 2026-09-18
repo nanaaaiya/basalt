@@ -43,6 +43,14 @@ struct VioConfidenceInputs {
   // but does not currently affect the score.
   // Source: SqrtKeypointVioEstimator::getLatestGyroNorm().
   double gyro_norm = 0.0;
+
+  // True once the joint (vision+IMU) optimized pose has disagreed with
+  // pure IMU-integration's prediction for several consecutive frames --
+  // the signature of a dynamic-scene violation (flowing water, a close
+  // moving object) large enough to fool per-point robust loss, which
+  // only helps when bad points are a minority.
+  // Source: SqrtKeypointVioEstimator::isImuVisionDisagreement().
+  bool imu_vision_disagreement = false;
 };
 
 struct VioConfidenceConfig {
@@ -53,11 +61,14 @@ struct VioConfidenceConfig {
   // exactly what a tracking-quality signal wants to know too.
   double min_tracked_ratio = 0.7;
 
-  // Mirrors OnlineLoopClosure's kMinTriangulatedPointsForDatabase (25):
-  // below this, a keyframe isn't even good enough to serve as a future
+  // Mirrors OnlineLoopClosure's kMinTriangulatedPointsForDatabase (20,
+  // lowered from 25 after real low-texture/distant-background sessions
+  // showed triangulated points never clearing 25 at all -- see that
+  // constant's own history comment in online_loop_closure.cpp): below
+  // this, a keyframe isn't even good enough to serve as a future
   // loop-closure match target, so treat it as a real quality concern for
   // VIO's own confidence, not just a loop-closure-specific gate.
-  int min_triangulated_points = 25;
+  int min_triangulated_points = 20;
 };
 
 struct VioConfidence {

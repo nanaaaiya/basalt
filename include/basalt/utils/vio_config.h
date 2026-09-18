@@ -72,6 +72,18 @@ struct VioConfig {
   double vio_obs_huber_thresh;
   double vio_min_triangulation_dist;
 
+  // Static-initialization gravity/orientation estimate: instead of a single
+  // accelerometer sample (fragile against handling motion right as the
+  // pipeline starts -- a real, observed cause of ~0.5m position drift
+  // within the first few seconds of a live run), average accel samples
+  // over this many seconds leading up to the first vision frame.
+  double vio_static_init_window_s;
+  // If the accelerometer magnitude's stddev over that window exceeds this
+  // (m/s^2), the device likely wasn't actually still -- logged as a
+  // warning (init still proceeds; this isn't a hard gate) so a bad startup
+  // is visible instead of silently baked into an early, uncorrected drift.
+  double vio_static_init_max_accel_std;
+
   bool vio_enforce_realtime;
 
   bool vio_use_lm;

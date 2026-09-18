@@ -247,7 +247,41 @@ class SqrtKeypointVioEstimator : public VioEstimatorBase,
     return latest_gyro;
   }
 
+  // The optimizer's current estimate of the accel/gyro sensor bias --
+  // previously invisible outside the estimator, so a runaway raw
+  // trajectory could only be diagnosed after the fact from the position
+  // blowup, never by watching the bias state itself as it happens. Read
+  // from the same state the sliding window already maintains (see
+  // measure()'s next_state), not recomputed.
+  Eigen::Vector3d getLatestAccelBias() const override {
+    std::lock_guard<std::mutex> lock(latest_bias_mutex);
+    return latest_accel_bias;
+  }
+  Eigen::Vector3d getLatestGyroBias() const override {
+    std::lock_guard<std::mutex> lock(latest_bias_mutex);
+    return latest_gyro_bias;
+  }
+
   bool isDegraded() const override { return vio_health.degraded; }
+
+  // Detect-and-flag defense against dynamic-scene corruption (a hand
+  // waved close to a stationary camera, flowing water filling a large
+  // fraction of the frame, etc.) that per-point robust loss can't catch
+  // once the corrupted points are the majority, not a minority. Compares
+  // the joint (vision+IMU) optimized pose against what pure IMU
+  // integration alone predicted for the same step (see measure()) --
+  // vision pulling the pose away from that prediction is normal noise on
+  // any single frame, but if it persists over many consecutive frames,
+  // that's the same signature a genuinely static-world-violating scene
+  // produces, independent of what fraction of tracked points are
+  // affected (unlike tracked_ratio/Huber loss, which only help when bad
+  // points are a minority).
+  bool isImuVisionDisagreement() const override {
+    return imu_vision_disagreement;
+  }
+  double getLatestImuVisionDisagreementM() const override {
+    return latest_imu_vision_disagreement_m;
+  }
 
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 
@@ -272,7 +306,34 @@ class SqrtKeypointVioEstimator : public VioEstimatorBase,
   std::atomic<double> latest_gyro_norm{0.0};
   mutable std::mutex latest_gyro_mutex;
   Eigen::Vector3d latest_gyro{Eigen::Vector3d::Zero()};
+
+  mutable std::mutex latest_bias_mutex;
+  Eigen::Vector3d latest_accel_bias{Eigen::Vector3d::Zero()};
+  Eigen::Vector3d latest_gyro_bias{Eigen::Vector3d::Zero()};
   Eigen::aligned_map<int64_t, IntegratedImuMeasurement<Scalar>> imu_meas;
+
+  // IMU-vision disagreement detector (see isImuVisionDisagreement() above).
+  // Starting values, not yet validated against real flight data -- expect
+  // to retune once live/dynamic-scene test data exists, same as the drift
+  // gate's own constants were (kDriftGateThresholdM 1.0 -> 0.5, etc.).
+  // Threshold: how far (m) the joint optimizer is allowed to pull a
+  // single frame's position away from the pure-IMU prediction before
+  // counting it as "disagreeing" -- predictState() already accounts for
+  // the current velocity estimate, so ordinary continued motion doesn't
+  // by itself produce a large gap here; this is meant to catch NEW,
+  // unexplained corrections, not motion in general.
+  static constexpr double kImuVisionDisagreementThreshM = 0.05;
+  // Persistence: consecutive frames the disagreement must stay above
+  // threshold before flagging -- a single frame is expected sensor noise
+  // or the normal transient stress of a real aggressive maneuver (camera-
+  // IMU time sync/extrinsics are never perfect); only a sustained
+  // disagreement is evidence of an actual static-world violation (the
+  // cause -- water still flowing, hand still in frame -- keeps producing
+  // it, unlike noise or a brief maneuver).
+  static constexpr int kImuVisionDisagreementPersistenceFrames = 10;
+  int imu_vision_disagreement_count_ = 0;
+  std::atomic<bool> imu_vision_disagreement{false};
+  std::atomic<double> latest_imu_vision_disagreement_m{0.0};
 
   const Vec3 g;
 

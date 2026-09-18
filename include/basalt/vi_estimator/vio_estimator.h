@@ -130,7 +130,28 @@ class VioEstimatorBase {
   virtual int getLatestTrackedCount() const { return 0; }
   virtual int getLatestTotalObservedCount() const { return 0; }
   virtual double getLatestGyroNorm() const { return 0.0; }
+
+  // Current bias estimate the optimizer is carrying -- exposed so a
+  // runaway raw trajectory can be diagnosed live (is the bias sitting at
+  // a wrong value, oscillating, or steadily diverging?) instead of only
+  // inferred after the fact from the resulting position blowup.
+  virtual Eigen::Vector3d getLatestAccelBias() const {
+    return Eigen::Vector3d::Zero();
+  }
+  virtual Eigen::Vector3d getLatestGyroBias() const {
+    return Eigen::Vector3d::Zero();
+  }
+
   virtual bool isDegraded() const { return false; }
+
+  // Sustained disagreement between the joint (vision+IMU) optimized pose
+  // and what pure IMU integration alone predicted -- see
+  // SqrtKeypointVioEstimator::isImuVisionDisagreement()'s comment for why
+  // this catches dynamic-scene corruption (flowing water, a close moving
+  // object) that tracked_ratio/Huber loss can't, once the corrupted
+  // points are the majority rather than a minority.
+  virtual bool isImuVisionDisagreement() const { return false; }
+  virtual double getLatestImuVisionDisagreementM() const { return 0.0; }
 };
 
 class VioEstimatorFactory {

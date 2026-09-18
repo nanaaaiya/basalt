@@ -128,6 +128,18 @@ void handle_shutdown_signal(int /*signum*/) {
 // Post-run analysis needs the actual [ONLINE-LOOP] per-keyframe decision
 // log, not just the trajectory numbers, so this makes that automatic
 // instead of relying on remembering to add `| tee` on the command line.
+// Every thread in this app (t3/t4/t6, the VIO filter thread,
+// OnlineLoopClosure's thread, main) writes to std::cout/std::cerr
+// concurrently and unsynchronized -- both get retargeted to instances of
+// this class below, and both instances' `b_` is the SAME underlying
+// console_log_file streambuf. Without a shared lock, that's a genuine
+// data race on that one file's internal buffer state: observed in
+// practice as a duplicated log line ("Finished t3" printed twice) and,
+// on real hardware, a `corrupted double-linked list` glibc heap-
+// corruption abort at shutdown. mu_ is a single mutex shared by every
+// TeeStreambuf instance (static, not per-instance) so a cout-writer and
+// a cerr-writer serialize against each other too, not just against
+// other writers on the same stream.
 class TeeStreambuf : public std::streambuf {
  public:
   TeeStreambuf(std::streambuf* a, std::streambuf* b) : a_(a), b_(b) {}
@@ -135,12 +147,14 @@ class TeeStreambuf : public std::streambuf {
  protected:
   int overflow(int c) override {
     if (c == EOF) return !EOF;
+    std::lock_guard<std::mutex> lock(mu_);
     bool ok_a = a_->sputc(static_cast<char>(c)) != EOF;
     bool ok_b = b_->sputc(static_cast<char>(c)) != EOF;
     return (ok_a && ok_b) ? c : EOF;
   }
 
   int sync() override {
+    std::lock_guard<std::mutex> lock(mu_);
     int ra = a_->pubsync();
     int rb = b_->pubsync();
     return (ra == 0 && rb == 0) ? 0 : -1;
@@ -149,7 +163,10 @@ class TeeStreambuf : public std::streambuf {
  private:
   std::streambuf* a_;
   std::streambuf* b_;
+  static std::mutex mu_;
 };
+
+std::mutex TeeStreambuf::mu_;
 
 pangolin::DataLog imu_data_log, vio_data_log, error_data_log;
 pangolin::Plotter* plotter;
@@ -275,6 +292,31 @@ int main(int argc, char** argv) {
                  "Directory to save raw/corrected trajectories and a drift "
                  "summary to on exit (default: ./run_logs/<timestamp>/).");
 
+  // Accelerometer bias (especially its component along gravity) is only
+  // observable through translational motion -- during a stationary hold,
+  // the optimizer converges the bias state to whatever locally-consistent
+  // value the very limited available constraints allow, which is not
+  // necessarily close to the true physical bias. Starting from a flat
+  // Eigen::Vector3d::Zero() guess every run means an unobserved/wrong
+  // component just integrates as pure drift for the rest of a stationary
+  // test. These defaults are the converged accel/gyro bias observed on a
+  // real run of this OAK-D Lite unit (run_logs/20260917_052055,
+  // [VIO-BIAS] log) -- a better starting point than zero, not a certified
+  // calibration. Override once a proper motion-excited calibration
+  // exists, or if this unit's IMU characteristics change.
+  std::vector<double> accel_bias_init = {0.0297, -0.0447, 0.0431};
+  app.add_option("--accel-bias-init", accel_bias_init,
+                 "Initial accelerometer bias guess [x y z], m/s^2 (default: "
+                 "this unit's last observed converged value, not a "
+                 "certified calibration).")
+      ->expected(3);
+  std::vector<double> gyro_bias_init = {0.00476, -0.0001, 0.00149};
+  app.add_option("--gyro-bias-init", gyro_bias_init,
+                 "Initial gyroscope bias guess [x y z], rad/s (default: "
+                 "this unit's last observed converged value, not a "
+                 "certified calibration).")
+      ->expected(3);
+
   try {
     app.parse(argc, argv);
   } catch (const CLI::ParseError& e) {
@@ -347,7 +389,10 @@ int main(int argc, char** argv) {
   // on the Pi5 in headless (--show-gui false) testing.
   oakd_device->setOutputQueues(&opt_flow_ptr->input_queue,
                                &vio->imu_data_queue);
-  vio->initialize(Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero());
+  vio->initialize(
+      Eigen::Vector3d(gyro_bias_init[0], gyro_bias_init[1], gyro_bias_init[2]),
+      Eigen::Vector3d(accel_bias_init[0], accel_bias_init[1],
+                      accel_bias_init[2]));
 
   opt_flow_ptr->output_queue = &vio->vision_data_queue;
   if (show_gui) vio->out_vis_queue = &out_vis_queue;
@@ -474,6 +519,7 @@ int main(int argc, char** argv) {
         health_in.tracked_ratio = vio->getLatestTrackedRatio();
         health_in.numerically_degraded = vio->isDegraded();
         health_in.gyro_norm = vio->getLatestGyroNorm();
+        health_in.imu_vision_disagreement = vio->isImuVisionDisagreement();
         if (online_loop_closure) {
           health_in.triangulated_points =
               online_loop_closure->getLatestTriangulatedPoints();
@@ -502,7 +548,27 @@ int main(int argc, char** argv) {
                     << (health_in.triangulated_points
                             ? std::to_string(*health_in.triangulated_points)
                             : "n/a")
-                    << " gyro_norm=" << health_in.gyro_norm << std::endl;
+                    << " gyro_norm=" << health_in.gyro_norm
+                    << " imu_vision_disagreement_m="
+                    << vio->getLatestImuVisionDisagreementM() << std::endl;
+        }
+
+        // Bias-state telemetry: printed unconditionally (health-gated
+        // above) and throttled to ~1Hz (this block runs at frame rate) so
+        // a GOOD run's bias trajectory is visible too, not just a
+        // degraded one -- diagnosing a runaway raw trajectory needs to
+        // compare both, e.g. two same-config runs where one stayed at
+        // 2m drift and one blew up to 300m despite near-identical
+        // starting conditions.
+        static int bias_log_counter = 0;
+        if (++bias_log_counter >= 15) {
+          bias_log_counter = 0;
+          Eigen::Vector3d accel_bias = vio->getLatestAccelBias();
+          Eigen::Vector3d gyro_bias = vio->getLatestGyroBias();
+          std::cout << "[VIO-BIAS] t_ns=" << t_ns
+                    << " accel_bias=[" << accel_bias.transpose() << "]"
+                    << " gyro_bias=[" << gyro_bias.transpose() << "]"
+                    << std::endl;
         }
 
         if (dashboard_client) {

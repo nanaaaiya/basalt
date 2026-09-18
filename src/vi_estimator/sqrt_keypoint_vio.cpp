@@ -53,6 +53,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <tbb/parallel_reduce.h>
 
 #include <chrono>
+#include <vector>
 
 namespace basalt {
 
@@ -183,19 +184,71 @@ void SqrtKeypointVioEstimator<Scalar_>::initialize(const Eigen::Vector3d& bg_,
       // curr_frame->t_ns += calib.cam_time_offset_ns;
 
       if (!initialized) {
+        // Buffer accel samples up to curr_frame's timestamp instead of
+        // keeping only the single sample nearest it -- see the
+        // static-init averaging below.
+        std::vector<std::pair<int64_t, Vec3>> static_init_accel_samples;
+        static_init_accel_samples.emplace_back(data->t_ns, data->accel);
+
         while (data->t_ns < curr_frame->t_ns) {
           data = popFromImuDataQueue();
           if (!data) break;
           data->accel = calib.calib_accel_bias.getCalibrated(data->accel);
           data->gyro = calib.calib_gyro_bias.getCalibrated(data->gyro);
+          static_init_accel_samples.emplace_back(data->t_ns, data->accel);
           // std::cout << "Skipping IMU data.." << std::endl;
+        }
+
+        // Average accel over a short static-init window instead of a
+        // single sample: one sample right as the pipeline starts is
+        // fragile against real handling motion (picking the device up,
+        // setting it down) at that exact instant -- observed on real
+        // hardware to cause ~0.5m of position drift within the first few
+        // seconds of a run, well before vision has enough to correct it.
+        const int64_t window_ns =
+            static_cast<int64_t>(config.vio_static_init_window_s * 1e9);
+        const int64_t window_start_ns =
+            static_init_accel_samples.back().first - window_ns;
+
+        Vec3 accel_sum = Vec3::Zero();
+        int accel_count = 0;
+        for (const auto& kv : static_init_accel_samples) {
+          if (kv.first >= window_start_ns) {
+            accel_sum += kv.second;
+            accel_count++;
+          }
+        }
+        Vec3 accel_mean = accel_sum / Scalar(accel_count);
+
+        Scalar accel_var = 0;
+        for (const auto& kv : static_init_accel_samples) {
+          if (kv.first >= window_start_ns) {
+            accel_var += (kv.second - accel_mean).squaredNorm();
+          }
+        }
+        accel_var /= Scalar(accel_count);
+        const Scalar accel_std = std::sqrt(accel_var);
+
+        if (accel_std > Scalar(config.vio_static_init_max_accel_std)) {
+          std::cerr
+              << "WARNING: accelerometer std-dev during static "
+                 "initialization was "
+              << accel_std << " m/s^2 over " << accel_count
+              << " samples (threshold "
+              << config.vio_static_init_max_accel_std
+              << ") -- the device likely wasn't still while VIO started. "
+                 "Initial gravity direction may be inaccurate, which can "
+                 "cause fast early drift. Hold the device still for the "
+                 "first "
+              << config.vio_static_init_window_s << "s next time."
+              << std::endl;
         }
 
         Vec3 vel_w_i_init;
         vel_w_i_init.setZero();
 
         T_w_i_init.setQuaternion(Eigen::Quaternion<Scalar>::FromTwoVectors(
-            data->accel, Vec3::UnitZ()));
+            accel_mean, Vec3::UnitZ()));
 
         last_state_t_ns = curr_frame->t_ns;
         imu_meas[last_state_t_ns] =
@@ -322,6 +375,13 @@ bool SqrtKeypointVioEstimator<Scalar_>::measure(
   stats_sums_.add("frame_id", opt_flow_meas->t_ns).format("none");
   Timer t_total;
 
+  // Captured here (pure IMU integration, before optimize_and_marg() below
+  // lets vision pull on it) and compared against the post-optimization
+  // pose further down -- see isImuVisionDisagreement()'s comment in the
+  // header for why.
+  bool have_imu_prediction = false;
+  Vec3 imu_only_translation = Vec3::Zero();
+
   if (meas.get()) {
     BASALT_ASSERT(frame_states[last_state_t_ns].getState().t_ns ==
                   meas->get_start_t_ns());
@@ -335,12 +395,21 @@ bool SqrtKeypointVioEstimator<Scalar_>::measure(
     meas->predictState(frame_states.at(last_state_t_ns).getState(), g,
                        next_state);
 
+    have_imu_prediction = true;
+    imu_only_translation = next_state.T_w_i.translation();
+
     last_state_t_ns = opt_flow_meas->t_ns;
     next_state.t_ns = opt_flow_meas->t_ns;
 
     frame_states[last_state_t_ns] = PoseVelBiasStateWithLin<Scalar>(next_state);
 
     imu_meas[meas->get_start_t_ns()] = *meas;
+
+    {
+      std::lock_guard<std::mutex> lock(latest_bias_mutex);
+      latest_accel_bias = next_state.bias_accel.template cast<double>();
+      latest_gyro_bias = next_state.bias_gyro.template cast<double>();
+    }
   }
 
   // save results
@@ -505,6 +574,22 @@ bool SqrtKeypointVioEstimator<Scalar_>::measure(
   }
 
   optimize_and_marg(num_points_connected, lost_landmaks);
+
+  if (have_imu_prediction && frame_states.count(last_state_t_ns) > 0) {
+    Vec3 optimized_translation =
+        frame_states.at(last_state_t_ns).getState().T_w_i.translation();
+    double disagreement_m = double(
+        (optimized_translation - imu_only_translation).norm());
+    latest_imu_vision_disagreement_m = disagreement_m;
+
+    if (disagreement_m > kImuVisionDisagreementThreshM) {
+      imu_vision_disagreement_count_++;
+    } else {
+      imu_vision_disagreement_count_ = 0;
+    }
+    imu_vision_disagreement =
+        imu_vision_disagreement_count_ >= kImuVisionDisagreementPersistenceFrames;
+  }
 
   if (out_state_queue) {
     PoseVelBiasStateWithLin p = frame_states.at(last_state_t_ns);
