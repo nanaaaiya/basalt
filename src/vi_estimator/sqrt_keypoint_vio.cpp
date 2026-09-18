@@ -582,7 +582,14 @@ bool SqrtKeypointVioEstimator<Scalar_>::measure(
         (optimized_translation - imu_only_translation).norm());
     latest_imu_vision_disagreement_m = disagreement_m;
 
-    if (disagreement_m > kImuVisionDisagreementThreshM) {
+    if (latest_gyro_norm > kImuVisionDisagreementMaxGyroNormRadS) {
+      // Genuinely fast rotation can itself produce this much position
+      // disagreement (camera-IMU sync/extrinsics are never perfect), so
+      // this frame's reading isn't usable evidence either way -- skip it
+      // rather than counting it as agreement (reset) or disagreement
+      // (increment), so a real corruption event that happens to overlap
+      // one high-gyro instant doesn't lose its persistence count.
+    } else if (disagreement_m > kImuVisionDisagreementThreshM) {
       imu_vision_disagreement_count_++;
     } else {
       imu_vision_disagreement_count_ = 0;

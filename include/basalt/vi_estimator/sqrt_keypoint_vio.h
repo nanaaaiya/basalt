@@ -313,24 +313,47 @@ class SqrtKeypointVioEstimator : public VioEstimatorBase,
   Eigen::aligned_map<int64_t, IntegratedImuMeasurement<Scalar>> imu_meas;
 
   // IMU-vision disagreement detector (see isImuVisionDisagreement() above).
-  // Starting values, not yet validated against real flight data -- expect
-  // to retune once live/dynamic-scene test data exists, same as the drift
-  // gate's own constants were (kDriftGateThresholdM 1.0 -> 0.5, etc.).
+  // History: 0.05m thresh / 10-frame persistence (initial guesses) -> 0.02m
+  // / 3 frames, retuned against a real captured hand-wave
+  // (run_logs/20260918_142001): the actual disagreement bump was real and
+  // clearly hand-wave-shaped, but only ~6-7 frames wide (~0.4-0.5s) and
+  // only cleared 0.05m on a single frame, so the original 10-frame
+  // requirement -- sized for a SUSTAINED violation like flowing water --
+  // never came close to firing for what was actually a brief, reflexive
+  // wave (the original motivating case for this whole detector). Across
+  // that same run's 802 frames (hand-wave included), p99 stayed at 0.03m,
+  // so 0.02m/3 frames should catch this class of event without much
+  // false-positive risk from ordinary noise -- still unvalidated against
+  // a live re-test, expect further tuning.
   // Threshold: how far (m) the joint optimizer is allowed to pull a
   // single frame's position away from the pure-IMU prediction before
   // counting it as "disagreeing" -- predictState() already accounts for
   // the current velocity estimate, so ordinary continued motion doesn't
   // by itself produce a large gap here; this is meant to catch NEW,
   // unexplained corrections, not motion in general.
-  static constexpr double kImuVisionDisagreementThreshM = 0.05;
+  static constexpr double kImuVisionDisagreementThreshM = 0.02;
   // Persistence: consecutive frames the disagreement must stay above
   // threshold before flagging -- a single frame is expected sensor noise
   // or the normal transient stress of a real aggressive maneuver (camera-
-  // IMU time sync/extrinsics are never perfect); only a sustained
-  // disagreement is evidence of an actual static-world violation (the
-  // cause -- water still flowing, hand still in frame -- keeps producing
-  // it, unlike noise or a brief maneuver).
-  static constexpr int kImuVisionDisagreementPersistenceFrames = 10;
+  // IMU time sync/extrinsics are never perfect); still requiring a few
+  // consecutive frames (not just one) keeps a single noisy sample from
+  // triggering it.
+  static constexpr int kImuVisionDisagreementPersistenceFrames = 3;
+  // Rotation-rate gate, added after the 0.02m/3-frame retune above turned
+  // out to false-positive heavily during genuine aggressive motion (two
+  // separate real test flights: 41 fires/11 episodes and 74 fires/14
+  // episodes over ~26-40s each, both with gyro_norm means around 2 rad/s
+  // and peaks past 20 rad/s -- vs. a real stationary dynamic-scene
+  // corruption event, which measured gyro_norm mean 0.009, max 0.28
+  // rad/s). Real fast rotation stresses camera-IMU time sync/extrinsics
+  // enough to produce the same kind of brief position disagreement a
+  // genuine corruption does, so disagreement alone can't tell the two
+  // apart -- gyro_norm can. Threshold sits with wide margin above the
+  // stationary-corruption case's observed max (0.28) and well below the
+  // aggressive-motion cases' mean (~2), so legitimate maneuvering is
+  // excluded without narrowing what counts as "the camera is basically
+  // not rotating" for the corruption case itself.
+  static constexpr double kImuVisionDisagreementMaxGyroNormRadS = 0.5;
   int imu_vision_disagreement_count_ = 0;
   std::atomic<bool> imu_vision_disagreement{false};
   std::atomic<double> latest_imu_vision_disagreement_m{0.0};
