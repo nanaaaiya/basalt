@@ -92,19 +92,31 @@ constexpr double kStereoEpipolarErrorThreshold = 1e-3;
 // count), so anything below that floor is a pure waste, not a real chance.
 //
 // History: 30 (initial) -> 15 (too strict, excluded almost everything on
-// Pi5) -> 25 (current). 15 let through partners whose triangulated points
-// were sparse/marginal -- still numerically able to clear
+// Pi5) -> 25 -> 20 (current). 15 let through partners whose triangulated
+// points were sparse/marginal -- still numerically able to clear
 // mapper_min_matches, but a thin or poorly-distributed point set can give
 // RANSAC/PnP a badly-conditioned problem, producing a pose that passes
 // verification while still being meaningfully wrong. A *wrong* accepted
 // closure is worse than a missed one -- it actively pulls the trajectory
-// off, rather than just failing to correct it. 25 is a deliberate partial
+// off, rather than just failing to correct it. 25 was a deliberate partial
 // revert to isolate whether this specific gate was the dominant cause of
-// the increased drift observed after the previous set of loosenings,
-// before touching the other thresholds. If Pi5 hardware instability keeps
-// triangulation near-zero regardless, this alone won't fix it -- that's a
-// data-quality problem no database threshold can compensate for.
-constexpr int kMinTriangulatedPointsForDatabase = 25;
+// the increased drift observed after the previous set of loosenings.
+// Real low-texture/distant-background sessions (2026-09-17) then hit the
+// opposite failure: triangulated points sitting consistently in the
+// 10-20 range (stereo match rate ~4.5% vs. ~8.2% on a good background,
+// per [STEREO-DIAG] logs) never cleared 25 even once across a whole run,
+// so the candidate database stayed empty and num_loop_closures was 0 the
+// entire time -- raw drift went completely uncorrected. 20 is a single,
+// deliberately modest step down from 25 (NOT a reversion to the
+// already-proven-bad 15) to let through the specific 17-20-point
+// keyframes observed in that failure case while staying well clear of
+// the mapper_min_matches=13 hard floor -- re-check num_loop_closures AND
+// whether corrected ends up worse than raw (the signature of accepted-
+// but-wrong closures, same failure 15 hit) before loosening further. If
+// Pi5 hardware instability keeps triangulation near-zero regardless,
+// this alone won't fix it -- that's a data-quality problem no database
+// threshold can compensate for.
+constexpr int kMinTriangulatedPointsForDatabase = 20;
 
 // Cap on how many BoW candidates get the FULL verification treatment
 // (countMatchStages + matchDescriptors, both O(corners0 x corners_partner)
