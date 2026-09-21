@@ -425,12 +425,16 @@ class FrameToFrameOpticalFlow : public OpticalFlowBase {
 
     KeypointsData kd;
 
-    // num_points_cell raised 1 -> 2: see
+    // num_points_cell raised 1 -> 2 -> 3: see
     // config.optical_flow_detection_grid_size's comment (vio_config.cpp)
     // for why more raw candidate corners should help tracked_ratio even
     // without improving either downstream matching path's success rate.
+    // Pushed further specifically to raise how many candidates the
+    // FIRST post-rotation keyframe has to work with, shrinking the
+    // landmark-pool rebuild time from conversation's live measurement
+    // (run 20260921_143218, ~1.8-2.2s typical).
     detectKeypoints(pyramid->at(0).lvl(0), kd,
-                    config.optical_flow_detection_grid_size, 2, pts0);
+                    config.optical_flow_detection_grid_size, 3, pts0);
 
     Eigen::aligned_map<KeypointId, Eigen::AffineCompact2f> new_poses0,
         new_poses1;

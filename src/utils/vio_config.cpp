@@ -71,18 +71,20 @@ VioConfig::VioConfig() {
 
   vio_max_states = 3;
   vio_max_kfs = 7;
-  // Was 5 -- the other lever behind the post-rotation recovery lag (see
-  // conversation, and kSeedDepthsM's comment in
+  // Was 5, then 3 -- the other lever behind the post-rotation recovery
+  // lag (see conversation, and kSeedDepthsM's comment in
   // frame_to_frame_optical_flow.h for the first one): once tracking
   // degrades below vio_new_kf_keypoints_thresh, this cooldown is what
   // paces how often the system even ATTEMPTS to rebuild the landmark
-  // pool via a fresh keyframe. Measured live (multiple runs this
-  // session) at 5, that cadence was a fixed ~7 frames / ~0.47s between
-  // keyframes -- lowered to let it attempt more rebuild cycles per
-  // second specifically while struggling, without changing anything
-  // once tracked_ratio climbs back above threshold and keyframing goes
-  // back to being scene-driven.
-  vio_min_frames_after_kf = 3;
+  // pool via a fresh keyframe. At 5 that cadence was a fixed ~7 frames
+  // / ~0.47s between keyframes; at 3, measured live (run
+  // 20260921_143218) that landmark-pool rebuild after a rotation still
+  // took ~1.8-2.2s typical (median/mean across 7 clean episodes) to
+  // reach 80% of pre-rotation tracked_count -- lowered further to keep
+  // pushing that down. Doesn't change anything once tracked_ratio
+  // climbs back above threshold and keyframing goes back to being
+  // scene-driven.
+  vio_min_frames_after_kf = 2;
   // Was 0.7 (upstream default, tuned against clean EuRoC benchmark footage).
   // On the OAK-D Lite rig, real tracked_ratio chronically sits in the
   // 0.0-0.2 range even on well-tracked frames, so 0.7 was never satisfied
