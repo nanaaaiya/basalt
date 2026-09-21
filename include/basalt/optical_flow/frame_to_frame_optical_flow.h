@@ -269,8 +269,19 @@ class FrameToFrameOpticalFlow : public OpticalFlowBase {
           new_poses0,
       Eigen::aligned_map<KeypointId, Eigen::AffineCompact2f>& new_poses1)
       const {
-    static const std::array<Scalar, 4> kSeedDepthsM = {
-        Scalar(0.5), Scalar(1.0), Scalar(2.0), Scalar(4.0)};
+    // Widened from the original {0.5, 1.0, 2.0, 4.0} -- this is one of
+    // the two levers behind the post-rotation "tracked points take 1-2s
+    // to come back" recovery lag (see conversation): landmark-pool
+    // rebuild speed after motion blur wipes it out is capped partly by
+    // how many of a keyframe's new corners this seeding successfully
+    // triangulates. Finer/wider coverage raises that per-keyframe yield
+    // directly, same mechanism validated for the coarser 4-depth set
+    // (run 20260921_134359: 1.37% -> 2.80% klt_stereo_ok). Cost is
+    // bounded to newly-detected corners only (self-limiting -- more
+    // hypotheses only get tried when there's more to rebuild).
+    static const std::array<Scalar, 7> kSeedDepthsM = {
+        Scalar(0.3), Scalar(0.6), Scalar(1.0), Scalar(1.5),
+        Scalar(2.5), Scalar(4.0), Scalar(6.0)};
 
     std::vector<KeypointId> ids;
     Eigen::aligned_vector<Eigen::AffineCompact2f> init_vec;
