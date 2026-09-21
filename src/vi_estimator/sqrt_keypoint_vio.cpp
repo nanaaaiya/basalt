@@ -71,6 +71,7 @@ SqrtKeypointVioEstimator<Scalar_>::SqrtKeypointVioEstimator(
       max_lambda(config_.vio_lm_lambda_max),
       lambda_vee(2) {
   obs_std_dev = Scalar(config.vio_obs_std_dev);
+  nominal_obs_std_dev = obs_std_dev;
   huber_thresh = Scalar(config.vio_obs_huber_thresh);
   calib = calib_.cast<Scalar>();
 
@@ -480,6 +481,17 @@ bool SqrtKeypointVioEstimator<Scalar_>::measure(
     TimeCamId tcidl(opt_flow_meas->t_ns, 0);
 
     int num_points_added = 0;
+    // Diagnostic breakdown of *why* unconnected corners fail to become real
+    // landmarks -- distinguishes "never had any prior sighting to pair with"
+    // (cam0-cam1 stereo tracking itself failed, and no temporal history yet
+    // either) from "had a candidate but insufficient baseline" (the
+    // vio_min_triangulation_dist=5cm gate, which a stereo pair should always
+    // clear via the rig's fixed baseline, but a temporal-only pair needs
+    // real ego-motion for) from "had adequate baseline but triangulation
+    // math itself rejected it" (behind camera / out of the 3m range gate).
+    int diag_no_candidate = 0;
+    int diag_baseline_rejected = 0;
+    int diag_triangulation_failed = 0;
     for (int lm_id : unconnected_obs0) {
       // Find all observations
       std::map<TimeCamId, KeypointObservation<Scalar>> kp_obs;
@@ -502,6 +514,7 @@ bool SqrtKeypointVioEstimator<Scalar_>::measure(
 
       // triangulate
       bool valid_kp = false;
+      bool any_baseline_ok = false;
       const Scalar min_triang_distance2 =
           Scalar(config.vio_min_triangulation_dist *
                  config.vio_min_triangulation_dist);
@@ -530,6 +543,7 @@ bool SqrtKeypointVioEstimator<Scalar_>::measure(
             calib.T_i_c[0].inverse() * T_i0_i1 * calib.T_i_c[tcido.cam_id];
 
         if (T_0_1.translation().squaredNorm() < min_triang_distance2) continue;
+        any_baseline_ok = true;
 
         Vec4 p0_triangulated = triangulate(p0_3d.template head<3>(),
                                            p1_3d.template head<3>(), T_0_1);
@@ -552,10 +566,22 @@ bool SqrtKeypointVioEstimator<Scalar_>::measure(
         for (const auto& kv_obs : kp_obs) {
           lmdb.addObservation(kv_obs.first, kv_obs.second);
         }
+      } else if (kp_obs.empty()) {
+        diag_no_candidate++;
+      } else if (!any_baseline_ok) {
+        diag_baseline_rejected++;
+      } else {
+        diag_triangulation_failed++;
       }
     }
 
     num_points_kf[opt_flow_meas->t_ns] = num_points_added;
+    std::cout << "[LANDMARK-DIAG] unconnected=" << unconnected_obs0.size()
+              << " added=" << num_points_added
+              << " no_candidate=" << diag_no_candidate
+              << " baseline_rejected=" << diag_baseline_rejected
+              << " triangulation_failed=" << diag_triangulation_failed
+              << std::endl;
   } else {
     frames_after_kf++;
   }
@@ -572,6 +598,35 @@ bool SqrtKeypointVioEstimator<Scalar_>::measure(
         lost_landmaks.emplace(kv.first);
       }
     }
+  }
+
+  // Apply reweighting for THIS frame's optimize_and_marg() based on LAST
+  // frame's disagreement flag -- this frame's own flag can only be known
+  // after its optimization already ran (see below), so there's an
+  // unavoidable one-frame lag (see the reweighting members' comment in
+  // the header for why that's fine at this frame rate).
+  if (imu_vision_disagreement) {
+    auto now = std::chrono::steady_clock::now();
+    if (!imu_vision_reweight_active_) {
+      imu_vision_reweight_active_ = true;
+      imu_vision_reweight_start_wall_ = now;
+    }
+    double active_s = std::chrono::duration<double>(
+                           now - imu_vision_reweight_start_wall_)
+                           .count();
+    if (active_s <= kImuVisionReweightMaxDurationS) {
+      obs_std_dev = nominal_obs_std_dev * Scalar(kImuVisionReweightFactor);
+    } else {
+      // Time cap exceeded -- give up reweighting for this episode and
+      // go back to trusting vision normally, rather than let IMU bias
+      // run uncorrected indefinitely (see header comment: this is the
+      // same failure mode as the global-weight-change blowup earlier
+      // this session, just bounded here instead of unbounded).
+      obs_std_dev = nominal_obs_std_dev;
+    }
+  } else {
+    imu_vision_reweight_active_ = false;
+    obs_std_dev = nominal_obs_std_dev;
   }
 
   optimize_and_marg(num_points_connected, lost_landmaks);

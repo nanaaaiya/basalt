@@ -537,6 +537,17 @@ int main(int argc, char** argv) {
         int tracked_count = vio->getLatestTrackedCount();
         int total_observed_count = vio->getLatestTotalObservedCount();
 
+        // Feeds the drift gate's starvation trigger (see
+        // kStarvationTrackedRatioThresh in online_loop_closure.cpp) --
+        // lets it hold the live pose when tracking is starved badly
+        // enough that few or no new keyframes are being created, a
+        // window checkDriftGate()'s own residual check can otherwise
+        // miss entirely.
+        if (online_loop_closure) {
+          online_loop_closure->reportTrackingHealth(health_in.tracked_ratio,
+                                                     total_observed_count);
+        }
+
         if (health.primary_reason != "nominal") {
           std::cout << "[VIO-HEALTH] t_ns=" << t_ns
                     << " confidence=" << health.score
@@ -551,7 +562,9 @@ int main(int argc, char** argv) {
                     << " gyro_norm=" << health_in.gyro_norm
                     << " accel_norm=" << vio->getLatestAccelNorm()
                     << " imu_vision_disagreement_m="
-                    << vio->getLatestImuVisionDisagreementM() << std::endl;
+                    << vio->getLatestImuVisionDisagreementM()
+                    << " imu_vision_reweight_active="
+                    << vio->isImuVisionReweightActive() << std::endl;
         }
 
         // Bias-state telemetry: printed unconditionally (health-gated

@@ -74,7 +74,19 @@ constexpr double kStereoSecondBestTestRatio = 1.5;
 // Epipolar error threshold for findInliersEssential() -- same value
 // Basalt's own offline mapper uses for the identical stereo-verification
 // purpose (NfrMapper::match_stereo(), src/vi_estimator/nfr_mapper.cpp).
-constexpr double kStereoEpipolarErrorThreshold = 1e-3;
+//
+// Loosened 10x from the upstream 1e-3 default: at this rig's focal length
+// (fx~455px @ 640x480), 1e-3 rad allows only ~0.45px of deviation from the
+// exact epipolar line -- tighter than a consumer OAK-D Lite's combined
+// calibration residual + corner-localization jitter + L/R sync skew can
+// satisfy, even before descriptor matching runs. Measured triangulated
+// yield had been stuck at 5-20% of detected corners all session despite
+// the already-loosened Hamming/ratio thresholds above. Confirmed live
+// (run 20260921_112133): loosening to 1e-2 (~4.5px tolerance) raised
+// average triangulated points/keyframe from 24 to 72 (5.7% -> 15.6% of
+// detected corners) on the same rig/environment, validating the
+// tolerance-mismatch diagnosis. Kept as the new baseline since.
+constexpr double kStereoEpipolarErrorThreshold = 1e-2;
 
 // Keyframe quality gate: minimum triangulated 3D points a keyframe needs
 // before it's allowed to become a future match TARGET (see processKeyframe()
@@ -250,6 +262,44 @@ constexpr size_t kDriftGateAnchorRefreshKeyframes = 20;
 // (kDriftGateReleaseCount consecutive good solves) recovery sooner,
 // accepting an unconfirmed correction more readily.
 constexpr double kDriftGateMaxHoldSeconds = 15.0;
+
+// Starvation trigger: a SECOND way into the same held state above,
+// independent of checkDriftGate()'s residual check. That check only
+// fires when solvePoseGraph() processes a new keyframe -- but when
+// tracking is starved badly enough (something covering the camera, or
+// the chronic-low-tracked_ratio failure mode this session kept hitting:
+// tracked_ratio down at 2.8-6.5% for tens of seconds on a real live
+// test, 2026-09-21), few or no NEW keyframes get created at all, so
+// checkDriftGate() may never run during exactly the window it would
+// need to. Meanwhile the estimator doesn't "decide" to trust the IMU
+// more in that case -- it just has nothing else to lean on, so it
+// silently free-integrates while still reporting a confident-looking
+// pose. This trigger watches the same tracked_ratio/total_observed_count
+// oak_d_vio.cpp already reads for VioConfidenceInputs (see
+// reportTrackingHealth()) and enters the SAME held_pose_ state
+// checkDriftGate() uses, so it inherits the same max-hold timeout and
+// release-blend behavior for free -- this is a second way to TRIP, not
+// a parallel hold mechanism.
+//
+// Deliberately much stricter than VioConfidenceConfig::min_tracked_ratio
+// (0.7, used for the general "degraded" confidence label): holding the
+// live pose has its own cost (stale data), so this is reserved for
+// genuinely critical starvation, not ordinary environment-driven
+// tracking noise the confidence system already tolerates without a
+// freeze. total_observed_count is checked separately from the ratio
+// because if raw detections collapse to near-zero (camera fully
+// covered), the ratio itself may not even be a meaningful signal.
+// Unvalidated starting guesses -- no live test of this trigger exists
+// yet.
+constexpr double kStarvationTrackedRatioThresh = 0.10;
+constexpr int kStarvationMinTotalObserved = 5;
+// Wall-clock, not a call count, matching drift_held_since_wall_'s own
+// reasoning: getSmoothedCorrectedPose() is called from several sites in
+// oak_d_vio.cpp (GUI draw, dashboard publish, etc.), not at one single
+// guaranteed rate, so counting consecutive CALLS would make this
+// trigger's sensitivity depend on how many consumers happen to be
+// active, not on how long the starvation actually lasted.
+constexpr double kStarvationPersistenceSeconds = 2.0;
 
 // Decompose R = Rz(yaw) * Ry(pitch) * Rx(roll). Assumes no gimbal lock
 // (pitch away from +-90 deg), a reasonable assumption for a handheld/mobile
@@ -1184,6 +1234,10 @@ void OnlineLoopClosure::checkDriftGate() {
       release_blending_ = true;
       release_blend_start_pose_ = held_pose_;
       release_blend_start_wall_ = std::chrono::steady_clock::now();
+      release_blend_duration_s_ = -1.0;  // recomputed on first use -- see comment
+      // See forceReleaseDriftHoldLocked()'s matching reset -- same bug,
+      // same fix, for the confirmed-release path.
+      starvation_active_ = false;
       drift_gate_events.try_push(DriftGateEvent::kReleasedConfirmed);
       std::cout << "[ONLINE-LOOP] DRIFT GATE RELEASED: kf=" << (n - 1)
                 << " residual back under threshold for " << kDriftGateReleaseCount
@@ -1217,8 +1271,18 @@ void OnlineLoopClosure::forceReleaseDriftHoldLocked() const {
   release_blending_ = true;
   release_blend_start_pose_ = held_pose_;
   release_blend_start_wall_ = std::chrono::steady_clock::now();
+  release_blend_duration_s_ = -1.0;  // recomputed on first use -- see comment
   last_forced_release_wall_ = release_blend_start_wall_;
   had_forced_release_ = true;
+  // Reset the starvation trigger's clock too (see
+  // kStarvationTrackedRatioThresh in the .cpp): without this, a release
+  // followed immediately by still-bad tracking would re-trip on the very
+  // next check using the OLD, un-reset elapsed time, chaining what should
+  // be separate hold episodes into what looks like one continuous freeze
+  // -- confirmed on a real live test (2026-09-21): reported "starved for"
+  // durations of 10-23s despite kStarvationPersistenceSeconds being 2.0,
+  // because this reset was missing.
+  starvation_active_ = false;
   drift_gate_events.try_push(DriftGateEvent::kReleasedForced);
 }
 
@@ -1230,6 +1294,12 @@ bool OnlineLoopClosure::isRecentlyForceReleased() const {
                           last_forced_release_wall_)
                           .count();
   return elapsed_s < kForcedReleaseCooldownS;
+}
+
+void OnlineLoopClosure::reportTrackingHealth(double tracked_ratio,
+                                             int total_observed_count) {
+  latest_reported_tracked_ratio_ = tracked_ratio;
+  latest_reported_total_observed_count_ = total_observed_count;
 }
 
 Eigen::aligned_vector<Eigen::Vector3d> OnlineLoopClosure::getCorrectedTrajectory()
@@ -1301,6 +1371,60 @@ bool OnlineLoopClosure::getSmoothedCorrectedPose(
     }
   }
 
+  // Starvation trigger (see kStarvationTrackedRatioThresh in the .cpp) --
+  // a second way into drift_held_, independent of checkDriftGate()'s
+  // residual check, for when tracking is starved badly enough (camera
+  // covered, or the chronic-low-tracked_ratio failure mode) that few or
+  // no new keyframes are being created at all, so that check may never
+  // get a chance to run. At this point drift_held_ is definitely false
+  // (either it always was, or the block above just released it), so this
+  // only evaluates whether to trip a NEW hold, never conflicts with an
+  // in-progress one.
+  bool starved =
+      latest_reported_tracked_ratio_ < kStarvationTrackedRatioThresh ||
+      latest_reported_total_observed_count_ < kStarvationMinTotalObserved;
+  if (starved) {
+    auto now = std::chrono::steady_clock::now();
+    if (!starvation_active_) {
+      starvation_active_ = true;
+      starvation_since_wall_ = now;
+    }
+    double starved_s =
+        std::chrono::duration<double>(now - starvation_since_wall_).count();
+    if (starved_s >= kStarvationPersistenceSeconds) {
+      // Freeze at wherever the live pose actually was an instant ago,
+      // same reasoning as checkDriftGate()'s own trip -- see held_pose_'s
+      // header comment for why last_published_pose_, not some graph node.
+      if (have_last_published_pose_) {
+        held_pose_ = last_published_pose_;
+        held_anchor_raw_pose_ = last_raw_pose_seen_;
+      } else {
+        const LoopKeyframe& newest = keyframes_.back();
+        held_pose_ = Sophus::SE3d(composeYPR(newest.roll, newest.pitch, newest.yaw),
+                                  newest.t_opt);
+        held_anchor_raw_pose_ = newest.T_w_i_raw;
+      }
+      drift_held_ = true;
+      drift_held_since_t_ns_ = -1;  // no keyframe backing this trip -- see
+                                     // drift_held_since_wall_'s comment, the
+                                     // wall-clock twin is what actually
+                                     // governs the max-hold cap here.
+      drift_held_since_wall_ = now;
+      drift_gate_events.try_push(DriftGateEvent::kTripped);
+      std::cout << "[ONLINE-LOOP] DRIFT GATE TRIPPED (starvation: "
+                   "tracked_ratio="
+                << latest_reported_tracked_ratio_
+                << " total_observed_count="
+                << latest_reported_total_observed_count_
+                << ", starved for " << starved_s
+                << "s) -- holding live pose in place" << std::endl;
+      out = held_pose_;
+      return true;
+    }
+  } else {
+    starvation_active_ = false;
+  }
+
   const LoopKeyframe& kf = keyframes_.back();
   Sophus::SE3d T_w_i_corrected_kf(composeYPR(kf.roll, kf.pitch, kf.yaw),
                                    kf.t_opt);
@@ -1311,22 +1435,67 @@ bool OnlineLoopClosure::getSmoothedCorrectedPose(
   Sophus::SE3d T_kf_to_current = kf.T_w_i_raw.inverse() * current_raw_pose;
   out = T_w_i_corrected_kf * T_kf_to_current;
 
-  // For kReleaseBlendDurationS after a hold releases (either way -- see
-  // checkDriftGate() and release_blending_'s header comment), glide from
-  // where the pose was frozen to the freshly-computed target instead of
-  // jumping to it in one step. SE3 geodesic interpolation (linear on
-  // translation, exponential-map on the log of the relative rotation) so
-  // the blend is a single consistent rigid-body motion, not independently
-  // lerped translation/rotation.
+  // Blend across ordinary target movement too -- see
+  // last_unblended_target_pose_'s header comment for why this has to
+  // compare against the last UNBLENDED target, not last_published_pose_
+  // (which deliberately lags behind target while a blend is in flight,
+  // and would look like continuous movement every tick if used here).
+  // Arms (or RESTARTS, from wherever the stream actually is right now,
+  // i.e. last_published_pose_ -- correct whether that's a steady pose or
+  // mid-blend from an earlier jump/release) whenever the fresh target
+  // meaningfully disagrees with the previous fresh target. Deliberately
+  // does NOT skip when a blend is already in flight: that was tried
+  // first and measured live (run 20260921_114840) to let some jumps leak
+  // through nearly full-strength (up to ~40cm in one tick) whenever they
+  // landed while a prior blend's alpha was already close to 1, since the
+  // in-flight blend's target silently absorbed the new jump with no
+  // re-arm to smooth it.
+  if (have_last_unblended_target_pose_) {
+    double jump_m = (out.translation() -
+                     last_unblended_target_pose_.translation())
+                        .norm();
+    if (jump_m > kTargetJumpBlendThresholdM) {
+      release_blending_ = true;
+      release_blend_start_pose_ =
+          have_last_published_pose_ ? last_published_pose_ : out;
+      release_blend_start_wall_ = std::chrono::steady_clock::now();
+      release_blend_duration_s_ = -1.0;  // recomputed on first use below
+    }
+  }
+  last_unblended_target_pose_ = out;
+  have_last_unblended_target_pose_ = true;
+
+  // After a hold releases OR an ordinary anchor switch (either way --
+  // see checkDriftGate() and release_blending_'s header comment), glide
+  // from where the pose was frozen/last published to the freshly-
+  // computed target instead of jumping to it in one step. SE3 geodesic
+  // interpolation (linear on translation, exponential-map on the log of
+  // the relative rotation) so the blend is a single consistent
+  // rigid-body motion, not independently lerped translation/rotation.
   if (release_blending_) {
+    // Duration is computed once per blend, on the first tick that
+    // actually sees both endpoints (every arm site just sets this to -1
+    // and lets this be the single place that derives it) -- rate-limited
+    // by kMaxBlendSpeedMps rather than always kReleaseBlendDurationS, so
+    // a big correction gets stretched out instead of moving implausibly
+    // fast for the same fixed window. Held fixed for the rest of this
+    // blend so alpha stays monotonic even though target keeps moving.
+    if (release_blend_duration_s_ < 0.0) {
+      double total_jump_m =
+          (out.translation() - release_blend_start_pose_.translation())
+              .norm();
+      release_blend_duration_s_ =
+          std::max(kReleaseBlendDurationS, total_jump_m / kMaxBlendSpeedMps);
+    }
     double elapsed_s = std::chrono::duration<double>(
                             std::chrono::steady_clock::now() -
                             release_blend_start_wall_)
                             .count();
-    if (elapsed_s >= kReleaseBlendDurationS) {
+    if (elapsed_s >= release_blend_duration_s_) {
       release_blending_ = false;
     } else {
-      double alpha = std::clamp(elapsed_s / kReleaseBlendDurationS, 0.0, 1.0);
+      double alpha =
+          std::clamp(elapsed_s / release_blend_duration_s_, 0.0, 1.0);
       Sophus::SE3d delta = release_blend_start_pose_.inverse() * out;
       out = release_blend_start_pose_ * Sophus::SE3d::exp(alpha * delta.log());
     }

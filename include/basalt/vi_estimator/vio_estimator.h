@@ -153,6 +153,12 @@ class VioEstimatorBase {
   // points are the majority rather than a minority.
   virtual bool isImuVisionDisagreement() const { return false; }
   virtual double getLatestImuVisionDisagreementM() const { return 0.0; }
+
+  // Whether vision's residual weight is currently reduced in response to
+  // isImuVisionDisagreement() -- see
+  // SqrtKeypointVioEstimator::isImuVisionReweightActive()'s comment for
+  // the bounded-window/time-cap design.
+  virtual bool isImuVisionReweightActive() const { return false; }
 };
 
 class VioEstimatorFactory {

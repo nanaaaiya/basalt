@@ -61,7 +61,19 @@ VioConfig::VioConfig() {
   vio_max_states = 3;
   vio_max_kfs = 7;
   vio_min_frames_after_kf = 5;
-  vio_new_kf_keypoints_thresh = 0.7;
+  // Was 0.7 (upstream default, tuned against clean EuRoC benchmark footage).
+  // On the OAK-D Lite rig, real tracked_ratio chronically sits in the
+  // 0.0-0.2 range even on well-tracked frames, so 0.7 was never satisfied
+  // and this threshold alone (not real scene need) paced keyframe creation
+  // at the fastest allowed rate (vio_min_frames_after_kf cooldown) for an
+  // entire 205s live run -- confirmed via run 20260921_103601, where all
+  // 432 keyframes were spaced exactly 7 frames apart with zero variance.
+  // That churn kept re-hosting landmarks before frame-to-frame tracking
+  // could build up connected observations, which fed back into keeping
+  // tracked_ratio low -- triggering the starvation drift-gate trigger for
+  // ~90s of that 205s run. Lowered to reflect what this rig actually
+  // achieves, so new keyframes are driven by genuine scene need again.
+  vio_new_kf_keypoints_thresh = 0.3;
 
   vio_debug = false;
   vio_extended_logging = false;

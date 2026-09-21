@@ -35,6 +35,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <mutex>
 #include <thread>
 
@@ -284,6 +285,16 @@ class SqrtKeypointVioEstimator : public VioEstimatorBase,
     return latest_imu_vision_disagreement_m;
   }
 
+  // Whether vision's residual weight is currently reduced in response to
+  // isImuVisionDisagreement() -- see the reweighting members' comment for
+  // the full design (bounded to the flagged window, hard time cap).
+  // False both when nominal (flag clear) AND when the time cap has been
+  // exceeded (flag still set but reweighting gave up for this episode) --
+  // getLatestImuVisionDisagreementM() distinguishes those two if needed.
+  bool isImuVisionReweightActive() const override {
+    return imu_vision_reweight_active_;
+  }
+
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 
  private:
@@ -392,6 +403,45 @@ class SqrtKeypointVioEstimator : public VioEstimatorBase,
   int imu_vision_disagreement_count_ = 0;
   std::atomic<bool> imu_vision_disagreement{false};
   std::atomic<double> latest_imu_vision_disagreement_m{0.0};
+
+  // Detect-AND-REWEIGHT: while imu_vision_disagreement is flagged, vision's
+  // residual weight in the optimizer is temporarily reduced (obs_std_dev
+  // raised, so vision counts for less against the IMU factor) instead of
+  // just reporting the flag. Deliberately bounded on two axes, both
+  // learned the hard way earlier this session: (1) a global, permanent
+  // version of "trust IMU more" (halved accel_bias_std/gyro_noise_std in
+  // the calibration file) caused 225-300m raw-trajectory runaways,
+  // because it also suppressed the bias self-correction vision provides
+  // during the many frames where nothing is actually wrong -- so this
+  // ONLY applies while the flag is active, snapping back to nominal the
+  // instant it clears; (2) even scoped to the flagged window, a genuinely
+  // sustained event (flowing water) must not let reweighting run
+  // indefinitely, since that reproduces the same bias-runs-free failure
+  // just over a shorter, still-real window -- kImuVisionReweightMaxDurationS
+  // forces a return to nominal trust after that long, accepting the
+  // (smaller) risk of trusting a still-flagged vision stream over the
+  // (larger, proven) risk of unbounded uncorrected IMU drift.
+  //
+  // One-frame lag by construction: a given frame's disagreement can only
+  // be computed AFTER that frame's optimize_and_marg() already ran (it
+  // compares the optimized result against the IMU prediction), so
+  // reweighting for frame N is decided from frame N-1's flag, applied
+  // before optimize_and_marg() runs, matching frame_states.at(...) reads
+  // throughout this file (see measure()). At ~15-20Hz this is single-
+  // digit milliseconds of lag, not a design compromise worth avoiding at
+  // the cost of running optimize() twice per frame.
+  //
+  // Both constants are unvalidated starting guesses (no live reweighting
+  // test has run yet) -- kImuVisionReweightFactor is a coarse, whole-
+  // frame downweight (this detector only knows "something disagrees
+  // overall", not which specific points are bad, so it can't do a
+  // targeted per-point rejection instead). Expect to retune once real
+  // before/after data exists on both a disturbance run and a clean run.
+  static constexpr double kImuVisionReweightFactor = 3.0;
+  static constexpr double kImuVisionReweightMaxDurationS = 5.0;
+  std::atomic<bool> imu_vision_reweight_active_{false};
+  std::chrono::steady_clock::time_point imu_vision_reweight_start_wall_;
+  Scalar nominal_obs_std_dev{0};
 
   const Vec3 g;
 

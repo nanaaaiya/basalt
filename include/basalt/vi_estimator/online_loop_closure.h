@@ -252,6 +252,19 @@ class OnlineLoopClosure {
   // snapping straight back to "nominal" the instant the hold ends.
   bool isRecentlyForceReleased() const;
 
+  // Feeds the same tracked_ratio/total_observed_count oak_d_vio.cpp
+  // already reads for VioConfidenceInputs into the drift gate's
+  // starvation trigger (see kStarvationTrackedRatioThresh in the .cpp) --
+  // call this once per VIO frame from wherever that health block already
+  // lives. Deliberately a separate "push" method rather than adding
+  // parameters to getSmoothedCorrectedPose() itself: that method has six
+  // call sites across oak_d_vio.cpp, and not all of them are positioned
+  // to easily supply a fresh value on every call, whereas the health
+  // block already computes these once per frame in one place. Cheap
+  // (two atomic writes), safe to call even when online loop closure is
+  // otherwise idle.
+  void reportTrackingHealth(double tracked_ratio, int total_observed_count);
+
   // Same as getCorrectedTrajectory(), but paired with each keyframe's
   // timestamp -- needed for logging/analysis (matching timestamps up
   // against the raw VIO trajectory, sample rate, etc.), not just drawing a
@@ -383,16 +396,22 @@ class OnlineLoopClosure {
   // see that method's comment for why a release needs to be triggerable
   // from both places.
   mutable bool drift_held_ = false;
-  Sophus::SE3d held_pose_;
-  Sophus::SE3d held_anchor_raw_pose_;
+  // mutable: both written from checkDriftGate() (non-const) on a normal
+  // residual-based trip, AND from getSmoothedCorrectedPose() (const) on
+  // a starvation trip -- see kStarvationTrackedRatioThresh in the .cpp.
+  mutable Sophus::SE3d held_pose_;
+  mutable Sophus::SE3d held_anchor_raw_pose_;
   mutable int drift_gate_stable_count_ = 0;
   // t_ns the current hold started at -- see kDriftGateMaxHoldSeconds:
   // a real live test found this staying stuck (never confirmed
   // recovered) for 40+ seconds straight, which is worse for a live
   // display than resuming with an unconfirmed correction. Only checked
   // from checkDriftGate(), which runs on keyframe arrival -- see
-  // drift_held_since_wall_ for the gap that left.
-  int64_t drift_held_since_t_ns_ = -1;
+  // drift_held_since_wall_ for the gap that left. Set to -1 (meaning
+  // "no keyframe-time anchor, use the wall-clock twin instead") by a
+  // starvation trip, which by definition isn't backed by a fresh
+  // keyframe -- mutable for the same reason as held_pose_ above.
+  mutable int64_t drift_held_since_t_ns_ = -1;
 
   // Wall-clock twin of drift_held_since_t_ns_, checked from
   // getSmoothedCorrectedPose() instead of checkDriftGate(). Necessary
@@ -424,6 +443,53 @@ class OnlineLoopClosure {
   mutable Sophus::SE3d release_blend_start_pose_;
   mutable std::chrono::steady_clock::time_point release_blend_start_wall_;
   static constexpr double kReleaseBlendDurationS = 0.4;
+  // Actual duration in use for the blend currently in flight -- a fixed
+  // 0.4s is fine for a small correction but, measured live (run
+  // 20260921_114840), a large one (20-40cm) spread over just 0.4s still
+  // produced individual published-tick deltas over 5cm, since a bigger
+  // total step divided by the same fixed window is a bigger per-tick
+  // slice. Lazily computed the first time getSmoothedCorrectedPose()
+  // applies a newly-armed blend (every arm site just sets this to -1;
+  // whichever call notices release_blending_ went true first fills it
+  // in using the actual start/target delta it can see, rather than
+  // duplicating that computation at every arm site), then held fixed
+  // for the rest of that blend so alpha stays monotonic. See
+  // kMaxBlendSpeedMps for how it's derived.
+  mutable double release_blend_duration_s_ = -1.0;
+  // Caps how fast a blended correction is allowed to visibly move --
+  // chosen near the upper end of plausible handheld/light-drone motion
+  // seen in this session's own data (most measured live jumps implied
+  // well under 1 m/s), so a blended correction never looks like faster,
+  // more violent motion than the vehicle could plausibly be doing.
+  static constexpr double kMaxBlendSpeedMps = 0.5;
+
+  // Ordinary target movement, independent of the drift gate --
+  // getSmoothedCorrectedPose()'s normal (not-held) path anchors on
+  // keyframes_.back() and chains raw motion forward from it. The
+  // resulting unblended target can jump for two DIFFERENT reasons, not
+  // just one: (1) the anchor switches identity to a freshly-created
+  // keyframe, or (2) solvePoseGraph() -- run whenever a loop closure is
+  // accepted -- revises the CURRENT anchor's t_opt/yaw IN PLACE (it
+  // writes back every free node's solved position each time it runs,
+  // not just a newly-added one), with no identity change at all. An
+  // earlier version of this fix only watched for (1) via a keyframe-id
+  // comparison and completely missed (2) -- confirmed live (run
+  // 20260921_115907) by unblended jumps up to 22.5cm/tick (~3.4 m/s)
+  // that didn't correlate with any anchor-identity change or drift-gate
+  // event. Comparing the freshly-computed unblended target directly
+  // against the last unblended target (not the possibly-still-blending
+  // last_published_pose_, which is deliberately lagging behind target
+  // while a blend is in flight and would falsely look like continuous
+  // movement) catches both cases uniformly, and normal frame-to-frame
+  // raw motion stays well under the threshold below so it doesn't
+  // spuriously re-arm.
+  mutable Sophus::SE3d last_unblended_target_pose_;
+  mutable bool have_last_unblended_target_pose_ = false;
+  // Below this, don't bother starting a blend -- ordinary graph-solve
+  // noise between consecutive publishes is usually a few mm to low-cm
+  // and blending on every single one adds pointless state churn for
+  // something already invisible against the <5cm accuracy target.
+  static constexpr double kTargetJumpBlendThresholdM = 0.02;
 
   // Set on a FORCED release specifically (kDriftGateMaxHoldSeconds timeout
   // gave up waiting, not confirmed by kDriftGateReleaseCount consecutive
@@ -435,6 +501,23 @@ class OnlineLoopClosure {
   mutable std::chrono::steady_clock::time_point last_forced_release_wall_;
   mutable bool had_forced_release_ = false;
   static constexpr double kForcedReleaseCooldownS = 5.0;
+
+  // Starvation trigger state (see kStarvationTrackedRatioThresh in the
+  // .cpp for the full reasoning) -- a second way into drift_held_,
+  // independent of checkDriftGate()'s residual check. Written by
+  // reportTrackingHealth() (called once per VIO frame from
+  // oak_d_vio.cpp), read from getSmoothedCorrectedPose(). Defaults to
+  // healthy values so nothing trips before the first real report
+  // arrives (e.g. during startup, before VIO has produced any health
+  // reading at all).
+  std::atomic<double> latest_reported_tracked_ratio_{1.0};
+  std::atomic<int> latest_reported_total_observed_count_{999};
+  // Wall-clock time the CURRENT continuous starvation stretch began --
+  // reset to invalid (via starvation_active_) the moment the condition
+  // stops holding, same "wall-clock, not a call count" reasoning as
+  // kStarvationPersistenceSeconds's own comment.
+  mutable bool starvation_active_ = false;
+  mutable std::chrono::steady_clock::time_point starvation_since_wall_;
 
   // Continuously updated by getSmoothedCorrectedPose() (mutable: that
   // method is const) every time it publishes a live, not-held pose --
