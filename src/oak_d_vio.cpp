@@ -538,14 +538,14 @@ int main(int argc, char** argv) {
         int total_observed_count = vio->getLatestTotalObservedCount();
 
         // Feeds the drift gate's starvation trigger (see
-        // kStarvationTrackedRatioThresh in online_loop_closure.cpp) --
+        // kStarvationMinTrackedCount in online_loop_closure.cpp) --
         // lets it hold the live pose when tracking is starved badly
         // enough that few or no new keyframes are being created, a
         // window checkDriftGate()'s own residual check can otherwise
         // miss entirely.
         if (online_loop_closure) {
-          online_loop_closure->reportTrackingHealth(health_in.tracked_ratio,
-                                                     total_observed_count);
+          online_loop_closure->reportTrackingHealth(
+              health_in.tracked_ratio, tracked_count, total_observed_count);
         }
 
         if (health.primary_reason != "nominal") {

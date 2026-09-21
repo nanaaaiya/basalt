@@ -252,18 +252,22 @@ class OnlineLoopClosure {
   // snapping straight back to "nominal" the instant the hold ends.
   bool isRecentlyForceReleased() const;
 
-  // Feeds the same tracked_ratio/total_observed_count oak_d_vio.cpp
-  // already reads for VioConfidenceInputs into the drift gate's
-  // starvation trigger (see kStarvationTrackedRatioThresh in the .cpp) --
-  // call this once per VIO frame from wherever that health block already
-  // lives. Deliberately a separate "push" method rather than adding
-  // parameters to getSmoothedCorrectedPose() itself: that method has six
-  // call sites across oak_d_vio.cpp, and not all of them are positioned
-  // to easily supply a fresh value on every call, whereas the health
-  // block already computes these once per frame in one place. Cheap
-  // (two atomic writes), safe to call even when online loop closure is
-  // otherwise idle.
-  void reportTrackingHealth(double tracked_ratio, int total_observed_count);
+  // Feeds the same tracked_ratio/tracked_count/total_observed_count
+  // oak_d_vio.cpp already reads for VioConfidenceInputs into the drift
+  // gate's starvation trigger (see kStarvationMinTrackedCount in the
+  // .cpp) -- call this once per VIO frame from wherever that health
+  // block already lives. Deliberately a separate "push" method rather
+  // than adding parameters to getSmoothedCorrectedPose() itself: that
+  // method has six call sites across oak_d_vio.cpp, and not all of them
+  // are positioned to easily supply a fresh value on every call, whereas
+  // the health block already computes these once per frame in one
+  // place. Cheap (three atomic writes), safe to call even when online
+  // loop closure is otherwise idle. tracked_ratio is still recorded (for
+  // the [ONLINE-LOOP] log line) even though the trigger itself now keys
+  // off tracked_count -- see kStarvationMinTrackedCount's comment for
+  // why the ratio stopped being a reliable trigger signal.
+  void reportTrackingHealth(double tracked_ratio, int tracked_count,
+                            int total_observed_count);
 
   // Same as getCorrectedTrajectory(), but paired with each keyframe's
   // timestamp -- needed for logging/analysis (matching timestamps up
@@ -398,7 +402,7 @@ class OnlineLoopClosure {
   mutable bool drift_held_ = false;
   // mutable: both written from checkDriftGate() (non-const) on a normal
   // residual-based trip, AND from getSmoothedCorrectedPose() (const) on
-  // a starvation trip -- see kStarvationTrackedRatioThresh in the .cpp.
+  // a starvation trip -- see kStarvationMinTrackedCount in the .cpp.
   mutable Sophus::SE3d held_pose_;
   mutable Sophus::SE3d held_anchor_raw_pose_;
   mutable int drift_gate_stable_count_ = 0;
@@ -502,7 +506,7 @@ class OnlineLoopClosure {
   mutable bool had_forced_release_ = false;
   static constexpr double kForcedReleaseCooldownS = 5.0;
 
-  // Starvation trigger state (see kStarvationTrackedRatioThresh in the
+  // Starvation trigger state (see kStarvationMinTrackedCount in the
   // .cpp for the full reasoning) -- a second way into drift_held_,
   // independent of checkDriftGate()'s residual check. Written by
   // reportTrackingHealth() (called once per VIO frame from
@@ -511,6 +515,7 @@ class OnlineLoopClosure {
   // arrives (e.g. during startup, before VIO has produced any health
   // reading at all).
   std::atomic<double> latest_reported_tracked_ratio_{1.0};
+  std::atomic<int> latest_reported_tracked_count_{999};
   std::atomic<int> latest_reported_total_observed_count_{999};
   // Wall-clock time the CURRENT continuous starvation stretch began --
   // reset to invalid (via starvation_active_) the moment the condition

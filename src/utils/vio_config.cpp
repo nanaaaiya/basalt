@@ -47,7 +47,18 @@ namespace basalt {
 VioConfig::VioConfig() {
   // optical_flow_type = "patch";
   optical_flow_type = "frame_to_frame";
-  optical_flow_detection_grid_size = 50;
+  // Was 50 (upstream default). At this rig's 640x480 resolution that's
+  // only ~108 grid cells, capping total_observed_count at roughly that
+  // regardless of how much real texture is available -- directly limits
+  // how many raw candidate corners exist for both the stereo-pairing and
+  // temporal-triangulation paths feeding tracked_ratio (see conversation:
+  // both paths already run below their own success-rate ceiling, so more
+  // raw candidates should translate close to linearly into more landmarks
+  // even without improving either path's percentage yield). Lowered to
+  // ~2x the cell density; see also num_points_cell in
+  // FrameToFrameOpticalFlow::addPoints()'s detectKeypoints() call, raised
+  // from 1 to 2 for the same reason.
+  optical_flow_detection_grid_size = 35;
   optical_flow_max_recovered_dist2 = 0.09f;
   optical_flow_pattern = 51;
   optical_flow_max_iterations = 5;

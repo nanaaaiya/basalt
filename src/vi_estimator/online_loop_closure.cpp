@@ -289,9 +289,23 @@ constexpr double kDriftGateMaxHoldSeconds = 15.0;
 // freeze. total_observed_count is checked separately from the ratio
 // because if raw detections collapse to near-zero (camera fully
 // covered), the ratio itself may not even be a meaningful signal.
-// Unvalidated starting guesses -- no live test of this trigger exists
-// yet.
-constexpr double kStarvationTrackedRatioThresh = 0.10;
+// Originally ratio-based (tracked_ratio < 0.10) -- switched to an
+// absolute tracked_count floor after live testing (run 20260921_135722)
+// showed increasing corner detection density
+// (optical_flow_detection_grid_size, num_points_cell -- see
+// vio_config.cpp) inflates total_observed_count (the ratio's
+// denominator) much faster than it inflates connected/tracked count
+// (the numerator): tracked_count improved in absolute terms (avg 16.5
+// -> 25.7) but the ratio got WORSE (diluted below 0.10 on 81% of
+// frames) because total_observed_count grew ~3.4x. A ratio implicitly
+// calibrated against one candidate-pool size breaks any time that size
+// changes; absolute tracked_count is what the optimizer actually has to
+// work with regardless of how many raw candidates were thrown into the
+// detection pool. Still an unvalidated starting guess (picked from this
+// run's own bucketed data: ~2-4 during clearly bad stretches, 20+
+// during clearly healthy ones) -- needs the same kind of live
+// confirmation the ratio threshold it replaces never got either.
+constexpr int kStarvationMinTrackedCount = 8;
 constexpr int kStarvationMinTotalObserved = 5;
 // Wall-clock, not a call count, matching drift_held_since_wall_'s own
 // reasoning: getSmoothedCorrectedPose() is called from several sites in
@@ -1275,7 +1289,7 @@ void OnlineLoopClosure::forceReleaseDriftHoldLocked() const {
   last_forced_release_wall_ = release_blend_start_wall_;
   had_forced_release_ = true;
   // Reset the starvation trigger's clock too (see
-  // kStarvationTrackedRatioThresh in the .cpp): without this, a release
+  // kStarvationMinTrackedCount in the .cpp): without this, a release
   // followed immediately by still-bad tracking would re-trip on the very
   // next check using the OLD, un-reset elapsed time, chaining what should
   // be separate hold episodes into what looks like one continuous freeze
@@ -1297,8 +1311,10 @@ bool OnlineLoopClosure::isRecentlyForceReleased() const {
 }
 
 void OnlineLoopClosure::reportTrackingHealth(double tracked_ratio,
+                                             int tracked_count,
                                              int total_observed_count) {
   latest_reported_tracked_ratio_ = tracked_ratio;
+  latest_reported_tracked_count_ = tracked_count;
   latest_reported_total_observed_count_ = total_observed_count;
 }
 
@@ -1371,17 +1387,17 @@ bool OnlineLoopClosure::getSmoothedCorrectedPose(
     }
   }
 
-  // Starvation trigger (see kStarvationTrackedRatioThresh in the .cpp) --
+  // Starvation trigger (see kStarvationMinTrackedCount in the .cpp) --
   // a second way into drift_held_, independent of checkDriftGate()'s
   // residual check, for when tracking is starved badly enough (camera
-  // covered, or the chronic-low-tracked_ratio failure mode) that few or
+  // covered, or the chronic-low-tracked-count failure mode) that few or
   // no new keyframes are being created at all, so that check may never
   // get a chance to run. At this point drift_held_ is definitely false
   // (either it always was, or the block above just released it), so this
   // only evaluates whether to trip a NEW hold, never conflicts with an
   // in-progress one.
   bool starved =
-      latest_reported_tracked_ratio_ < kStarvationTrackedRatioThresh ||
+      latest_reported_tracked_count_ < kStarvationMinTrackedCount ||
       latest_reported_total_observed_count_ < kStarvationMinTotalObserved;
   if (starved) {
     auto now = std::chrono::steady_clock::now();
@@ -1412,8 +1428,9 @@ bool OnlineLoopClosure::getSmoothedCorrectedPose(
       drift_held_since_wall_ = now;
       drift_gate_events.try_push(DriftGateEvent::kTripped);
       std::cout << "[ONLINE-LOOP] DRIFT GATE TRIPPED (starvation: "
-                   "tracked_ratio="
-                << latest_reported_tracked_ratio_
+                   "tracked_count="
+                << latest_reported_tracked_count_
+                << " tracked_ratio=" << latest_reported_tracked_ratio_
                 << " total_observed_count="
                 << latest_reported_total_observed_count_
                 << ", starved for " << starved_s

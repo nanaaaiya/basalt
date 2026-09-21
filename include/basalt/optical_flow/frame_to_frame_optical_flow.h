@@ -85,6 +85,10 @@ class FrameToFrameOpticalFlow : public OpticalFlowBase {
       Sophus::SE3d T_i_j = calib.T_i_c[0].inverse() * calib.T_i_c[1];
       computeEssential(T_i_j, Ed);
       E = Ed.cast<Scalar>();
+
+      // See trackNewPointsStereoWithDepthSeeds() -- maps a point in cam0's
+      // frame to cam1's frame for depth-hypothesis reprojection seeding.
+      T_c1_c0_ = (this->calib.T_i_c[1].inverse() * this->calib.T_i_c[0]);
     }
 
     processing_thread.reset(
@@ -240,6 +244,99 @@ class FrameToFrameOpticalFlow : public OpticalFlowBase {
     transform_map_2.insert(result.begin(), result.end());
   }
 
+  // Stereo-specific seeding for newly-detected cam0 corners -- unlike
+  // trackPoints() above (correct for frame-to-frame TEMPORAL tracking,
+  // where near-zero motion between consecutive frames makes "start the
+  // search at the same pixel" a good initial guess), a same-instant
+  // cam0->cam1 pair can have substantial pixel disparity even for a
+  // perfectly static scene, and KLT's small per-level search window can't
+  // recover a correspondence that starts that far from the true target.
+  // Measured live (see conversation): the naive same-pixel seed (i.e.
+  // calling trackPoints() here the same way as for temporal tracking)
+  // succeeded on only ~1.4% of newly-detected corners, vs. 74.7% of the
+  // ones that DID get a seed close enough to converge -- the seed, not
+  // the tracker itself, was the bottleneck. Tries a small set of
+  // representative scene depths (covering this rig's ~0.3-6m intended
+  // operating range), reprojects each cam0 ray into cam1 using the
+  // calibrated extrinsics to get a much better starting pixel, and keeps
+  // the first depth hypothesis that produces a forward-backward-
+  // consistent track -- same acceptance criteria as trackPoints() above,
+  // just a smarter initial guess.
+  void trackNewPointsStereoWithDepthSeeds(
+      const basalt::ManagedImagePyr<uint16_t>& pyr0,
+      const basalt::ManagedImagePyr<uint16_t>& pyr1,
+      const Eigen::aligned_map<KeypointId, Eigen::AffineCompact2f>&
+          new_poses0,
+      Eigen::aligned_map<KeypointId, Eigen::AffineCompact2f>& new_poses1)
+      const {
+    static const std::array<Scalar, 4> kSeedDepthsM = {
+        Scalar(0.5), Scalar(1.0), Scalar(2.0), Scalar(4.0)};
+
+    std::vector<KeypointId> ids;
+    Eigen::aligned_vector<Eigen::AffineCompact2f> init_vec;
+    ids.reserve(new_poses0.size());
+    init_vec.reserve(new_poses0.size());
+    for (const auto& kv : new_poses0) {
+      ids.push_back(kv.first);
+      init_vec.push_back(kv.second);
+    }
+
+    tbb::concurrent_unordered_map<
+        KeypointId, Eigen::AffineCompact2f, std::hash<KeypointId>,
+        std::equal_to<KeypointId>,
+        Eigen::aligned_allocator<
+            std::pair<const KeypointId, Eigen::AffineCompact2f>>>
+        result;
+
+    auto compute_func = [&](const tbb::blocked_range<size_t>& range) {
+      for (size_t r = range.begin(); r != range.end(); ++r) {
+        const KeypointId id = ids[r];
+        const Eigen::AffineCompact2f& transform_1 = init_vec[r];
+
+        Vector4 ray0;
+        if (!calib.intrinsics[0].unproject(transform_1.translation(), ray0))
+          continue;
+        Vector3 dir0 = ray0.template head<3>().normalized();
+
+        for (Scalar depth : kSeedDepthsM) {
+          Vector3 pt_c1 = T_c1_c0_ * (dir0 * depth);
+
+          Vector4 pt_c1_h;
+          pt_c1_h.template head<3>() = pt_c1;
+          pt_c1_h[3] = Scalar(1);
+
+          Vector2 seed_px;
+          if (!calib.intrinsics[1].project(pt_c1_h, seed_px)) continue;
+
+          Eigen::AffineCompact2f transform_2;
+          transform_2.setIdentity();
+          transform_2.translation() = seed_px;
+
+          bool valid = trackPoint(pyr0, pyr1, transform_1, transform_2);
+          if (!valid) continue;
+
+          Eigen::AffineCompact2f transform_1_recovered = transform_2;
+          valid = trackPoint(pyr1, pyr0, transform_2, transform_1_recovered);
+          if (!valid) continue;
+
+          Scalar dist2 = (transform_1.translation() -
+                          transform_1_recovered.translation())
+                             .squaredNorm();
+          if (dist2 < config.optical_flow_max_recovered_dist2) {
+            result[id] = transform_2;
+            break;  // this depth hypothesis worked, stop trying others
+          }
+        }
+      }
+    };
+
+    tbb::blocked_range<size_t> range(0, ids.size());
+    tbb::parallel_for(range, compute_func);
+
+    new_poses1.clear();
+    new_poses1.insert(result.begin(), result.end());
+  }
+
   inline bool trackPoint(const basalt::ManagedImagePyr<uint16_t>& old_pyr,
                          const basalt::ManagedImagePyr<uint16_t>& pyr,
                          const Eigen::AffineCompact2f& old_transform,
@@ -317,8 +414,12 @@ class FrameToFrameOpticalFlow : public OpticalFlowBase {
 
     KeypointsData kd;
 
+    // num_points_cell raised 1 -> 2: see
+    // config.optical_flow_detection_grid_size's comment (vio_config.cpp)
+    // for why more raw candidate corners should help tracked_ratio even
+    // without improving either downstream matching path's success rate.
     detectKeypoints(pyramid->at(0).lvl(0), kd,
-                    config.optical_flow_detection_grid_size, 1, pts0);
+                    config.optical_flow_detection_grid_size, 2, pts0);
 
     Eigen::aligned_map<KeypointId, Eigen::AffineCompact2f> new_poses0,
         new_poses1;
@@ -334,12 +435,23 @@ class FrameToFrameOpticalFlow : public OpticalFlowBase {
       last_keypoint_id++;
     }
 
+    // Diagnostic funnel for newly-detected cam0 corners specifically (not
+    // points already being carried forward from earlier frames): how many
+    // survive the KLT-based cam0->cam1 stereo track (before filterPoints()'s
+    // epipolar check below removes more) -- see diag_new_ids_this_frame_'s
+    // use in filterPoints() for the rest of the funnel.
+    diag_new_ids_this_frame_.clear();
+    for (const auto& kv : new_poses0) diag_new_ids_this_frame_.push_back(kv.first);
+    diag_new_klt_stereo_ok_ = 0;
+
     if (calib.intrinsics.size() > 1) {
-      trackPoints(pyramid->at(0), pyramid->at(1), new_poses0, new_poses1);
+      trackNewPointsStereoWithDepthSeeds(pyramid->at(0), pyramid->at(1),
+                                        new_poses0, new_poses1);
 
       for (const auto& kv : new_poses1) {
         transforms->observations.at(1).emplace(kv);
       }
+      diag_new_klt_stereo_ok_ = new_poses1.size();
     }
   }
 
@@ -383,6 +495,25 @@ class FrameToFrameOpticalFlow : public OpticalFlowBase {
     for (int id : lm_to_remove) {
       transforms->observations.at(1).erase(id);
     }
+
+    // Completes the funnel started in addPoints(): of the corners newly
+    // detected THIS frame, how many still have a cam1 observation after
+    // this epipolar check -- distinguishes "KLT itself couldn't find a
+    // stereo match" (diag_new_klt_stereo_ok_ already low) from "KLT found
+    // a match but epipolar verification rejected it" (drops between
+    // diag_new_klt_stereo_ok_ and this count), the two different failure
+    // modes feeding the same downstream landmark-starvation symptom (see
+    // [LANDMARK-DIAG] in sqrt_keypoint_vio.cpp).
+    if (!diag_new_ids_this_frame_.empty()) {
+      int survived = 0;
+      for (KeypointId id : diag_new_ids_this_frame_) {
+        if (transforms->observations.at(1).count(id)) survived++;
+      }
+      std::cout << "[OPTFLOW-STEREO-DIAG] new_detected="
+                << diag_new_ids_this_frame_.size()
+                << " klt_stereo_ok=" << diag_new_klt_stereo_ok_
+                << " epipolar_survived=" << survived << std::endl;
+    }
   }
 
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
@@ -393,6 +524,11 @@ class FrameToFrameOpticalFlow : public OpticalFlowBase {
 
   KeypointId last_keypoint_id;
 
+  // See addPoints()/filterPoints() for how these track the newly-detected-
+  // corners stereo-pairing funnel.
+  std::vector<KeypointId> diag_new_ids_this_frame_;
+  size_t diag_new_klt_stereo_ok_ = 0;
+
   VioConfig config;
   basalt::Calibration<Scalar> calib;
 
@@ -401,6 +537,8 @@ class FrameToFrameOpticalFlow : public OpticalFlowBase {
       pyramid;
 
   Matrix4 E;
+  // See trackNewPointsStereoWithDepthSeeds().
+  Sophus::SE3<Scalar> T_c1_c0_;
 
   std::shared_ptr<std::thread> processing_thread;
 };
