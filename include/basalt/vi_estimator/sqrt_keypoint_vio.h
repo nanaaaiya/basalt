@@ -242,6 +242,7 @@ class SqrtKeypointVioEstimator : public VioEstimatorBase,
   }
 
   double getLatestGyroNorm() const override { return latest_gyro_norm; }
+  double getLatestAccelNorm() const override { return latest_accel_norm; }
   Eigen::Vector3d getLatestGyro() const {
     std::lock_guard<std::mutex> lock(latest_gyro_mutex);
     return latest_gyro;
@@ -304,6 +305,12 @@ class SqrtKeypointVioEstimator : public VioEstimatorBase,
   std::atomic<int> latest_tracked_count{0};
   std::atomic<int> latest_total_observed_count{0};
   std::atomic<double> latest_gyro_norm{0.0};
+  // Raw accelerometer magnitude (specific force, not yet gravity- or
+  // bias-corrected) at the timestamp of the most recently consumed IMU
+  // sample -- the linear-motion counterpart to latest_gyro_norm, added
+  // for the disagreement detector's acceleration gate (see
+  // kImuVisionDisagreementMaxExcessAccelMps2 below).
+  std::atomic<double> latest_accel_norm{0.0};
   mutable std::mutex latest_gyro_mutex;
   Eigen::Vector3d latest_gyro{Eigen::Vector3d::Zero()};
 
@@ -354,6 +361,34 @@ class SqrtKeypointVioEstimator : public VioEstimatorBase,
   // excluded without narrowing what counts as "the camera is basically
   // not rotating" for the corruption case itself.
   static constexpr double kImuVisionDisagreementMaxGyroNormRadS = 0.5;
+  // Linear-acceleration counterpart to the gyro gate above -- added after
+  // the gyro gate alone only partly fixed a second real aggressive-motion
+  // test (74 fires/14 episodes -> 58/9, vs. 41/11 -> 5/1 for the first):
+  // checking gyro_norm at each of that test's remaining false triggers
+  // showed it was actually LOW there (0.05-0.27 rad/s), meaning that
+  // test's motion was translation-heavy rather than purely rotational --
+  // a rotation-rate gate alone can't see that. Compares the raw
+  // accelerometer magnitude (specific force, not yet bias-corrected --
+  // fine for a coarse gate, the bias is ~0.03 m/s^2 per the [VIO-BIAS]
+  // telemetry, negligible next to what this is meant to catch) against
+  // gravity's magnitude; a large deviation means real linear acceleration
+  // is happening, which -- like fast rotation -- can stress camera-IMU
+  // calibration enough to produce the same kind of disagreement a genuine
+  // corruption does. Starting value, NOT validated the way the gyro
+  // threshold was: retroactively replayed against four real post-
+  // deployment test captures (2307 frames total) once accel telemetry
+  // existed, and the pattern this gate targets (low rotation, high
+  // linear acceleration, high disagreement) occurred ZERO times. What
+  // looked like a translation-caused false-positive residual in the
+  // second aggressive test instead correlated with erratic tracked_count
+  // (0, 0, 10, 0, 0, 0, 0, 30, 0, 19 -- landmark-database instability
+  // after a violent disruption, not instantaneous kinematics) -- a
+  // mechanism this gate was never meant to address and arguably
+  // shouldn't suppress anyway, since the pose really is unreliable then.
+  // Net effect so far: a harmless, currently-inert safeguard rather than
+  // a confirmed fix. Leave as-is unless/until a real translation-heavy,
+  // low-rotation disturbance is actually captured to test it against.
+  static constexpr double kImuVisionDisagreementMaxExcessAccelMps2 = 3.0;
   int imu_vision_disagreement_count_ = 0;
   std::atomic<bool> imu_vision_disagreement{false};
   std::atomic<double> latest_imu_vision_disagreement_m{0.0};

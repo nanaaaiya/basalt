@@ -130,6 +130,7 @@ class VioEstimatorBase {
   virtual int getLatestTrackedCount() const { return 0; }
   virtual int getLatestTotalObservedCount() const { return 0; }
   virtual double getLatestGyroNorm() const { return 0.0; }
+  virtual double getLatestAccelNorm() const { return 0.0; }
 
   // Current bias estimate the optimizer is carrying -- exposed so a
   // runaway raw trajectory can be diagnosed live (is the bias sitting at

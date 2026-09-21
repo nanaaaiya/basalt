@@ -549,6 +549,7 @@ int main(int argc, char** argv) {
                             ? std::to_string(*health_in.triangulated_points)
                             : "n/a")
                     << " gyro_norm=" << health_in.gyro_norm
+                    << " accel_norm=" << vio->getLatestAccelNorm()
                     << " imu_vision_disagreement_m="
                     << vio->getLatestImuVisionDisagreementM() << std::endl;
         }

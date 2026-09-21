@@ -352,6 +352,7 @@ SqrtKeypointVioEstimator<Scalar_>::popFromImuDataQueue() {
   // consumed, which is what a live confidence signal wants.
   if (data) {
     latest_gyro_norm = data->gyro.norm();
+    latest_accel_norm = data->accel.norm();
     std::lock_guard<std::mutex> lock(latest_gyro_mutex);
     latest_gyro = data->gyro.template cast<double>();
   }
@@ -582,13 +583,18 @@ bool SqrtKeypointVioEstimator<Scalar_>::measure(
         (optimized_translation - imu_only_translation).norm());
     latest_imu_vision_disagreement_m = disagreement_m;
 
-    if (latest_gyro_norm > kImuVisionDisagreementMaxGyroNormRadS) {
-      // Genuinely fast rotation can itself produce this much position
-      // disagreement (camera-IMU sync/extrinsics are never perfect), so
-      // this frame's reading isn't usable evidence either way -- skip it
-      // rather than counting it as agreement (reset) or disagreement
-      // (increment), so a real corruption event that happens to overlap
-      // one high-gyro instant doesn't lose its persistence count.
+    double excess_accel_mps2 =
+        std::abs(double(latest_accel_norm) - double(g.norm()));
+
+    if (latest_gyro_norm > kImuVisionDisagreementMaxGyroNormRadS ||
+        excess_accel_mps2 > kImuVisionDisagreementMaxExcessAccelMps2) {
+      // Genuinely fast rotation OR real linear acceleration can itself
+      // produce this much position disagreement (camera-IMU sync/
+      // extrinsics are never perfect), so this frame's reading isn't
+      // usable evidence either way -- skip it rather than counting it as
+      // agreement (reset) or disagreement (increment), so a real
+      // corruption event that happens to overlap one such instant doesn't
+      // lose its persistence count.
     } else if (disagreement_m > kImuVisionDisagreementThreshM) {
       imu_vision_disagreement_count_++;
     } else {
