@@ -4,7 +4,7 @@
 
 TEST(VioHealthTestSuite, NominalInputsScoreHigh) {
   basalt::VioConfidenceInputs in;
-  in.tracked_ratio = 0.95;
+  in.tracked_count = 50;
   in.triangulated_points = 40;
   in.numerically_degraded = false;
   in.gyro_norm = 0.05;
@@ -19,7 +19,7 @@ TEST(VioHealthTestSuite, MissingTriangulatedPointsIsIgnoredNotPenalized) {
   // No loop-closure module running -> nullopt. Should not be treated as
   // "zero points" (which would wrongly penalize a pure-VIO-only setup).
   basalt::VioConfidenceInputs in;
-  in.tracked_ratio = 0.95;
+  in.tracked_count = 50;
   in.triangulated_points = std::nullopt;
 
   auto out = basalt::computeVioConfidence(in);
@@ -30,7 +30,7 @@ TEST(VioHealthTestSuite, MissingTriangulatedPointsIsIgnoredNotPenalized) {
 
 TEST(VioHealthTestSuite, NumericalDegradationTrumpsEverythingElse) {
   basalt::VioConfidenceInputs in;
-  in.tracked_ratio = 0.99;    // otherwise perfect
+  in.tracked_count = 50;    // otherwise perfect
   in.triangulated_points = 100;
   in.numerically_degraded = true;
 
@@ -40,22 +40,22 @@ TEST(VioHealthTestSuite, NumericalDegradationTrumpsEverythingElse) {
   EXPECT_EQ(out.primary_reason, "numerically_degraded");
 }
 
-TEST(VioHealthTestSuite, LowTrackedRatioReportedBeforeLowTriangulation) {
+TEST(VioHealthTestSuite, LowTrackedCountReportedBeforeLowTriangulation) {
   // Both inputs are weak -- the most severe single reason should win,
   // not an average of the two.
   basalt::VioConfidenceInputs in;
-  in.tracked_ratio = 0.3;         // below default 0.7 threshold
+  in.tracked_count = 3;         // below default 8 threshold
   in.triangulated_points = 5;     // also below default 20 threshold
   in.numerically_degraded = false;
 
   auto out = basalt::computeVioConfidence(in);
 
-  EXPECT_EQ(out.primary_reason, "low_tracked_keypoint_ratio");
+  EXPECT_EQ(out.primary_reason, "low_tracked_keypoint_count");
 }
 
 TEST(VioHealthTestSuite, LowTriangulationYieldAloneIsReported) {
   basalt::VioConfidenceInputs in;
-  in.tracked_ratio = 0.95;        // fine on its own
+  in.tracked_count = 50;        // fine on its own
   in.triangulated_points = 8;     // below default 20 threshold -- matches
                                   // the stereo-yield-collapse bug this
                                   // signal is meant to help surface
@@ -69,11 +69,11 @@ TEST(VioHealthTestSuite, LowTriangulationYieldAloneIsReported) {
 
 TEST(VioHealthTestSuite, ThresholdsAreConfigurableNotHardcoded) {
   basalt::VioConfidenceInputs in;
-  in.tracked_ratio = 0.5;  // below the default 0.7, but...
+  in.tracked_count = 5;  // below the default 8, but...
   in.triangulated_points = 25;
 
   basalt::VioConfidenceConfig cfg;
-  cfg.min_tracked_ratio = 0.4;  // ...above this looser threshold
+  cfg.min_tracked_count = 4;  // ...above this looser threshold
   cfg.min_triangulated_points = 25;
 
   auto out = basalt::computeVioConfidence(in, cfg);
@@ -83,7 +83,7 @@ TEST(VioHealthTestSuite, ThresholdsAreConfigurableNotHardcoded) {
 
 TEST(VioHealthTestSuite, RecentForcedDriftReleaseReportedEvenIfOtherwiseNominal) {
   basalt::VioConfidenceInputs in;
-  in.tracked_ratio = 0.95;       // otherwise perfect
+  in.tracked_count = 50;       // otherwise perfect
   in.triangulated_points = 40;
   in.recently_forced_drift_release = true;
 
@@ -93,11 +93,11 @@ TEST(VioHealthTestSuite, RecentForcedDriftReleaseReportedEvenIfOtherwiseNominal)
   EXPECT_LT(out.score, 1.0);
 }
 
-TEST(VioHealthTestSuite, RecentForcedDriftReleaseReportedBeforeLowTrackedRatio) {
+TEST(VioHealthTestSuite, RecentForcedDriftReleaseReportedBeforeLowTrackedCount) {
   // Both weak -- the more specific, time-bounded signal (we KNOW this
   // exact pose was never confirmed) should win over the inferred one.
   basalt::VioConfidenceInputs in;
-  in.tracked_ratio = 0.3;  // also below default 0.7 threshold
+  in.tracked_count = 3;  // also below default 8 threshold
   in.recently_forced_drift_release = true;
 
   auto out = basalt::computeVioConfidence(in);
@@ -107,7 +107,7 @@ TEST(VioHealthTestSuite, RecentForcedDriftReleaseReportedBeforeLowTrackedRatio) 
 
 TEST(VioHealthTestSuite, NumericalDegradationTrumpsForcedDriftReleaseToo) {
   basalt::VioConfidenceInputs in;
-  in.tracked_ratio = 0.99;
+  in.tracked_count = 50;
   in.recently_forced_drift_release = true;
   in.numerically_degraded = true;
 
@@ -119,7 +119,7 @@ TEST(VioHealthTestSuite, NumericalDegradationTrumpsForcedDriftReleaseToo) {
 
 TEST(VioHealthTestSuite, ImuVisionDisagreementReportedEvenIfOtherwiseNominal) {
   basalt::VioConfidenceInputs in;
-  in.tracked_ratio = 0.95;  // otherwise perfect
+  in.tracked_count = 50;  // otherwise perfect
   in.triangulated_points = 40;
   in.imu_vision_disagreement = true;
 
@@ -129,13 +129,13 @@ TEST(VioHealthTestSuite, ImuVisionDisagreementReportedEvenIfOtherwiseNominal) {
   EXPECT_LT(out.score, 1.0);
 }
 
-TEST(VioHealthTestSuite, ImuVisionDisagreementReportedBeforeLowTrackedRatio) {
+TEST(VioHealthTestSuite, ImuVisionDisagreementReportedBeforeLowTrackedCount) {
   // Both weak -- the dynamic-scene-violation signal should win over the
   // generic tracking-quality one, since it's the more specific/actionable
-  // explanation (and tracked_ratio alone can look fine even when a large,
+  // explanation (and tracked_count alone can look fine even when a large,
   // coherently-moving object like water dominates the tracked points).
   basalt::VioConfidenceInputs in;
-  in.tracked_ratio = 0.3;  // also below default 0.7 threshold
+  in.tracked_count = 3;  // also below default 8 threshold
   in.imu_vision_disagreement = true;
 
   auto out = basalt::computeVioConfidence(in);
@@ -145,7 +145,7 @@ TEST(VioHealthTestSuite, ImuVisionDisagreementReportedBeforeLowTrackedRatio) {
 
 TEST(VioHealthTestSuite, NumericalDegradationTrumpsImuVisionDisagreementToo) {
   basalt::VioConfidenceInputs in;
-  in.tracked_ratio = 0.99;
+  in.tracked_count = 50;
   in.imu_vision_disagreement = true;
   in.numerically_degraded = true;
 
@@ -160,7 +160,7 @@ TEST(VioHealthTestSuite, GyroNormIsCarriedThroughButDoesNotAffectScoreYet) {
   // exists to calibrate a real threshold -- a high rotation rate alone
   // must not currently change the score.
   basalt::VioConfidenceInputs in;
-  in.tracked_ratio = 0.95;
+  in.tracked_count = 50;
   in.triangulated_points = 40;
   in.gyro_norm = 12.0;  // deliberately extreme
 

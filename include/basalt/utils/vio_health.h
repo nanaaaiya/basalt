@@ -9,10 +9,19 @@ namespace basalt {
 // something the pipeline already computes somewhere -- this struct's only
 // job is to collect them in one place; see each field's source accessor.
 struct VioConfidenceInputs {
-  // Fraction of the current frame's cam0 observations that matched an
-  // existing landmark, in [0, 1].
-  // Source: SqrtKeypointVioEstimator::getLatestTrackedRatio().
-  double tracked_ratio = 1.0;
+  // Absolute count of the current frame's cam0 observations that matched
+  // an existing landmark. Deliberately NOT a ratio (tracked_count /
+  // total_observed_count): real Pi5/OAK-D Lite runs showed tracked_ratio
+  // chronically sitting in the 0.0-0.2 range even on well-tracked frames
+  // (see VioConfig::vio_new_kf_keypoints_thresh's comment in
+  // vio_config.cpp, and the starvation-gate history in
+  // online_loop_closure.cpp), so a ratio-based threshold here saturated
+  // this signal near its floor for nearly an entire live test (run
+  // pi5-63f519dd, 2026-09-22: confidence stuck at 0.10-0.20 for the full
+  // ~111s run, including well-tracked stretches) instead of discriminating
+  // good stretches from bad ones.
+  // Source: SqrtKeypointVioEstimator::getLatestTrackedCount().
+  int tracked_count = 999;
 
   // Stereo-triangulated point count from the most recently processed
   // keyframe, or nullopt if no loop-closure module is running at all.
@@ -54,12 +63,18 @@ struct VioConfidenceInputs {
 };
 
 struct VioConfidenceConfig {
-  // Deliberately the SAME threshold VioConfig::vio_new_kf_keypoints_thresh
-  // already uses for keyframe-insertion decisions (default 0.7f) -- not
-  // an independently re-tuned number. Below this, the estimator is
-  // already deciding "not enough of this frame is trustworthy," which is
-  // exactly what a tracking-quality signal wants to know too.
-  double min_tracked_ratio = 0.7;
+  // Was a ratio threshold mirroring VioConfig::vio_new_kf_keypoints_thresh
+  // -- but that mirror had already gone stale (that config field was
+  // separately lowered 0.7 -> 0.3 once real hardware showed tracked_ratio
+  // chronically sitting in 0.0-0.2, this comment's old value was never
+  // updated to match), and even 0.3 wouldn't have fixed it: this rig's
+  // real tracked_ratio *mean* sits below that too. Switched to the same
+  // absolute-count threshold already validated for the same purpose on
+  // the same rig -- see kBiasFreezeTrackedCountThresh in
+  // sqrt_keypoint_vio.h and the starvation-gate history in
+  // online_loop_closure.cpp (also originally ratio-based, also switched
+  // to absolute count after density increases diluted the ratio).
+  int min_tracked_count = 8;
 
   // Mirrors OnlineLoopClosure's kMinTriangulatedPointsForDatabase (20,
   // lowered from 25 after real low-texture/distant-background sessions

@@ -11,7 +11,7 @@ VioConfidence computeVioConfidence(const VioConfidenceInputs& in,
   }
 
   // Checked second, ahead of every tracking-quality signal below: unlike
-  // tracked_ratio/triangulated_points (which only catch a problem when
+  // tracked_count/triangulated_points (which only catch a problem when
   // bad points are a MINORITY of what's tracked), this fires precisely
   // when vision's overall implied motion disagrees with an independent
   // sensor -- the case a dynamic scene (flowing water, a close moving
@@ -21,7 +21,7 @@ VioConfidence computeVioConfidence(const VioConfidenceInputs& in,
     return {0.1, "imu_vision_disagreement"};
   }
 
-  // Checked ahead of tracked_ratio: this is a specific, time-bounded "we
+  // Checked ahead of tracked_count: this is a specific, time-bounded "we
   // know this exact pose was never confirmed" signal, which is more
   // actionable for a consumer than an inferred low-tracking-quality
   // reading that may or may not be the reason for that specific pose.
@@ -29,8 +29,8 @@ VioConfidence computeVioConfidence(const VioConfidenceInputs& in,
     return {0.1, "recent_forced_drift_release"};
   }
 
-  if (in.tracked_ratio < cfg.min_tracked_ratio) {
-    return {0.2, "low_tracked_keypoint_ratio"};
+  if (in.tracked_count < cfg.min_tracked_count) {
+    return {0.2, "low_tracked_keypoint_count"};
   }
 
   if (in.triangulated_points.has_value() &&

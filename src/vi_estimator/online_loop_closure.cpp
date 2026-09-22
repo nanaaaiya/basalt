@@ -281,14 +281,20 @@ constexpr double kDriftGateMaxHoldSeconds = 15.0;
 // release-blend behavior for free -- this is a second way to TRIP, not
 // a parallel hold mechanism.
 //
-// Deliberately much stricter than VioConfidenceConfig::min_tracked_ratio
-// (0.7, used for the general "degraded" confidence label): holding the
-// live pose has its own cost (stale data), so this is reserved for
-// genuinely critical starvation, not ordinary environment-driven
-// tracking noise the confidence system already tolerates without a
-// freeze. total_observed_count is checked separately from the ratio
-// because if raw detections collapse to near-zero (camera fully
-// covered), the ratio itself may not even be a meaningful signal.
+// Deliberately much stricter than VioConfidenceConfig::min_tracked_count
+// (8, used for the general "degraded" confidence label, and -- after
+// 2026-09-22 -- the SAME value: VioConfidenceConfig's own threshold was
+// ratio-based until real data showed it saturating the confidence signal
+// near its floor for an entire live run, and was switched to reuse this
+// starvation trigger's already-validated absolute-count threshold rather
+// than re-deriving a new one). Even though the two now share a value,
+// they're checked for different purposes: holding the live pose (this
+// trigger) has its own cost (stale data), so it's reserved for genuinely
+// critical starvation, while the confidence label is meant to fire at
+// the same point tracking quality first becomes suspect. total_observed_
+// count is checked separately from tracked_count because if raw
+// detections collapse to near-zero (camera fully covered), tracked_count
+// alone may not even be a meaningful signal.
 // Originally ratio-based (tracked_ratio < 0.10) -- switched to an
 // absolute tracked_count floor after live testing (run 20260921_135722)
 // showed increasing corner detection density

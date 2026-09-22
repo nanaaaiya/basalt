@@ -530,8 +530,17 @@ int main(int argc, char** argv) {
       // flight). Logged locally regardless of whether a dashboard is
       // connected, so this also works fully offline on the bench.
       {
+        // Raw counts and ratio, computed up front: tracked_count feeds
+        // computeVioConfidence() below, tracked_ratio is kept only for
+        // reportTrackingHealth()/logging/dashboard (see
+        // VioConfidenceInputs::tracked_count's comment for why the
+        // confidence signal itself moved off the ratio).
+        int tracked_count = vio->getLatestTrackedCount();
+        int total_observed_count = vio->getLatestTotalObservedCount();
+        double tracked_ratio = vio->getLatestTrackedRatio();
+
         basalt::VioConfidenceInputs health_in;
-        health_in.tracked_ratio = vio->getLatestTrackedRatio();
+        health_in.tracked_count = tracked_count;
         health_in.numerically_degraded = vio->isDegraded();
         health_in.gyro_norm = vio->getLatestGyroNorm();
         health_in.imu_vision_disagreement = vio->isImuVisionDisagreement();
@@ -544,14 +553,6 @@ int main(int argc, char** argv) {
 
         basalt::VioConfidence health = basalt::computeVioConfidence(health_in);
 
-        // Raw counts behind tracked_ratio -- see
-        // getLatestTrackedCount()/getLatestTotalObservedCount()'s comment:
-        // separates "few features exist this frame" (detection/texture/
-        // exposure) from "plenty exist but few matched" (tracking/motion
-        // blur), which the ratio alone can't distinguish.
-        int tracked_count = vio->getLatestTrackedCount();
-        int total_observed_count = vio->getLatestTotalObservedCount();
-
         // Feeds the drift gate's starvation trigger (see
         // kStarvationMinTrackedCount in online_loop_closure.cpp) --
         // lets it hold the live pose when tracking is starved badly
@@ -560,14 +561,14 @@ int main(int argc, char** argv) {
         // miss entirely.
         if (online_loop_closure) {
           online_loop_closure->reportTrackingHealth(
-              health_in.tracked_ratio, tracked_count, total_observed_count);
+              tracked_ratio, tracked_count, total_observed_count);
         }
 
         if (health.primary_reason != "nominal") {
           std::cout << "[VIO-HEALTH] t_ns=" << t_ns
                     << " confidence=" << health.score
                     << " reason=" << health.primary_reason
-                    << " tracked_ratio=" << health_in.tracked_ratio
+                    << " tracked_ratio=" << tracked_ratio
                     << " tracked_count=" << tracked_count
                     << " total_observed_count=" << total_observed_count
                     << " triangulated_points="
@@ -606,7 +607,7 @@ int main(int argc, char** argv) {
           dashboard_client->sendHealth(
               t_ns, health.score, health.primary_reason,
               health_in.numerically_degraded, health_in.gyro_norm,
-              health_in.tracked_ratio, health_in.triangulated_points,
+              tracked_ratio, health_in.triangulated_points,
               tracked_count, total_observed_count);
         }
       }
