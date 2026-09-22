@@ -35,6 +35,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #pragma once
 
 #include <string>
+#include <vector>
 
 namespace basalt {
 
@@ -53,6 +54,17 @@ struct VioConfig {
   int optical_flow_levels;
   float optical_flow_epipolar_error;
   int optical_flow_skip_frames;
+  // Depth hypotheses (meters) tried when seeding the cam0->cam1 stereo
+  // KLT track for newly-detected corners -- see
+  // trackNewPointsStereoWithDepthSeeds() in frame_to_frame_optical_flow.h.
+  // Configurable (rather than a fixed in-code constant) specifically so
+  // a compute-constrained platform (e.g. a Pi5, vs. a laptop) can run
+  // fewer hypotheses without changing the default for anyone else --
+  // see conversation, 2026-09-21: a Pi5 live test showed erratic
+  // per-frame tracked-point counts consistent with the combined compute
+  // cost of a wide depth-hypothesis set plus higher corner density
+  // overloading its 4 cores, unlike the laptop this was validated on.
+  std::vector<double> optical_flow_stereo_seed_depths_m;
 
   LinearizationType vio_linearization_type;
   bool vio_sqrt_marg;

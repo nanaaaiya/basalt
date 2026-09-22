@@ -40,6 +40,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #include <cereal/archives/json.hpp>
 #include <cereal/cereal.hpp>
+#include <cereal/types/vector.hpp>
 #include <magic_enum/magic_enum.hpp>
 
 namespace basalt {
@@ -65,6 +66,10 @@ VioConfig::VioConfig() {
   optical_flow_levels = 3;
   optical_flow_epipolar_error = 0.005;
   optical_flow_skip_frames = 1;
+  // Default matches what's validated on the laptop (see
+  // trackNewPointsStereoWithDepthSeeds()'s comment) -- override via
+  // --stereo-seed-depths on compute-constrained platforms.
+  optical_flow_stereo_seed_depths_m = {0.3, 0.6, 1.0, 1.5, 2.5, 4.0, 6.0};
 
   vio_linearization_type = LinearizationType::ABS_QR;
   vio_sqrt_marg = true;
@@ -205,6 +210,7 @@ void serialize(Archive& ar, basalt::VioConfig& config) {
   ar(CEREAL_NVP(config.optical_flow_epipolar_error));
   ar(CEREAL_NVP(config.optical_flow_levels));
   ar(CEREAL_NVP(config.optical_flow_skip_frames));
+  ar(CEREAL_NVP(config.optical_flow_stereo_seed_depths_m));
 
   ar(CEREAL_NVP(config.vio_linearization_type));
   ar(CEREAL_NVP(config.vio_sqrt_marg));

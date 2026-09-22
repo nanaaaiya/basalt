@@ -116,6 +116,8 @@ SqrtKeypointVioEstimator<Scalar_>::SqrtKeypointVioEstimator(
 
   gyro_bias_sqrt_weight = calib.gyro_bias_std.array().inverse();
   accel_bias_sqrt_weight = calib.accel_bias_std.array().inverse();
+  nominal_gyro_bias_sqrt_weight = gyro_bias_sqrt_weight;
+  nominal_accel_bias_sqrt_weight = accel_bias_sqrt_weight;
 
   max_states = config.vio_max_states;
   max_kfs = config.vio_max_kfs;
@@ -159,7 +161,7 @@ void SqrtKeypointVioEstimator<Scalar_>::initialize(const Eigen::Vector3d& bg_,
     OpticalFlowResult::Ptr prev_frame, curr_frame;
     typename IntegratedImuMeasurement<Scalar>::Ptr meas;
 
-    const Vec3 accel_cov =
+    const Vec3 nominal_accel_cov =
         calib.dicrete_time_accel_noise_std().array().square();
     const Vec3 gyro_cov = calib.dicrete_time_gyro_noise_std().array().square();
 
@@ -285,6 +287,32 @@ void SqrtKeypointVioEstimator<Scalar_>::initialize(const Eigen::Vector3d& bg_,
         BASALT_ASSERT_MSG(prev_frame->t_ns < curr_frame->t_ns,
                           "duplicate frame timestamps?! zero time delta leads "
                           "to invalid IMU integration.");
+
+        // Position-propagation suppression during a vision blackout (see
+        // bias_freeze_active_'s comment for the failure mode this
+        // complements): orientation drifts roughly linearly from gyro
+        // integration, but double-integrated accel position drifts
+        // QUADRATICALLY in time under a constant bias error -- exactly
+        // the mechanism behind every raw-trajectory runaway measured
+        // today. The bias freeze above keeps the bias state itself from
+        // wandering during starvation, but does nothing to stop this
+        // frame's own accel samples from being integrated at full trust
+        // into the relative-position/velocity part of the preintegrated
+        // IMU factor. Inflating accel_cov (NOT gyro_cov -- orientation
+        // stays fully trusted, per the same asymmetric-drift reasoning)
+        // tells the optimizer this interval's accel-derived position
+        // contribution is unreliable, so it leans on the marginalization
+        // prior / other edges instead of blindly integrating through the
+        // blackout. Unlike the bias freeze, this needs no persistence
+        // delay or max-duration cap: it only loosens a per-interval
+        // MEASUREMENT'S trust, not a standing prior, so it can react
+        // every single frame and never suppresses future correction --
+        // vision or a later well-tracked IMU span can still freely pull
+        // the estimate back once available.
+        const Vec3 accel_cov =
+            latest_tracked_count < kBiasFreezeTrackedCountThresh
+                ? nominal_accel_cov * Scalar(kStarvedAccelCovInflationFactor)
+                : nominal_accel_cov;
 
         while (data->t_ns <= prev_frame->t_ns) {
           data = popFromImuDataQueue();
@@ -627,6 +655,58 @@ bool SqrtKeypointVioEstimator<Scalar_>::measure(
   } else {
     imu_vision_reweight_active_ = false;
     obs_std_dev = nominal_obs_std_dev;
+  }
+
+  // Bias freeze -- see kBiasFreezeTrackedCountThresh's header comment for
+  // the failure mode this addresses (distinct from the reweight block
+  // above: this reacts to STARVATION, no vision to weight against at
+  // all, not to a DISAGREEMENT between two available signals). Uses
+  // latest_tracked_count for THIS frame (already updated above, unlike
+  // the reweight block's one-frame-lagged disagreement flag), since
+  // starvation doesn't need optimize_and_marg() to run first to be
+  // known.
+  {
+    auto now = std::chrono::steady_clock::now();
+    if (latest_tracked_count < kBiasFreezeTrackedCountThresh) {
+      if (!low_tracked_count_streak_active_) {
+        low_tracked_count_streak_active_ = true;
+        low_tracked_count_since_wall_ = now;
+      }
+    } else {
+      low_tracked_count_streak_active_ = false;
+      bias_freeze_active_ = false;
+    }
+
+    bool persisted =
+        low_tracked_count_streak_active_ &&
+        std::chrono::duration<double>(now - low_tracked_count_since_wall_)
+                .count() >= kBiasFreezeMinPersistenceS;
+
+    if (persisted) {
+      if (!bias_freeze_active_) {
+        bias_freeze_active_ = true;
+        bias_freeze_start_wall_ = now;
+      }
+      double freeze_active_s =
+          std::chrono::duration<double>(now - bias_freeze_start_wall_)
+              .count();
+      if (freeze_active_s <= kBiasFreezeMaxDurationS) {
+        accel_bias_sqrt_weight =
+            nominal_accel_bias_sqrt_weight * Scalar(kBiasFreezeWeightMultiplier);
+        gyro_bias_sqrt_weight =
+            nominal_gyro_bias_sqrt_weight * Scalar(kBiasFreezeWeightMultiplier);
+      } else {
+        // Time cap exceeded -- same reasoning as the reweight block's own
+        // cap: give up freezing for this episode rather than let bias
+        // self-correction stay suppressed indefinitely through a long
+        // blackout.
+        accel_bias_sqrt_weight = nominal_accel_bias_sqrt_weight;
+        gyro_bias_sqrt_weight = nominal_gyro_bias_sqrt_weight;
+      }
+    } else if (!bias_freeze_active_) {
+      accel_bias_sqrt_weight = nominal_accel_bias_sqrt_weight;
+      gyro_bias_sqrt_weight = nominal_gyro_bias_sqrt_weight;
+    }
   }
 
   optimize_and_marg(num_points_connected, lost_landmaks);

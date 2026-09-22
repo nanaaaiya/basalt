@@ -295,6 +295,11 @@ class SqrtKeypointVioEstimator : public VioEstimatorBase,
     return imu_vision_reweight_active_;
   }
 
+  // See kBiasFreezeTrackedCountThresh's comment. Same true/false
+  // semantics as isImuVisionReweightActive() above (false both when
+  // nominal and when the time cap gave up for this episode).
+  bool isBiasFreezeActive() const override { return bias_freeze_active_; }
+
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 
  private:
@@ -442,6 +447,79 @@ class SqrtKeypointVioEstimator : public VioEstimatorBase,
   std::atomic<bool> imu_vision_reweight_active_{false};
   std::chrono::steady_clock::time_point imu_vision_reweight_start_wall_;
   Scalar nominal_obs_std_dev{0};
+
+  // Bias freeze: a SEPARATE mechanism from the reweight above, for a
+  // different failure mode found on a real walking test (triangle-
+  // pattern accuracy test, Pi5, 2026-09-21) -- during a sustained
+  // near-zero-tracked_count stretch (camera rotating through a corner,
+  // no vision correction at all, not just weaker vision), the bias
+  // states are only constrained by IMU self-consistency and their own
+  // process-noise prior (accel_bias_sqrt_weight/gyro_bias_sqrt_weight,
+  // derived from the calibration's accel_bias_std/gyro_bias_std). Two
+  // real captures showed accel_bias_norm jumping from a healthy ~0.1 to
+  // 1.0-2.4 m/s^2 within a handful of seconds during exactly this kind
+  // of window, then (after vision returned and normal operation
+  // resumed for tens of seconds) the raw trajectory diverging
+  // exponentially to 1700-2400m -- a genuinely different mechanism from
+  // the [ONLINE-LOOP] drift gate/starvation trigger built earlier the
+  // same day, which only protects the PUBLISHED/corrected pose, not
+  // this estimator's own internal state.
+  //
+  // The fix is the mirror image of the reweight mechanism above: instead
+  // of trusting vision more, temporarily make the bias states harder to
+  // move (raise their process-noise weight) while there's nothing to
+  // validate a bias change against. This carries the EXACT SAME risk
+  // already learned the hard way earlier this session (see
+  // kImuVisionReweightFactor's comment): a bias made too rigid for too
+  // long stops self-correcting even during the many frames where
+  // nothing is actually wrong, which is what caused the original
+  // 225-300m runaway from halving accel_bias_std globally and
+  // permanently in the calibration file. Given how often tracked_count
+  // dips on this rig (see conversation -- chronic, not rare), an
+  // unbounded or over-eager freeze here would reproduce that exact
+  // failure. Same two-axis bound as the reweight mechanism: (1) only
+  // active while latest_tracked_count has been continuously below
+  // kBiasFreezeTrackedCountThresh for at least
+  // kBiasFreezeMinPersistenceS (not on a single noisy low reading), and
+  // snaps back to nominal the instant tracked_count recovers; (2) even
+  // within a flagged episode, kBiasFreezeMaxDurationS forces a return
+  // to nominal after that long, accepting a bounded window of
+  // uncorrected bias over an unbounded one. Does not claim to fully
+  // prevent the runaway (the observed captures ran for many seconds of
+  // near-zero tracked_count, likely still exceeding this cap in the
+  // worst case) -- it bounds how far the bias can move DURING the
+  // blackout, which is a real reduction versus today's unconstrained
+  // behavior, not a proven complete fix. Needs a live retest against
+  // the same triangle-walk scenario before being trusted further.
+  static constexpr int kBiasFreezeTrackedCountThresh = 8;
+  static constexpr double kBiasFreezeMinPersistenceS = 1.0;
+  static constexpr double kBiasFreezeWeightMultiplier = 20.0;
+  static constexpr double kBiasFreezeMaxDurationS = 5.0;
+  bool low_tracked_count_streak_active_ = false;
+  std::chrono::steady_clock::time_point low_tracked_count_since_wall_;
+  std::atomic<bool> bias_freeze_active_{false};
+  std::chrono::steady_clock::time_point bias_freeze_start_wall_;
+  Vec3 nominal_accel_bias_sqrt_weight, nominal_gyro_bias_sqrt_weight;
+
+  // Position-propagation suppression -- see its use in initialize()'s
+  // preintegration loop for the full reasoning (complements the bias
+  // freeze above: that keeps the bias STATE from wandering during
+  // starvation, this keeps THIS FRAME's accel samples from being
+  // integrated at full trust into the preintegrated factor's
+  // relative-position/velocity terms, the quadratic-in-time error
+  // source behind every raw-trajectory runaway measured on the
+  // 2026-09-21 triangle-walk tests). Reuses kBiasFreezeTrackedCountThresh
+  // as the same "starved" signal rather than a separate threshold --
+  // both mechanisms react to the identical condition, just at different
+  // points in the pipeline. No persistence delay or max-duration cap
+  // unlike the bias freeze: this only loosens one interval's
+  // MEASUREMENT trust, not a standing prior, so it's safe to react
+  // every frame and never risks suppressing future correction. Value is
+  // an unvalidated starting guess -- large enough that the optimizer
+  // effectively ignores this interval's accel-derived position/velocity
+  // contribution and leans on the marginalization prior / other edges
+  // instead, without being literally infinite.
+  static constexpr double kStarvedAccelCovInflationFactor = 1e4;
 
   const Vec3 g;
 

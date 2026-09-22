@@ -269,19 +269,23 @@ class FrameToFrameOpticalFlow : public OpticalFlowBase {
           new_poses0,
       Eigen::aligned_map<KeypointId, Eigen::AffineCompact2f>& new_poses1)
       const {
-    // Widened from the original {0.5, 1.0, 2.0, 4.0} -- this is one of
-    // the two levers behind the post-rotation "tracked points take 1-2s
-    // to come back" recovery lag (see conversation): landmark-pool
+    // Configurable via config.optical_flow_stereo_seed_depths_m (see that
+    // field's comment) -- was a fixed 7-depth set {0.3, 0.6, 1.0, 1.5,
+    // 2.5, 4.0, 6.0}, widened from an original {0.5, 1.0, 2.0, 4.0} as
+    // one of two levers behind the post-rotation "tracked points take
+    // 1-2s to come back" recovery lag (see conversation): landmark-pool
     // rebuild speed after motion blur wipes it out is capped partly by
     // how many of a keyframe's new corners this seeding successfully
-    // triangulates. Finer/wider coverage raises that per-keyframe yield
-    // directly, same mechanism validated for the coarser 4-depth set
-    // (run 20260921_134359: 1.37% -> 2.80% klt_stereo_ok). Cost is
-    // bounded to newly-detected corners only (self-limiting -- more
-    // hypotheses only get tried when there's more to rebuild).
-    static const std::array<Scalar, 7> kSeedDepthsM = {
-        Scalar(0.3), Scalar(0.6), Scalar(1.0), Scalar(1.5),
-        Scalar(2.5), Scalar(4.0), Scalar(6.0)};
+    // triangulates. More/finer depths raise that per-keyframe yield
+    // directly (run 20260921_134359: 1.37% -> 2.80% klt_stereo_ok going
+    // from 0 to 4 depths), but each one is a real added cost per new
+    // corner -- self-limiting in that it only applies to newly-detected
+    // corners, but NOT free, and a compute-constrained platform running
+    // the same corner-density settings as the laptop this was tuned on
+    // may need fewer of them (see the config field's comment for why
+    // this became configurable rather than a fixed constant).
+    const std::vector<double>& seed_depths_m =
+        config.optical_flow_stereo_seed_depths_m;
 
     std::vector<KeypointId> ids;
     Eigen::aligned_vector<Eigen::AffineCompact2f> init_vec;
@@ -309,7 +313,8 @@ class FrameToFrameOpticalFlow : public OpticalFlowBase {
           continue;
         Vector3 dir0 = ray0.template head<3>().normalized();
 
-        for (Scalar depth : kSeedDepthsM) {
+        for (double depth_d : seed_depths_m) {
+          Scalar depth = Scalar(depth_d);
           Vector3 pt_c1 = T_c1_c0_ * (dir0 * depth);
 
           Vector4 pt_c1_h;

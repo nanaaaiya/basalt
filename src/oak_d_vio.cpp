@@ -317,6 +317,18 @@ int main(int argc, char** argv) {
                  "certified calibration).")
       ->expected(3);
 
+  // See VioConfig::optical_flow_stereo_seed_depths_m's comment -- lets a
+  // compute-constrained platform (e.g. a Pi5) run fewer stereo-seed depth
+  // hypotheses than the laptop-validated default without needing a full
+  // --config-path file just for this one value. Empty means "use
+  // whatever config_path/the default already set" (CLI11 leaves the
+  // vio_config field untouched if this option is never passed).
+  std::vector<double> stereo_seed_depths;
+  app.add_option("--stereo-seed-depths", stereo_seed_depths,
+                 "Override the cam0->cam1 stereo-seed depth hypotheses "
+                 "(meters, any count) -- default is the laptop-validated "
+                 "7-depth set; pass fewer on compute-constrained hardware.");
+
   try {
     app.parse(argc, argv);
   } catch (const CLI::ParseError& e) {
@@ -362,6 +374,9 @@ int main(int argc, char** argv) {
     vio_config.load(config_path);
   } else {
     vio_config.optical_flow_skip_frames = 2;
+  }
+  if (!stereo_seed_depths.empty()) {
+    vio_config.optical_flow_stereo_seed_depths_m = stereo_seed_depths;
   }
 
   load_data(cam_calib_path);
@@ -564,7 +579,9 @@ int main(int argc, char** argv) {
                     << " imu_vision_disagreement_m="
                     << vio->getLatestImuVisionDisagreementM()
                     << " imu_vision_reweight_active="
-                    << vio->isImuVisionReweightActive() << std::endl;
+                    << vio->isImuVisionReweightActive()
+                    << " bias_freeze_active=" << vio->isBiasFreezeActive()
+                    << std::endl;
         }
 
         // Bias-state telemetry: printed unconditionally (health-gated

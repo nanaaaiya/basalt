@@ -159,6 +159,12 @@ class VioEstimatorBase {
   // SqrtKeypointVioEstimator::isImuVisionReweightActive()'s comment for
   // the bounded-window/time-cap design.
   virtual bool isImuVisionReweightActive() const { return false; }
+
+  // Whether the IMU bias states' process-noise weight is currently
+  // raised (harder to move) in response to a sustained near-zero
+  // tracked-point stretch -- see
+  // SqrtKeypointVioEstimator::isBiasFreezeActive()'s comment.
+  virtual bool isBiasFreezeActive() const { return false; }
 };
 
 class VioEstimatorFactory {
