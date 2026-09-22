@@ -515,6 +515,37 @@ class SqrtKeypointVioEstimator : public VioEstimatorBase,
   std::chrono::steady_clock::time_point bias_freeze_start_wall_;
   Vec3 nominal_accel_bias_sqrt_weight, nominal_gyro_bias_sqrt_weight;
 
+  // Wall-clock time a low-tracked-count streak most recently CONFIRMED
+  // ended (i.e. has_good_tracked_count_streak_ reached
+  // kBiasFreezeRecoveryGraceS above) -- used below to give the IMU-vision
+  // disagreement detector a grace window right after recovering from
+  // starvation. Initialized far in the past so nothing is suppressed
+  // before any real starvation episode has happened.
+  std::chrono::steady_clock::time_point low_tracked_count_streak_ended_wall_ =
+      std::chrono::steady_clock::now() - std::chrono::hours(24);
+  // A real live test (2026-09-22) showed imu_vision_disagreement firing
+  // repeatedly during a stretch where tracked_count was genuinely healthy
+  // (85-196) right after a starvation-triggered drift hold released --
+  // NOT a dynamic-scene corruption, but the optimizer legitimately
+  // snapping the position toward a freshly-rebuilt, well-constrained
+  // landmark pool after a period where the pure single-step IMU
+  // prediction this detector compares against (imu_only_translation, see
+  // measure()) had nothing trustworthy to track against either. Once
+  // flagged, the reweight block above/below (which downweights vision by
+  // kImuVisionReweightFactor while flagged) then fights the very
+  // correction that's needed to finish reconciling, which in turn can
+  // keep checkDriftGate()'s own residual elevated and stall its
+  // confirmed-release path well past when raw tracking numbers already
+  // look fine -- observed run pi5-fc5d7e96: 93% of a 53.9s test spent
+  // held, hitting the 15s max-hold cap 3 times. Grace window sized to
+  // give that catch-up correction room to fully settle (a few frames of
+  // sliding-window BA re-convergence, not instantaneous) without
+  // meaningfully widening the blind spot for a genuine dynamic-scene
+  // event that happens to start right after an unrelated starvation
+  // episode (rare, and still caught once the grace window elapses).
+  // Unvalidated starting guess -- needs a live retest.
+  static constexpr double kPostStarvationDisagreementGraceS = 2.0;
+
   // Position-propagation suppression -- see its use in initialize()'s
   // preintegration loop for the full reasoning (complements the bias
   // freeze above: that keeps the bias STATE from wandering during

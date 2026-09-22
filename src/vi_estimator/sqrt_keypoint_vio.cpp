@@ -693,6 +693,10 @@ bool SqrtKeypointVioEstimator<Scalar_>::measure(
         low_tracked_count_streak_active_ = false;
         bias_freeze_active_ = false;
         has_good_tracked_count_streak_ = false;
+        // See kPostStarvationDisagreementGraceS's comment: marks the
+        // start of the disagreement detector's post-recovery grace
+        // window.
+        low_tracked_count_streak_ended_wall_ = now;
       }
     }
 
@@ -740,8 +744,20 @@ bool SqrtKeypointVioEstimator<Scalar_>::measure(
     double excess_accel_mps2 =
         std::abs(double(latest_accel_norm) - double(g.norm()));
 
+    // See kPostStarvationDisagreementGraceS's comment: a real catch-up
+    // correction right after recovering from starvation can look exactly
+    // like disagreement to this detector, so treat it the same as the
+    // motion gates below -- not usable evidence either way.
+    double since_recovery_s = std::chrono::duration<double>(
+                                   std::chrono::steady_clock::now() -
+                                   low_tracked_count_streak_ended_wall_)
+                                   .count();
+    bool in_post_starvation_grace =
+        since_recovery_s <= kPostStarvationDisagreementGraceS;
+
     if (latest_gyro_norm > kImuVisionDisagreementMaxGyroNormRadS ||
-        excess_accel_mps2 > kImuVisionDisagreementMaxExcessAccelMps2) {
+        excess_accel_mps2 > kImuVisionDisagreementMaxExcessAccelMps2 ||
+        in_post_starvation_grace) {
       // Genuinely fast rotation OR real linear acceleration can itself
       // produce this much position disagreement (camera-IMU sync/
       // extrinsics are never perfect), so this frame's reading isn't
@@ -754,7 +770,15 @@ bool SqrtKeypointVioEstimator<Scalar_>::measure(
     } else {
       imu_vision_disagreement_count_ = 0;
     }
+    // Forced false during the grace window regardless of the counter's
+    // current value -- covers the case where the count already reached
+    // the persistence threshold from evidence gathered just before
+    // recovery was confirmed (e.g. a marginal frame during the tail of
+    // starvation itself), which would otherwise keep the reweight below
+    // active through the exact correction this grace window exists to
+    // protect.
     imu_vision_disagreement =
+        !in_post_starvation_grace &&
         imu_vision_disagreement_count_ >= kImuVisionDisagreementPersistenceFrames;
   }
 
