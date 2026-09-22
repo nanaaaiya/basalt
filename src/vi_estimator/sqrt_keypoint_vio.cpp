@@ -668,13 +668,32 @@ bool SqrtKeypointVioEstimator<Scalar_>::measure(
   {
     auto now = std::chrono::steady_clock::now();
     if (latest_tracked_count < kBiasFreezeTrackedCountThresh) {
+      // Cancel any pending recovery -- see has_good_tracked_count_streak_'s
+      // comment in the header: a single starved sample here must prevent
+      // the (!starved) branch below from ever crediting this as a real
+      // recovery, the same way online_loop_closure.cpp's starvation
+      // trigger works.
+      has_good_tracked_count_streak_ = false;
       if (!low_tracked_count_streak_active_) {
         low_tracked_count_streak_active_ = true;
         low_tracked_count_since_wall_ = now;
       }
-    } else {
-      low_tracked_count_streak_active_ = false;
-      bias_freeze_active_ = false;
+    } else if (low_tracked_count_streak_active_) {
+      // Only reset once THIS healthy streak has itself persisted for
+      // kBiasFreezeRecoveryGraceS -- not on the single sample that
+      // crossed the threshold. See kBiasFreezeRecoveryGraceS's comment.
+      if (!has_good_tracked_count_streak_) {
+        has_good_tracked_count_streak_ = true;
+        good_tracked_count_streak_since_wall_ = now;
+      }
+      double good_s = std::chrono::duration<double>(
+                          now - good_tracked_count_streak_since_wall_)
+                          .count();
+      if (good_s >= kBiasFreezeRecoveryGraceS) {
+        low_tracked_count_streak_active_ = false;
+        bias_freeze_active_ = false;
+        has_good_tracked_count_streak_ = false;
+      }
     }
 
     bool persisted =

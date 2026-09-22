@@ -517,12 +517,26 @@ class OnlineLoopClosure {
   std::atomic<double> latest_reported_tracked_ratio_{1.0};
   std::atomic<int> latest_reported_tracked_count_{999};
   std::atomic<int> latest_reported_total_observed_count_{999};
-  // Wall-clock time the CURRENT continuous starvation stretch began --
-  // reset to invalid (via starvation_active_) the moment the condition
-  // stops holding, same "wall-clock, not a call count" reasoning as
-  // kStarvationPersistenceSeconds's own comment.
+  // Wall-clock time the CURRENT continuous starvation stretch began.
+  // NOT reset the instant a single healthy sample arrives -- see
+  // good_streak_since_wall_ below and kStarvationRecoveryGraceS in the
+  // .cpp: a real live test (2026-09-22, untextured wall) showed
+  // tracked_count flickering above threshold for single samples every
+  // 0.3-0.7s throughout a ~13s badly-tracked stretch, which under the
+  // old instant-reset behavior kept this clock from ever reaching
+  // kStarvationPersistenceSeconds, letting the whole stretch free-drift
+  // unheld (~6m) despite being starved by any reasonable aggregate
+  // measure.
   mutable bool starvation_active_ = false;
   mutable std::chrono::steady_clock::time_point starvation_since_wall_;
+  // Wall-clock time the CURRENT continuous non-starved stretch began --
+  // invalid (via has_good_streak_) whenever a starved sample arrives.
+  // starvation_active_/starvation_since_wall_ only get reset once THIS
+  // streak itself has persisted for kStarvationRecoveryGraceS, so a
+  // brief good flicker can no longer discard accumulated bad-streak
+  // time the way an instant reset did.
+  mutable bool has_good_streak_ = false;
+  mutable std::chrono::steady_clock::time_point good_streak_since_wall_;
 
   // Continuously updated by getSmoothedCorrectedPose() (mutable: that
   // method is const) every time it publishes a live, not-held pose --

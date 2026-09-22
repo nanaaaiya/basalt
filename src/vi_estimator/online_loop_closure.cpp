@@ -320,6 +320,16 @@ constexpr int kStarvationMinTotalObserved = 5;
 // trigger's sensitivity depend on how many consumers happen to be
 // active, not on how long the starvation actually lasted.
 constexpr double kStarvationPersistenceSeconds = 2.0;
+// How long a RECOVERY (tracked_count/total_observed_count back above
+// threshold) must itself persist before the starvation clock actually
+// resets -- see has_good_streak_'s comment in the .h. Deliberately
+// shorter than kStarvationPersistenceSeconds (confirming a real recovery
+// should be faster/easier than confirming a real starvation episode),
+// but long enough to reject the sub-second flickers a real live test
+// (2026-09-22, untextured wall) showed recurring every 0.3-0.7s through
+// an extended bad stretch -- picked as roughly double the longest single
+// flicker observed there (~0.4s), not independently tuned.
+constexpr double kStarvationRecoveryGraceS = 1.0;
 
 // Decompose R = Rz(yaw) * Ry(pitch) * Rx(roll). Assumes no gimbal lock
 // (pitch away from +-90 deg), a reasonable assumption for a handheld/mobile
@@ -1258,6 +1268,7 @@ void OnlineLoopClosure::checkDriftGate() {
       // See forceReleaseDriftHoldLocked()'s matching reset -- same bug,
       // same fix, for the confirmed-release path.
       starvation_active_ = false;
+      has_good_streak_ = false;
       drift_gate_events.try_push(DriftGateEvent::kReleasedConfirmed);
       std::cout << "[ONLINE-LOOP] DRIFT GATE RELEASED: kf=" << (n - 1)
                 << " residual back under threshold for " << kDriftGateReleaseCount
@@ -1303,6 +1314,7 @@ void OnlineLoopClosure::forceReleaseDriftHoldLocked() const {
   // durations of 10-23s despite kStarvationPersistenceSeconds being 2.0,
   // because this reset was missing.
   starvation_active_ = false;
+  has_good_streak_ = false;
   drift_gate_events.try_push(DriftGateEvent::kReleasedForced);
 }
 
@@ -1405,8 +1417,14 @@ bool OnlineLoopClosure::getSmoothedCorrectedPose(
   bool starved =
       latest_reported_tracked_count_ < kStarvationMinTrackedCount ||
       latest_reported_total_observed_count_ < kStarvationMinTotalObserved;
+  auto now = std::chrono::steady_clock::now();
   if (starved) {
-    auto now = std::chrono::steady_clock::now();
+    // A real recovery is in progress (if any) -- cancel it. This is what
+    // makes a brief good flicker unable to discard accumulated bad-streak
+    // time: has_good_streak_ only matters once it's persisted past
+    // kStarvationRecoveryGraceS in the (!starved) branch below, and a
+    // single starved sample here resets it before it gets the chance.
+    has_good_streak_ = false;
     if (!starvation_active_) {
       starvation_active_ = true;
       starvation_since_wall_ = now;
@@ -1444,8 +1462,20 @@ bool OnlineLoopClosure::getSmoothedCorrectedPose(
       out = held_pose_;
       return true;
     }
-  } else {
-    starvation_active_ = false;
+  } else if (starvation_active_) {
+    // Only reset the bad-streak clock once this healthy sample's streak
+    // has ITSELF persisted for kStarvationRecoveryGraceS -- see
+    // has_good_streak_'s comment in the .h.
+    if (!has_good_streak_) {
+      has_good_streak_ = true;
+      good_streak_since_wall_ = now;
+    }
+    double good_s =
+        std::chrono::duration<double>(now - good_streak_since_wall_).count();
+    if (good_s >= kStarvationRecoveryGraceS) {
+      starvation_active_ = false;
+      has_good_streak_ = false;
+    }
   }
 
   const LoopKeyframe& kf = keyframes_.back();

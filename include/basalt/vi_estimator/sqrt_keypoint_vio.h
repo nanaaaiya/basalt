@@ -481,22 +481,36 @@ class SqrtKeypointVioEstimator : public VioEstimatorBase,
   // active while latest_tracked_count has been continuously below
   // kBiasFreezeTrackedCountThresh for at least
   // kBiasFreezeMinPersistenceS (not on a single noisy low reading), and
-  // snaps back to nominal the instant tracked_count recovers; (2) even
-  // within a flagged episode, kBiasFreezeMaxDurationS forces a return
-  // to nominal after that long, accepting a bounded window of
-  // uncorrected bias over an unbounded one. Does not claim to fully
-  // prevent the runaway (the observed captures ran for many seconds of
-  // near-zero tracked_count, likely still exceeding this cap in the
-  // worst case) -- it bounds how far the bias can move DURING the
-  // blackout, which is a real reduction versus today's unconstrained
-  // behavior, not a proven complete fix. Needs a live retest against
-  // the same triangle-walk scenario before being trusted further.
+  // resets once a recovery has ITSELF persisted for
+  // kBiasFreezeRecoveryGraceS -- NOT the instant tracked_count recovers,
+  // which is what this originally did until a real live test
+  // (2026-09-22, untextured wall) showed the analogous drift-gate
+  // starvation trigger (see kStarvationRecoveryGraceS in
+  // online_loop_closure.cpp) missing an entire ~13s bad stretch because
+  // sub-second good flickers kept discarding its accumulated bad-streak
+  // time; this mechanism has the identical instant-reset shape, so it
+  // gets the identical fix; (2) even within a flagged episode,
+  // kBiasFreezeMaxDurationS forces a return to nominal after that long,
+  // accepting a bounded window of uncorrected bias over an unbounded
+  // one. Does not claim to fully prevent the runaway (the observed
+  // captures ran for many seconds of near-zero tracked_count, likely
+  // still exceeding this cap in the worst case) -- it bounds how far the
+  // bias can move DURING the blackout, which is a real reduction versus
+  // today's unconstrained behavior, not a proven complete fix. Needs a
+  // live retest against the same triangle-walk scenario before being
+  // trusted further.
   static constexpr int kBiasFreezeTrackedCountThresh = 8;
   static constexpr double kBiasFreezeMinPersistenceS = 1.0;
   static constexpr double kBiasFreezeWeightMultiplier = 20.0;
   static constexpr double kBiasFreezeMaxDurationS = 5.0;
+  // Roughly half kBiasFreezeMinPersistenceS, same ratio as
+  // kStarvationRecoveryGraceS/kStarvationPersistenceSeconds -- not
+  // independently tuned.
+  static constexpr double kBiasFreezeRecoveryGraceS = 0.5;
   bool low_tracked_count_streak_active_ = false;
   std::chrono::steady_clock::time_point low_tracked_count_since_wall_;
+  bool has_good_tracked_count_streak_ = false;
+  std::chrono::steady_clock::time_point good_tracked_count_streak_since_wall_;
   std::atomic<bool> bias_freeze_active_{false};
   std::chrono::steady_clock::time_point bias_freeze_start_wall_;
   Vec3 nominal_accel_bias_sqrt_weight, nominal_gyro_bias_sqrt_weight;
