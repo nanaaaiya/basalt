@@ -252,16 +252,31 @@ constexpr size_t kDriftGateAnchorRefreshKeyframes = 20;
 // cleanly from this point rather than immediately re-tripping against
 // the same stale reference.
 //
-// Lowered from 30.0 to 15.0: on the same real session referenced above,
-// forced releases were observed snapping ~4.8cm/s of accumulated drift
-// for the full hold duration (a 34.8s hold producing a ~166cm jump) --
-// the cap doesn't reduce the drift rate, but it directly bounds how much
-// of it compounds before a forced release accepts it. Extrapolating that
-// session's own rate, 15s caps the same failure mode to roughly 70cm
-// instead of ~170cm. Tradeoff: gives up on waiting for a confirmed
-// (kDriftGateReleaseCount consecutive good solves) recovery sooner,
-// accepting an unconfirmed correction more readily.
-constexpr double kDriftGateMaxHoldSeconds = 15.0;
+// Lowered from 30.0 to 15.0, then to 5.0 (2026-09-23): a real Pi5
+// rectangle-walk test found checkDriftGate()'s residual check itself is
+// structurally slow to resolve during ordinary walking -- see this
+// session's investigation, checkDriftGate()'s own header comment. It
+// compares the graph's corrected position against a prediction built
+// from RAW VIO's dead-reckoning since the hold began; raw VIO drifting
+// over real covered distance (the same imprecision loop closure exists
+// to correct) means that prediction keeps getting worse the longer a
+// hold persists through continued real motion, so a hold tripped mid-leg
+// tends to stay tripped for the rest of that leg. Confirmed on that
+// test: 4 separate holds each ran the full 15s cap with tracking healthy
+// throughout (mean tracked_count 51-74, only 4-11% starved samples) --
+// not a tracking failure, the residual genuinely wasn't resolving in
+// time. 5.0s matches the existing precedent this codebase already uses
+// for "give up and stop suppressing/trust normally" caps elsewhere
+// (kBiasFreezeMaxDurationS, kImuVisionReweightMaxDurationS). Extrapolating
+// the ~4.8cm/s drift rate this constant's own history above was
+// calibrated against, 5s caps the same failure mode to roughly 24cm
+// instead of ~70cm. Tradeoff, same shape as the 30->15 change: gives up
+// on waiting for a confirmed (kDriftGateReleaseCount consecutive good
+// solves) recovery sooner, accepting an unconfirmed correction more
+// readily -- untested whether 5s is long enough for genuinely hard cases
+// to ever confirm-release at all, watch for an increase in the forced-
+// vs-confirmed ratio on a live retest.
+constexpr double kDriftGateMaxHoldSeconds = 5.0;
 
 // Starvation trigger: a SECOND way into the same held state above,
 // independent of checkDriftGate()'s residual check. That check only
