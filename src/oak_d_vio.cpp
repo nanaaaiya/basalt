@@ -329,6 +329,18 @@ int main(int argc, char** argv) {
                  "(meters, any count) -- default is the laptop-validated "
                  "7-depth set; pass fewer on compute-constrained hardware.");
 
+  // Same reasoning as --stereo-seed-depths above -- lets this be swept
+  // (e.g. testing whether a deeper pyramid tolerates larger inter-frame
+  // displacement before losing tracked points, 2026-09-23 investigation)
+  // without a full --config-path file per value tried. 0 means "use
+  // whatever config_path/the default already set" (CLI11 default), since
+  // 0 levels (single-scale KLT) is never a real config to test here.
+  int optical_flow_levels = 0;
+  app.add_option("--optical-flow-levels", optical_flow_levels,
+                 "Override the KLT pyramid depth (default 3) -- more "
+                 "levels tolerate larger inter-frame pixel displacement "
+                 "per tracked point, at higher per-frame compute cost.");
+
   try {
     app.parse(argc, argv);
   } catch (const CLI::ParseError& e) {
@@ -377,6 +389,9 @@ int main(int argc, char** argv) {
   }
   if (!stereo_seed_depths.empty()) {
     vio_config.optical_flow_stereo_seed_depths_m = stereo_seed_depths;
+  }
+  if (optical_flow_levels > 0) {
+    vio_config.optical_flow_levels = optical_flow_levels;
   }
 
   load_data(cam_calib_path);
