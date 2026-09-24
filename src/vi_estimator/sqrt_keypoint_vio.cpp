@@ -33,6 +33,8 @@ OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 */
 
+#include <algorithm>
+
 #include <basalt/vi_estimator/marg_helper.h>
 #include <basalt/vi_estimator/sqrt_keypoint_vio.h>
 
@@ -1112,8 +1114,36 @@ void SqrtKeypointVioEstimator<Scalar_>::marginalize(
         // map getHostKfs() itself reads, via the public accessor.
         const TimeCamId host_tcid(kf_id, 0);
         if (lmdb.getObservations().count(host_tcid) > 0) {
-          for (const Keypoint<Scalar>* kpt :
-               lmdb.getLandmarksForHost(host_tcid)) {
+          // Cap how many landmarks a single keyframe contributes -- a
+          // live test found some keyframes hosting 700+ (mean 102,
+          // median 65 among keyframes with any at all), and
+          // OnlineLoopClosure's own candidate matching is brute-force
+          // O(corners x corners_partner) (see kMaxCandidatesToVerify's
+          // comment), so feeding all of them in pushed
+          // loop_candidate_search from 68.8-224.6ms up to 331.7ms
+          // average -- above the ~256ms average keyframe interval, a
+          // real-time-budget regression the feature didn't have before.
+          // Rank by observation count (more views a landmark survived
+          // in the VIO's own window is a reasonable proxy for how
+          // well-constrained its triangulation is) and keep only the
+          // strongest kMaxHarvestedLandmarksPerKf, instead of an
+          // arbitrary lmdb-iteration-order subset.
+          constexpr size_t kMaxHarvestedLandmarksPerKf = 40;
+
+          std::vector<const Keypoint<Scalar>*> host_landmarks =
+              lmdb.getLandmarksForHost(host_tcid);
+          if (host_landmarks.size() > kMaxHarvestedLandmarksPerKf) {
+            std::partial_sort(
+                host_landmarks.begin(),
+                host_landmarks.begin() + kMaxHarvestedLandmarksPerKf,
+                host_landmarks.end(),
+                [](const Keypoint<Scalar>* a, const Keypoint<Scalar>* b) {
+                  return a->obs.size() > b->obs.size();
+                });
+            host_landmarks.resize(kMaxHarvestedLandmarksPerKf);
+          }
+
+          for (const Keypoint<Scalar>* kpt : host_landmarks) {
             Vec4 pt_cam = StereographicParam<Scalar>::unproject(kpt->direction);
             pt_cam[3] = kpt->inv_dist;
             if (!(pt_cam[3] > Scalar(0))) continue;  // behind camera / invalid
