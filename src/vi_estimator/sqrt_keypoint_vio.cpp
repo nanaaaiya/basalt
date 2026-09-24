@@ -1103,18 +1103,28 @@ void SqrtKeypointVioEstimator<Scalar_>::marginalize(
         // triangulation. cam1-hosted landmarks are skipped: their
         // direction/inv_dist and pixel position live in cam1's frame,
         // not cam0's, and OnlineLoopClosure's own pipeline is cam0-only.
-        for (const Keypoint<Scalar>* kpt :
-             lmdb.getLandmarksForHost(TimeCamId(kf_id, 0))) {
-          Vec4 pt_cam = StereographicParam<Scalar>::unproject(kpt->direction);
-          pt_cam[3] = kpt->inv_dist;
-          if (!(pt_cam[3] > Scalar(0))) continue;  // behind camera / invalid
+        //
+        // getLandmarksForHost() calls observations.at(tcid) internally,
+        // which THROWS std::out_of_range if this keyframe hosts zero
+        // landmarks -- a real, reachable case (confirmed live: a crash
+        // during a low-triangulation-yield stretch, triangulated_points
+        // consistently 0), not a hypothetical one. Guard with the same
+        // map getHostKfs() itself reads, via the public accessor.
+        const TimeCamId host_tcid(kf_id, 0);
+        if (lmdb.getObservations().count(host_tcid) > 0) {
+          for (const Keypoint<Scalar>* kpt :
+               lmdb.getLandmarksForHost(host_tcid)) {
+            Vec4 pt_cam = StereographicParam<Scalar>::unproject(kpt->direction);
+            pt_cam[3] = kpt->inv_dist;
+            if (!(pt_cam[3] > Scalar(0))) continue;  // behind camera / invalid
 
-          Vec3 pt3d = pt_cam.template head<3>() / pt_cam[3];
-          Vec2 px;
-          if (!calib.intrinsics[0].project(pt3d, px)) continue;
+            Vec3 pt3d = pt_cam.template head<3>() / pt_cam[3];
+            Vec2 px;
+            if (!calib.intrinsics[0].project(pt3d, px)) continue;
 
-          m->host_landmark_pt3d.emplace_back(pt3d.template cast<double>());
-          m->host_landmark_px.emplace_back(px.template cast<double>());
+            m->host_landmark_pt3d.emplace_back(pt3d.template cast<double>());
+            m->host_landmark_px.emplace_back(px.template cast<double>());
+          }
         }
 
         out_marg_queue->push(m);
