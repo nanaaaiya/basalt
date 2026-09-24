@@ -429,6 +429,14 @@ class OnlineLoopClosure {
   // so the max-hold promise holds even when nothing else is running.
   mutable std::chrono::steady_clock::time_point drift_held_since_wall_;
 
+  // Last time solvePoseGraph() actually ran (whether triggered by a new
+  // closure or the periodic while-held recheck below) -- see
+  // kDriftGatePeriodicRecheckWhileHeldS in the .cpp. Only touched from
+  // processKeyframe() (worker thread, already under state_mutex_), so
+  // not mutable/not needed from a const context the way the members
+  // above are.
+  std::chrono::steady_clock::time_point last_resolve_wall_;
+
   // When a hold releases (either way -- see checkDriftGate()), the very
   // next getSmoothedCorrectedPose() call would otherwise jump straight
   // from held_pose_ to wherever the graph currently says, in one step --

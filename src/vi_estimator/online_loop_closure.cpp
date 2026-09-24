@@ -278,6 +278,46 @@ constexpr size_t kDriftGateAnchorRefreshKeyframes = 20;
 // vs-confirmed ratio on a live retest.
 constexpr double kDriftGateMaxHoldSeconds = 5.0;
 
+// checkDriftGate() previously only ran when solvePoseGraph() processed a
+// NEW accepted closure (need_resolve in processKeyframe()) -- but new
+// keyframes keep getting added (with their own raw-derived odometry edge
+// to the previous node) regardless of whether a closure was found for
+// them, sitting with an un-optimized, still-effectively-raw t_opt until
+// the next solve touches them. A live rectangle-walk test found holds
+// sitting frozen for their full duration with tracking already healthy
+// (mean tracked_count 122.6, 100% nominal for one whole hold window)
+// simply because no NEW closure happened to land during that window to
+// give checkDriftGate() a chance to re-evaluate. This constant lets
+// processKeyframe() force a resolve anyway, on a timer, but ONLY while
+// actually held -- there's no equivalent urgency to re-solve when
+// nothing's being suppressed, and doing it unconditionally would burn
+// real-time budget (pose_graph_solve alone already averages ~64-213ms on
+// the Pi5, see OnlineLoopClosure::stop()'s comment) for no live benefit.
+// 1.0s gives a hold up to ~5 extra chances to self-resolve within
+// kDriftGateMaxHoldSeconds instead of just the one it might otherwise
+// get (or zero, if no closure lands at all before the cap).
+constexpr double kDriftGatePeriodicRecheckWhileHeldS = 1.0;
+
+// While held, checkDriftGate()'s residual compares the graph's corrected
+// position against a prediction built by chaining RAW VIO's own
+// dead-reckoning since the hold began (see kDriftGateMaxHoldSeconds) --
+// so the reference itself accumulates real error the longer the hold
+// persists through continued motion, at roughly the ~4.8cm/s rate that
+// constant's own derivation above was calibrated against. A FIXED
+// residual bar effectively gets stricter over time purely because of
+// that reference's own known unreliability, not because the correction
+// is actually any less trustworthy. Growing the held-path threshold by
+// this rate compensates for the reference's own expected drift instead
+// of penalizing confirmation for it. Deliberately NOT applied to the
+// not-held trip-detection comparison (kDriftGateThresholdM there stays
+// fixed at 0.5m) -- this is only meant to make genuine recovery easier
+// to confirm once already held, not to make tripping in the first place
+// any less sensitive. Bounded in practice by kDriftGateMaxHoldSeconds
+// (5.0s * 0.048m/s = 0.24m max extra slack, still small next to a
+// genuine bad-closure residual, which the documented EuRoC case put at
+// multiple meters) rather than an explicit cap constant.
+constexpr double kDriftGateHeldThresholdGrowthMPerS = 0.048;
+
 // Starvation trigger: a SECOND way into the same held state above,
 // independent of checkDriftGate()'s residual check. That check only
 // fires when solvePoseGraph() processes a new keyframe -- but when
@@ -985,6 +1025,21 @@ void OnlineLoopClosure::processKeyframe(const MargData::Ptr& data,
 
     t_ns_to_idx_[kf_id] = new_idx;
     keyframes_.push_back(std::move(kf));
+
+    // Periodic while-held recheck -- see kDriftGatePeriodicRecheckWhileHeldS.
+    // Gives checkDriftGate() a chance to re-evaluate using whatever's
+    // already in the graph (this new keyframe's own odometry edge plus
+    // any earlier loop-closure edges) even when no NEW closure was found
+    // for THIS keyframe specifically.
+    if (!need_resolve && drift_held_) {
+      double since_last_resolve = std::chrono::duration<double>(
+                                       std::chrono::steady_clock::now() -
+                                       last_resolve_wall_)
+                                       .count();
+      if (since_last_resolve >= kDriftGatePeriodicRecheckWhileHeldS) {
+        need_resolve = true;
+      }
+    }
   }
 
   auto t4 = std::chrono::steady_clock::now();
@@ -1047,6 +1102,12 @@ void OnlineLoopClosure::processKeyframe(const MargData::Ptr& data,
 
 void OnlineLoopClosure::solvePoseGraph() {
   std::lock_guard<std::mutex> lock(state_mutex_);
+
+  // See kDriftGatePeriodicRecheckWhileHeldS -- marks "a resolve just
+  // happened" regardless of why this call was triggered (new closure or
+  // periodic while-held recheck), so the next periodic recheck is timed
+  // from here, not from the last NEW-closure-triggered solve.
+  last_resolve_wall_ = std::chrono::steady_clock::now();
 
   const size_t n = keyframes_.size();
   if (n < 2) return;
@@ -1256,7 +1317,19 @@ void OnlineLoopClosure::checkDriftGate() {
   double residual_m =
       (T_newest_corrected.translation() - T_predicted.translation()).norm();
 
-  if (residual_m > kDriftGateThresholdM) {
+  // See kDriftGateHeldThresholdGrowthMPerS -- only grows the bar on the
+  // held (confirm-to-release) path, never the not-held trip-detection
+  // one, so tripping stays exactly as sensitive as before.
+  double effective_threshold_m = kDriftGateThresholdM;
+  if (drift_held_) {
+    double held_wall_s = std::chrono::duration<double>(
+                              std::chrono::steady_clock::now() -
+                              drift_held_since_wall_)
+                              .count();
+    effective_threshold_m += kDriftGateHeldThresholdGrowthMPerS * held_wall_s;
+  }
+
+  if (residual_m > effective_threshold_m) {
     if (!drift_held_) {
       // Freeze at wherever the live pose actually was an instant ago
       // (last_published_pose_/last_raw_pose_seen_, cached by
@@ -1307,7 +1380,9 @@ void OnlineLoopClosure::checkDriftGate() {
       has_good_streak_ = false;
       drift_gate_events.try_push(DriftGateEvent::kReleasedConfirmed);
       std::cout << "[ONLINE-LOOP] DRIFT GATE RELEASED: kf=" << (n - 1)
-                << " residual back under threshold for " << kDriftGateReleaseCount
+                << " residual=" << residual_m
+                << "m (effective_threshold=" << effective_threshold_m
+                << "m) back under threshold for " << kDriftGateReleaseCount
                 << " consecutive solves" << std::endl;
     }
     return;
