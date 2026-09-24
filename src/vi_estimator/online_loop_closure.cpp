@@ -658,16 +658,29 @@ void OnlineLoopClosure::processKeyframe(const MargData::Ptr& data,
       const Eigen::Vector2d& px = data->host_landmark_px[li];
       if (!img0.InBounds((float)px.x(), (float)px.y(), kEdgeThresholdPx))
         continue;
-      bool dup = false;
-      for (const auto& c : kf.kd0.corners) {
-        if ((c - px).squaredNorm() < kDedupRadiusPx * kDedupRadiusPx) {
-          dup = true;
+      // Reuse an existing nearby corner's index instead of discarding the
+      // landmark -- a live test found ~97% of harvested landmarks land
+      // within a few px of a corner detectKeypointsMapping() also found
+      // (both detectors picking out the same salient points), so
+      // dropping on any overlap wasted almost the entire feature (2.7%
+      // utilization: 1008/37884 landmarks used across one run). Most of
+      // those coinciding corners never got a 3D point from the ~10%-yield
+      // stereo match anyway (see kStereoEpipolarErrorThreshold's
+      // comment), so attaching the landmark's point to the SAME corner
+      // index -- rather than only to a brand-new one -- is what actually
+      // captures the opportunity.
+      int idx = -1;
+      for (size_t ci = 0; ci < kf.kd0.corners.size(); ci++) {
+        if ((kf.kd0.corners[ci] - px).squaredNorm() <
+            kDedupRadiusPx * kDedupRadiusPx) {
+          idx = (int)ci;
           break;
         }
       }
-      if (dup) continue;
-      int idx = (int)kf.kd0.corners.size();
-      kf.kd0.corners.push_back(px);
+      if (idx < 0) {
+        idx = (int)kf.kd0.corners.size();
+        kf.kd0.corners.push_back(px);
+      }
       vio_landmark_pts3d.emplace_back(idx, data->host_landmark_pt3d[li]);
     }
   }
