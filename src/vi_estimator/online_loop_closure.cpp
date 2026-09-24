@@ -631,6 +631,47 @@ void OnlineLoopClosure::processKeyframe(const MargData::Ptr& data,
   kf.T_w_i_raw = T_w_i_raw;
 
   detectKeypointsMapping(img0, kf.kd0, config_.mapper_detection_num_points);
+
+  // Fold in the VIO estimator's own multi-view-triangulated landmarks
+  // (see MargData::host_landmark_px/host_landmark_pt3d's comment) as
+  // EXTRA corners, before angle/descriptor computation below so they
+  // get descriptors through the exact same code path as independently-
+  // detected ones. Dedup against corners detectKeypointsMapping already
+  // found (a VIO-tracked point and a freshly-detected one can easily
+  // land on the same physical corner) and skip anything too close to
+  // the border for computeAngles()/computeDescriptors()'s patch access
+  // to stay in-bounds -- same EDGE_THRESHOLD margin
+  // detectKeypointsMapping's own corners are filtered to (see
+  // src/utils/keypoints.cpp).
+  // (corner index in kf.kd0.corners, VIO-landmark 3D point in this
+  // keyframe's own cam0 frame) for every landmark corner actually kept
+  // below -- applied to kf.pts3d/corner_to_pt3d AFTER the stereo-
+  // triangulation block further down, so a VIO-sourced 3D point (much
+  // stronger baseline -- see this block's header comment) takes
+  // precedence over anything the single-instant stereo match also found
+  // for the same corner, rather than the other way around.
+  std::vector<std::pair<int, Eigen::Vector3d>> vio_landmark_pts3d;
+  {
+    constexpr double kDedupRadiusPx = 3.0;
+    constexpr int kEdgeThresholdPx = 19;
+    for (size_t li = 0; li < data->host_landmark_px.size(); li++) {
+      const Eigen::Vector2d& px = data->host_landmark_px[li];
+      if (!img0.InBounds((float)px.x(), (float)px.y(), kEdgeThresholdPx))
+        continue;
+      bool dup = false;
+      for (const auto& c : kf.kd0.corners) {
+        if ((c - px).squaredNorm() < kDedupRadiusPx * kDedupRadiusPx) {
+          dup = true;
+          break;
+        }
+      }
+      if (dup) continue;
+      int idx = (int)kf.kd0.corners.size();
+      kf.kd0.corners.push_back(px);
+      vio_landmark_pts3d.emplace_back(idx, data->host_landmark_pt3d[li]);
+    }
+  }
+
   computeAngles(img0, kf.kd0, true);
   computeDescriptors(img0, kf.kd0);
   {
@@ -692,6 +733,23 @@ void OnlineLoopClosure::processKeyframe(const MargData::Ptr& data,
       kf.corner_to_pt3d[m.first] = pt_idx;
     }
 
+    // Apply the VIO-landmark 3D points collected earlier (see this
+    // function's kDedupRadiusPx block) -- done here, after stereo
+    // triangulation above, so a corner that BOTH the single-instant
+    // stereo match and a VIO landmark cover ends up pointing at the
+    // VIO-sourced entry (stronger multi-view baseline), not whichever
+    // ran first. Always appends a fresh kf.pts3d entry rather than
+    // trying to overwrite one in place -- corner_to_pt3d is a map, so
+    // repointing it here just leaves the stereo-sourced entry (if any)
+    // unreferenced, which is harmless.
+    int vio_landmark_pts3d_used = 0;
+    for (const auto& [corner_idx, pt3d] : vio_landmark_pts3d) {
+      int pt_idx = (int)kf.pts3d.size();
+      kf.pts3d.push_back(pt3d);
+      kf.corner_to_pt3d[corner_idx] = pt_idx;
+      vio_landmark_pts3d_used++;
+    }
+
     // Diagnostic breakdown of *why* triangulated-point yield ends up where
     // it does -- distinguishes "not enough corners detected" (texture/
     // exposure problem) from "corners detected but stereo matching/
@@ -703,7 +761,9 @@ void OnlineLoopClosure::processKeyframe(const MargData::Ptr& data,
               << " corners1=" << kd1.corners.size()
               << " raw_matches=" << md.matches.size()
               << " epipolar_inliers=" << md.inliers.size()
-              << " triangulated=" << kf.pts3d.size() << std::endl;
+              << " triangulated=" << kf.pts3d.size()
+              << " (vio_landmarks=" << vio_landmark_pts3d_used << "/"
+              << data->host_landmark_px.size() << ")" << std::endl;
 
     // Exposed for a live confidence signal (vio_health.h) / scenario-
     // characterization tooling -- this line was already printed every

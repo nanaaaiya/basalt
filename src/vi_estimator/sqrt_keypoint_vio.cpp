@@ -1065,7 +1065,7 @@ void SqrtKeypointVioEstimator<Scalar_>::marginalize(
 
     // Save marginalization prior
     if (out_marg_queue && !kfs_to_marg.empty()) {
-      // int64_t kf_id = *kfs_to_marg.begin();
+      int64_t kf_id = *kfs_to_marg.begin();
 
       {
         MargData::Ptr m(new MargData);
@@ -1089,6 +1089,32 @@ void SqrtKeypointVioEstimator<Scalar_>::marginalize(
 
         for (int64_t t : m->kfs_all) {
           m->opt_flow_res.emplace_back(prev_opt_flow_res.at(t));
+        }
+
+        // Harvest this keyframe's cam0-hosted landmarks (see MargData::
+        // host_landmark_px/host_landmark_pt3d's comment) right before
+        // lmdb.removeKeyframes() below drops them for good -- this is
+        // the last point they're still accessible. direction/inv_dist
+        // reflect the just-finished optimize() above, so this is their
+        // best available estimate, triangulated over this landmark's
+        // full real motion baseline across however many VIO keyframes
+        // observed it -- typically much stronger geometry than
+        // OnlineLoopClosure's own single-instant ~7.5cm stereo
+        // triangulation. cam1-hosted landmarks are skipped: their
+        // direction/inv_dist and pixel position live in cam1's frame,
+        // not cam0's, and OnlineLoopClosure's own pipeline is cam0-only.
+        for (const Keypoint<Scalar>* kpt :
+             lmdb.getLandmarksForHost(TimeCamId(kf_id, 0))) {
+          Vec4 pt_cam = StereographicParam<Scalar>::unproject(kpt->direction);
+          pt_cam[3] = kpt->inv_dist;
+          if (!(pt_cam[3] > Scalar(0))) continue;  // behind camera / invalid
+
+          Vec3 pt3d = pt_cam.template head<3>() / pt_cam[3];
+          Vec2 px;
+          if (!calib.intrinsics[0].project(pt3d, px)) continue;
+
+          m->host_landmark_pt3d.emplace_back(pt3d.template cast<double>());
+          m->host_landmark_px.emplace_back(px.template cast<double>());
         }
 
         out_marg_queue->push(m);
