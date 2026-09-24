@@ -517,6 +517,27 @@ void OnlineLoopClosure::start() {
 
 void OnlineLoopClosure::stop() {
   if (!running.exchange(false)) return;
+
+  // Discard whatever's still queued instead of draining it. On a live
+  // Pi5 run, loop_candidate_search+pose_graph_solve averaged ~289ms/kf
+  // against a ~285ms average keyframe interval -- essentially 100% of
+  // real-time budget with no slack, so any jitter puts this thread
+  // permanently behind for the rest of the run. Pushing nullptr to the
+  // back of input_queue (the old behavior) meant Ctrl+C had to fully
+  // process that entire backlog before the app could exit -- confirmed
+  // live: 81 keyframes still queued after the rest of the app had
+  // already shut down, ~30s of candidate-search+pose-graph-solve alone.
+  // By the time stop() runs here, the producer (vio->maybe_join(),
+  // called before this in oak_d_vio.cpp) has already stopped pushing,
+  // so draining is safe -- nothing new can arrive after it. Whatever's
+  // still queued at shutdown was never going to be scored in real time
+  // anyway, so dropping it costs nothing the run didn't already accept;
+  // it only bounds shutdown to whatever single keyframe is already
+  // in-flight inside processKeyframe() (worst case ~1s), not the whole
+  // backlog.
+  MargData::Ptr discard;
+  while (input_queue.try_pop(discard)) {
+  }
   input_queue.push(nullptr);
   if (worker_thread_.joinable()) worker_thread_.join();
 }
