@@ -643,6 +643,12 @@ void OnlineLoopClosure::processKeyframe(const MargData::Ptr& data,
   // to stay in-bounds -- same EDGE_THRESHOLD margin
   // detectKeypointsMapping's own corners are filtered to (see
   // src/utils/keypoints.cpp).
+  //
+  // Live-validated 2026-09-24 (see kMaxHarvestedLandmarksPerKf's comment
+  // in sqrt_keypoint_vio.cpp for the full A/B writeup): this is what
+  // lets a genuinely-matched long-range closure back to the true start
+  // actually clear mapper_min_matches, instead of being capped by a
+  // candidate keyframe's own sparse single-instant stereo triangulation.
   // (corner index in kf.kd0.corners, VIO-landmark 3D point in this
   // keyframe's own cam0 frame) for every landmark corner actually kept
   // below -- applied to kf.pts3d/corner_to_pt3d AFTER the stereo-

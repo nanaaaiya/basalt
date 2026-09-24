@@ -1128,6 +1128,34 @@ void SqrtKeypointVioEstimator<Scalar_>::marginalize(
           // well-constrained its triangulation is) and keep only the
           // strongest kMaxHarvestedLandmarksPerKf, instead of an
           // arbitrary lmdb-iteration-order subset.
+          //
+          // Live validation (2026-09-24, this cap already active): the
+          // elevated cost (331-396ms average across both a good and a
+          // bad outcome) turned out to be mostly LEGITIMATE work, not
+          // waste -- the fraction of candidate evaluations proceeding
+          // past the cheap pnp-ready-points gate into full PnP-RANSAC
+          // rose from 21.3% (pre-feature) to 23.7-29.8% (with this
+          // feature), i.e. more candidates are now actually worth
+          // verifying, not padding. A controlled A/B (same route, back
+          // to back, this branch vs. the pre-landmark-reuse baseline)
+          // found the feature directly fixes a specific, previously
+          // undiagnosed failure mode: a genuinely-matched long-range
+          // closure back to the true start (16 mutual-cross-check
+          // corners) was rejected on the baseline branch purely because
+          // the candidate (home-region) keyframe's own triangulation
+          // yield was only 6.38%, leaving just 5 of those 16 matches
+          // PnP-ready (< mapper_min_matches=13). The same route on this
+          // branch closed several genuine long-range loops (up to 453
+          // keyframes back) because candidate partner_triangulated was
+          // 11.9-20.9% instead -- enough for real matches to clear the
+          // SAME unweakened threshold on their own merit, rather than
+          // needing mapper_min_matches lowered (which was considered and
+          // rejected: it can't distinguish a strong match capped by
+          // sparse triangulation from a genuinely weak/aliased one, and
+          // this codebase has already been burned once by a similar
+          // loosening -- see kMinTriangulatedPointsForDatabase's history
+          // above). Net: keep this feature, the extra cost is buying
+          // real verification capability that baseline provably lacks.
           constexpr size_t kMaxHarvestedLandmarksPerKf = 40;
 
           std::vector<const Keypoint<Scalar>*> host_landmarks =
