@@ -33,6 +33,8 @@ OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 */
 
+#include <algorithm>
+
 #include <basalt/vi_estimator/marg_helper.h>
 #include <basalt/vi_estimator/sqrt_keypoint_vio.h>
 
@@ -1065,7 +1067,7 @@ void SqrtKeypointVioEstimator<Scalar_>::marginalize(
 
     // Save marginalization prior
     if (out_marg_queue && !kfs_to_marg.empty()) {
-      // int64_t kf_id = *kfs_to_marg.begin();
+      int64_t kf_id = *kfs_to_marg.begin();
 
       {
         MargData::Ptr m(new MargData);
@@ -1089,6 +1091,98 @@ void SqrtKeypointVioEstimator<Scalar_>::marginalize(
 
         for (int64_t t : m->kfs_all) {
           m->opt_flow_res.emplace_back(prev_opt_flow_res.at(t));
+        }
+
+        // Harvest this keyframe's cam0-hosted landmarks (see MargData::
+        // host_landmark_px/host_landmark_pt3d's comment) right before
+        // lmdb.removeKeyframes() below drops them for good -- this is
+        // the last point they're still accessible. direction/inv_dist
+        // reflect the just-finished optimize() above, so this is their
+        // best available estimate, triangulated over this landmark's
+        // full real motion baseline across however many VIO keyframes
+        // observed it -- typically much stronger geometry than
+        // OnlineLoopClosure's own single-instant ~7.5cm stereo
+        // triangulation. cam1-hosted landmarks are skipped: their
+        // direction/inv_dist and pixel position live in cam1's frame,
+        // not cam0's, and OnlineLoopClosure's own pipeline is cam0-only.
+        //
+        // getLandmarksForHost() calls observations.at(tcid) internally,
+        // which THROWS std::out_of_range if this keyframe hosts zero
+        // landmarks -- a real, reachable case (confirmed live: a crash
+        // during a low-triangulation-yield stretch, triangulated_points
+        // consistently 0), not a hypothetical one. Guard with the same
+        // map getHostKfs() itself reads, via the public accessor.
+        const TimeCamId host_tcid(kf_id, 0);
+        if (lmdb.getObservations().count(host_tcid) > 0) {
+          // Cap how many landmarks a single keyframe contributes -- a
+          // live test found some keyframes hosting 700+ (mean 102,
+          // median 65 among keyframes with any at all), and
+          // OnlineLoopClosure's own candidate matching is brute-force
+          // O(corners x corners_partner) (see kMaxCandidatesToVerify's
+          // comment), so feeding all of them in pushed
+          // loop_candidate_search from 68.8-224.6ms up to 331.7ms
+          // average -- above the ~256ms average keyframe interval, a
+          // real-time-budget regression the feature didn't have before.
+          // Rank by observation count (more views a landmark survived
+          // in the VIO's own window is a reasonable proxy for how
+          // well-constrained its triangulation is) and keep only the
+          // strongest kMaxHarvestedLandmarksPerKf, instead of an
+          // arbitrary lmdb-iteration-order subset.
+          //
+          // Live validation (2026-09-24, this cap already active): the
+          // elevated cost (331-396ms average across both a good and a
+          // bad outcome) turned out to be mostly LEGITIMATE work, not
+          // waste -- the fraction of candidate evaluations proceeding
+          // past the cheap pnp-ready-points gate into full PnP-RANSAC
+          // rose from 21.3% (pre-feature) to 23.7-29.8% (with this
+          // feature), i.e. more candidates are now actually worth
+          // verifying, not padding. A controlled A/B (same route, back
+          // to back, this branch vs. the pre-landmark-reuse baseline)
+          // found the feature directly fixes a specific, previously
+          // undiagnosed failure mode: a genuinely-matched long-range
+          // closure back to the true start (16 mutual-cross-check
+          // corners) was rejected on the baseline branch purely because
+          // the candidate (home-region) keyframe's own triangulation
+          // yield was only 6.38%, leaving just 5 of those 16 matches
+          // PnP-ready (< mapper_min_matches=13). The same route on this
+          // branch closed several genuine long-range loops (up to 453
+          // keyframes back) because candidate partner_triangulated was
+          // 11.9-20.9% instead -- enough for real matches to clear the
+          // SAME unweakened threshold on their own merit, rather than
+          // needing mapper_min_matches lowered (which was considered and
+          // rejected: it can't distinguish a strong match capped by
+          // sparse triangulation from a genuinely weak/aliased one, and
+          // this codebase has already been burned once by a similar
+          // loosening -- see kMinTriangulatedPointsForDatabase's history
+          // above). Net: keep this feature, the extra cost is buying
+          // real verification capability that baseline provably lacks.
+          constexpr size_t kMaxHarvestedLandmarksPerKf = 40;
+
+          std::vector<const Keypoint<Scalar>*> host_landmarks =
+              lmdb.getLandmarksForHost(host_tcid);
+          if (host_landmarks.size() > kMaxHarvestedLandmarksPerKf) {
+            std::partial_sort(
+                host_landmarks.begin(),
+                host_landmarks.begin() + kMaxHarvestedLandmarksPerKf,
+                host_landmarks.end(),
+                [](const Keypoint<Scalar>* a, const Keypoint<Scalar>* b) {
+                  return a->obs.size() > b->obs.size();
+                });
+            host_landmarks.resize(kMaxHarvestedLandmarksPerKf);
+          }
+
+          for (const Keypoint<Scalar>* kpt : host_landmarks) {
+            Vec4 pt_cam = StereographicParam<Scalar>::unproject(kpt->direction);
+            pt_cam[3] = kpt->inv_dist;
+            if (!(pt_cam[3] > Scalar(0))) continue;  // behind camera / invalid
+
+            Vec3 pt3d = pt_cam.template head<3>() / pt_cam[3];
+            Vec2 px;
+            if (!calib.intrinsics[0].project(pt3d, px)) continue;
+
+            m->host_landmark_pt3d.emplace_back(pt3d.template cast<double>());
+            m->host_landmark_px.emplace_back(px.template cast<double>());
+          }
         }
 
         out_marg_queue->push(m);

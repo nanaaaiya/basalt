@@ -343,6 +343,22 @@ struct MargData {
   bool use_imu;
 
   std::vector<OpticalFlowResult::Ptr> opt_flow_res;
+
+  // Multi-view-triangulated cam0-hosted landmarks belonging to the
+  // keyframe(s) in kfs_to_marg, harvested from the VIO estimator's own
+  // lmdb right before marginalization removes them (see
+  // SqrtKeypointVioEstimator::measure(), the out_marg_queue push site).
+  // Parallel arrays: host_landmark_px[i] is this landmark's pixel
+  // position in its host keyframe's own cam0 image,
+  // host_landmark_pt3d[i] is its metric 3D position in that SAME
+  // keyframe's own cam0 frame (not world frame) -- consumed by
+  // OnlineLoopClosure::processKeyframe() as a second, much
+  // stronger-baseline source of 3D points than its own single-instant
+  // stereo triangulation (see that method's comment for why: these
+  // landmarks were triangulated over real motion baseline across many
+  // VIO keyframes, not the OAK-D Lite's fixed ~7.5cm stereo baseline).
+  Eigen::aligned_vector<Eigen::Vector2d> host_landmark_px;
+  Eigen::aligned_vector<Eigen::Vector3d> host_landmark_pt3d;
 };
 
 struct RelPoseFactor {
