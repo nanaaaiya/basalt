@@ -1454,8 +1454,16 @@ void OnlineLoopClosure::checkDriftGate() {
       release_blend_start_wall_ = std::chrono::steady_clock::now();
       release_blend_duration_s_ = -1.0;  // recomputed on first use -- see comment
       // See forceReleaseDriftHoldLocked()'s matching reset -- same bug,
-      // same fix, for the confirmed-release path.
-      starvation_active_ = false;
+      // same fix, for the confirmed-release path. Only reset
+      // starvation_active_ if tracking has actually recovered by this
+      // exact moment (checked against the current health report) -- see
+      // that comment for why an unconditional reset creates a blind
+      // spot.
+      if (latest_reported_tracked_count_ >= kStarvationMinTrackedCount &&
+          latest_reported_total_observed_count_ >=
+              kStarvationMinTotalObserved) {
+        starvation_active_ = false;
+      }
       has_good_streak_ = false;
       drift_gate_events.try_push(DriftGateEvent::kReleasedConfirmed);
       std::cout << "[ONLINE-LOOP] DRIFT GATE RELEASED: kf=" << (n - 1)
@@ -1503,7 +1511,22 @@ void OnlineLoopClosure::forceReleaseDriftHoldLocked() const {
   // -- confirmed on a real live test (2026-09-21): reported "starved for"
   // durations of 10-23s despite kStarvationPersistenceSeconds being 2.0,
   // because this reset was missing.
-  starvation_active_ = false;
+  //
+  // BUT only reset starvation_active_ if tracking has actually recovered
+  // by this exact moment (checked against the current health report) --
+  // an unconditional reset re-created a different bug: confirmed live
+  // (2026-09-25), a hold releasing while the camera was STILL fully
+  // covered left the pose completely unguarded for ~2s
+  // (kStarvationPersistenceSeconds) until a fresh accumulation re-tripped
+  // a second hold, even though the underlying starvation never actually
+  // stopped. Leaving starvation_active_/starvation_since_wall_ alone when
+  // still starved lets the very next check see the ALREADY-elapsed time
+  // and re-trip immediately instead of waiting another full
+  // kStarvationPersistenceSeconds from zero.
+  if (latest_reported_tracked_count_ >= kStarvationMinTrackedCount &&
+      latest_reported_total_observed_count_ >= kStarvationMinTotalObserved) {
+    starvation_active_ = false;
+  }
   has_good_streak_ = false;
   drift_gate_events.try_push(DriftGateEvent::kReleasedForced);
 }
