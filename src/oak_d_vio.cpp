@@ -577,6 +577,11 @@ int main(int argc, char** argv) {
         if (online_loop_closure) {
           online_loop_closure->reportTrackingHealth(
               tracked_ratio, tracked_count, total_observed_count);
+          // See OnlineLoopClosure::reportAccelStability()'s comment --
+          // lets a starvation hold's force-release tell a real
+          // camera-cover-while-still episode from an ordinary
+          // tracking-loss-while-moving one.
+          online_loop_closure->reportAccelStability(vio->isLikelyStationary());
         }
 
         if (health.primary_reason != "nominal") {

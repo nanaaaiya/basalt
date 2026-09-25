@@ -386,6 +386,42 @@ SqrtKeypointVioEstimator<Scalar_>::popFromImuDataQueue() {
     latest_accel_norm = data->accel.norm();
     std::lock_guard<std::mutex> lock(latest_gyro_mutex);
     latest_gyro = data->gyro.template cast<double>();
+
+    // Rolling stationary check (see isLikelyStationary()) -- same
+    // mean/variance idea as the static-init gravity-alignment check
+    // above, continuously updated instead of a one-shot startup gate.
+    // Raw (uncalibrated) accel is fine here: bias is a slowly-varying
+    // near-constant offset, so it barely affects a SHORT window's
+    // variance either way -- this only needs to tell "is it noisy right
+    // now," not produce a metrically exact reading.
+    accel_stationary_window.emplace_back(data->t_ns,
+                                         data->accel.template cast<double>());
+    int64_t window_ns =
+        static_cast<int64_t>(config.vio_static_init_window_s * 1e9);
+    while (accel_stationary_window.size() > 1 &&
+          accel_stationary_window.back().first -
+                  accel_stationary_window.front().first >
+              window_ns) {
+      accel_stationary_window.pop_front();
+    }
+
+    if (accel_stationary_window.size() >= 2) {
+      Eigen::Vector3d mean = Eigen::Vector3d::Zero();
+      for (const auto& kv : accel_stationary_window) mean += kv.second;
+      mean /= double(accel_stationary_window.size());
+
+      double var = 0;
+      for (const auto& kv : accel_stationary_window) {
+        var += (kv.second - mean).squaredNorm();
+      }
+      var /= double(accel_stationary_window.size());
+
+      latest_likely_stationary =
+          std::sqrt(var) <= config.vio_static_init_max_accel_std;
+    } else {
+      // Not enough samples yet to judge -- don't assume stationary.
+      latest_likely_stationary = false;
+    }
   }
 
   if constexpr (std::is_same_v<Scalar, double>) {

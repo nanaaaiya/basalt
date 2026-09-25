@@ -269,6 +269,18 @@ class OnlineLoopClosure {
   void reportTrackingHealth(double tracked_ratio, int tracked_count,
                             int total_observed_count);
 
+  // Same reporting pattern as reportTrackingHealth() above, for a
+  // different signal: whether the VIO estimator's own rolling
+  // accelerometer-variance check currently looks like the device isn't
+  // moving (see SqrtKeypointVioEstimator::isLikelyStationary()). Used by
+  // getSmoothedCorrectedPose()'s force-release path to tell a real
+  // camera-cover-while-still episode (raw VIO's own IMU-only
+  // dead-reckoning diverging from sensor noise/bias with nothing to
+  // check it against -- confirmed live, up to 3.4m over a single ~5s
+  // blackout) from an ordinary tracking-loss-while-moving one, where
+  // the same override would be wrong to apply.
+  void reportAccelStability(bool likely_stationary);
+
   // Same as getCorrectedTrajectory(), but paired with each keyframe's
   // timestamp -- needed for logging/analysis (matching timestamps up
   // against the raw VIO trajectory, sample rate, etc.), not just drawing a
@@ -525,6 +537,39 @@ class OnlineLoopClosure {
   std::atomic<double> latest_reported_tracked_ratio_{1.0};
   std::atomic<int> latest_reported_tracked_count_{999};
   std::atomic<int> latest_reported_total_observed_count_{999};
+  // Written by reportAccelStability() -- see that method's comment.
+  // Defaults false (don't assume stationary) so nothing engages the
+  // override below before the first real report arrives.
+  std::atomic<bool> latest_reported_likely_stationary_{false};
+
+  // Tracks whether NO non-stationary sample has been seen since the
+  // CURRENT hold began -- only meaningful for a starvation-triggered
+  // hold (drift_held_since_t_ns_ < 0, see that member's comment); a
+  // residual-triggered (walking) hold never reads this. Initialized to
+  // whatever the accel check says at the moment of tripping, then
+  // revoked (never re-armed) the instant a non-stationary sample arrives
+  // while still held -- if the device moved partway through, the
+  // override below must not apply.
+  mutable bool hold_believed_stationary_ = false;
+  // Set at the moment a starvation-triggered, believed-stationary hold
+  // force-releases (see getSmoothedCorrectedPose()'s wall-clock
+  // watchdog) -- makes the immediately-following not-held computation
+  // use current_raw_pose as its own reference instead of the stale
+  // kf.T_w_i_raw from before the hold began, so the huge accumulated
+  // IMU-only dead-reckoning drift during the blackout (confirmed live:
+  // up to 3.4m over a single ~5s cover) never gets applied at all,
+  // rather than just gliding to it more slowly. One-shot: cleared the
+  // next time a genuinely new keyframe is processed (see
+  // last_seen_kf_t_ns_for_stationary_override_ below), not a standing
+  // override.
+  mutable bool have_stationary_raw_override_ = false;
+  mutable Sophus::SE3d stationary_raw_override_pose_;
+  // kf.t_ns last seen by getSmoothedCorrectedPose() -- lets it detect
+  // "a new keyframe just arrived" (the back of keyframes_ changed
+  // identity) and clear have_stationary_raw_override_ at that point,
+  // rather than leaving a one-shot correction active indefinitely.
+  mutable int64_t last_seen_kf_t_ns_for_stationary_override_ = -1;
+
   // Wall-clock time the CURRENT continuous starvation stretch began.
   // NOT reset the instant a single healthy sample arrives -- see
   // good_streak_since_wall_ below and kStarvationRecoveryGraceS in the

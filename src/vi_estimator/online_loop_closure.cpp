@@ -1526,6 +1526,10 @@ void OnlineLoopClosure::reportTrackingHealth(double tracked_ratio,
   latest_reported_total_observed_count_ = total_observed_count;
 }
 
+void OnlineLoopClosure::reportAccelStability(bool likely_stationary) {
+  latest_reported_likely_stationary_ = likely_stationary;
+}
+
 Eigen::aligned_vector<Eigen::Vector3d> OnlineLoopClosure::getCorrectedTrajectory()
     const {
   std::lock_guard<std::mutex> lock(state_mutex_);
@@ -1570,6 +1574,14 @@ bool OnlineLoopClosure::getSmoothedCorrectedPose(
   // isn't gated by this), so it still gets a chance to self-correct;
   // only what's published live is held back until it does.
   if (drift_held_) {
+    // Revoke the stationary belief the instant a non-stationary sample
+    // arrives while held -- see hold_believed_stationary_'s comment.
+    // Only meaningful for a starvation-triggered hold (drift_held_since_
+    // t_ns_ < 0); a residual-triggered one never reads this flag.
+    if (drift_held_since_t_ns_ < 0 && !latest_reported_likely_stationary_) {
+      hold_believed_stationary_ = false;
+    }
+
     // Wall-clock watchdog for kDriftGateMaxHoldSeconds -- see
     // drift_held_since_wall_'s comment. checkDriftGate()'s own timeout
     // check only runs when solvePoseGraph() processes a new keyframe; if
@@ -1585,10 +1597,24 @@ bool OnlineLoopClosure::getSmoothedCorrectedPose(
                                     drift_held_since_wall_)
                                     .count();
     if (held_seconds_wall >= kDriftGateMaxHoldSeconds) {
+      // See have_stationary_raw_override_'s comment: a starvation hold
+      // that was believed stationary the whole time gets its raw-drift
+      // reference reset to right now, instead of releasing into
+      // whatever raw VIO's own IMU-only dead-reckoning accumulated
+      // during the blackout.
+      if (drift_held_since_t_ns_ < 0 && hold_believed_stationary_) {
+        have_stationary_raw_override_ = true;
+        stationary_raw_override_pose_ = current_raw_pose;
+      }
       forceReleaseDriftHoldLocked();
       std::cout << "[ONLINE-LOOP] DRIFT GATE FORCE-RELEASED (wall-clock "
                    "watchdog, no recent keyframe activity): held for "
-                << held_seconds_wall << "s" << std::endl;
+                << held_seconds_wall << "s"
+                << (drift_held_since_t_ns_ < 0 && hold_believed_stationary_
+                        ? " -- believed stationary throughout, resetting "
+                          "raw-drift reference to now"
+                        : "")
+                << std::endl;
     } else {
       out = held_pose_;
       return true;
@@ -1640,6 +1666,11 @@ bool OnlineLoopClosure::getSmoothedCorrectedPose(
                                      // wall-clock twin is what actually
                                      // governs the max-hold cap here.
       drift_held_since_wall_ = now;
+      // See hold_believed_stationary_'s comment -- starts true only if
+      // the accel check already looks stationary at the moment of
+      // tripping; revoked (never re-armed) the instant that stops being
+      // true while still held (see the drift_held_ block above).
+      hold_believed_stationary_ = latest_reported_likely_stationary_;
       drift_gate_events.try_push(DriftGateEvent::kTripped);
       std::cout << "[ONLINE-LOOP] DRIFT GATE TRIPPED (starvation: "
                    "tracked_count="
@@ -1669,13 +1700,31 @@ bool OnlineLoopClosure::getSmoothedCorrectedPose(
   }
 
   const LoopKeyframe& kf = keyframes_.back();
+
+  // A genuinely new keyframe arrived -- the one-shot stationary-release
+  // override (if any) has done its job for this transition; let normal
+  // kf.T_w_i_raw-based tracking take back over. See
+  // have_stationary_raw_override_'s comment.
+  if (kf.t_ns != last_seen_kf_t_ns_for_stationary_override_) {
+    have_stationary_raw_override_ = false;
+    last_seen_kf_t_ns_for_stationary_override_ = kf.t_ns;
+  }
+
   Sophus::SE3d T_w_i_corrected_kf(composeYPR(kf.roll, kf.pitch, kf.yaw),
                                    kf.t_opt);
   // Raw motion since this keyframe was captured -- kf.T_w_i_raw and
   // current_raw_pose are both raw VIO poses in the same (uncorrected)
   // world frame, so this delta is meaningful even though that frame's
-  // origin/yaw is arbitrary.
-  Sophus::SE3d T_kf_to_current = kf.T_w_i_raw.inverse() * current_raw_pose;
+  // origin/yaw is arbitrary. Uses stationary_raw_override_pose_ instead
+  // of kf.T_w_i_raw immediately after a believed-stationary starvation
+  // release, so the huge IMU-only drift accumulated during the blackout
+  // (kf.T_w_i_raw is from BEFORE the hold began) never gets applied --
+  // see have_stationary_raw_override_'s comment.
+  const Sophus::SE3d& T_w_i_raw_reference =
+      have_stationary_raw_override_ ? stationary_raw_override_pose_
+                                    : kf.T_w_i_raw;
+  Sophus::SE3d T_kf_to_current =
+      T_w_i_raw_reference.inverse() * current_raw_pose;
   out = T_w_i_corrected_kf * T_kf_to_current;
 
   // Blend across ordinary target movement too -- see

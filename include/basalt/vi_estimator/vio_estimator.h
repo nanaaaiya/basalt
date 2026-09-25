@@ -132,6 +132,16 @@ class VioEstimatorBase {
   virtual double getLatestGyroNorm() const { return 0.0; }
   virtual double getLatestAccelNorm() const { return 0.0; }
 
+  // Rolling accelerometer-variance check (same idea as the static-init
+  // gravity-alignment check, but continuously updated instead of a
+  // one-shot startup gate) -- true when recent accel samples look
+  // consistent with the device not moving. Defaults false (never claim
+  // stationary) so nothing that reads this trips before a real
+  // estimator computes it. See OnlineLoopClosure::reportAccelStability()
+  // for why this matters: distinguishing a real camera-cover-while-still
+  // episode from an ordinary tracking-loss-while-moving one.
+  virtual bool isLikelyStationary() const { return false; }
+
   // Current bias estimate the optimizer is carrying -- exposed so a
   // runaway raw trajectory can be diagnosed live (is the bias sitting at
   // a wrong value, oscillating, or steadily diverging?) instead of only

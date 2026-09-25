@@ -36,6 +36,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #include <atomic>
 #include <chrono>
+#include <deque>
 #include <mutex>
 #include <thread>
 
@@ -244,6 +245,7 @@ class SqrtKeypointVioEstimator : public VioEstimatorBase,
 
   double getLatestGyroNorm() const override { return latest_gyro_norm; }
   double getLatestAccelNorm() const override { return latest_accel_norm; }
+  bool isLikelyStationary() const override { return latest_likely_stationary; }
   Eigen::Vector3d getLatestGyro() const {
     std::lock_guard<std::mutex> lock(latest_gyro_mutex);
     return latest_gyro;
@@ -329,6 +331,16 @@ class SqrtKeypointVioEstimator : public VioEstimatorBase,
   std::atomic<double> latest_accel_norm{0.0};
   mutable std::mutex latest_gyro_mutex;
   Eigen::Vector3d latest_gyro{Eigen::Vector3d::Zero()};
+
+  // Rolling accel-variance stationary check -- see isLikelyStationary().
+  // Same window/threshold as the static-init gravity-alignment check
+  // (config.vio_static_init_window_s / vio_static_init_max_accel_std),
+  // reused here rather than introducing new untuned constants, just
+  // applied continuously instead of once at startup. Guarded by
+  // latest_gyro_mutex (not a new mutex): updated at the same
+  // per-IMU-sample chokepoint, already low-contention.
+  std::deque<std::pair<int64_t, Eigen::Vector3d>> accel_stationary_window;
+  std::atomic<bool> latest_likely_stationary{false};
 
   mutable std::mutex latest_bias_mutex;
   Eigen::Vector3d latest_accel_bias{Eigen::Vector3d::Zero()};
