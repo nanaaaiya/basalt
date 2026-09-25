@@ -167,11 +167,22 @@ void SqrtKeypointVioEstimator<Scalar_>::initialize(const Eigen::Vector3d& bg_,
         calib.dicrete_time_accel_noise_std().array().square();
     const Vec3 gyro_cov = calib.dicrete_time_gyro_noise_std().array().square();
 
+    // Last calibrated accel/gyro sample seen while NOT starved -- see
+    // this loop's "substitute_stationary" comment below for why. Persists
+    // for the processing thread's whole lifetime (this lambda's own
+    // enclosing scope, same as nominal_accel_cov/gyro_cov above), updated
+    // every non-starved sample so it's always the freshest trustworthy
+    // reading by the time a starvation episode begins.
+    Vec3 last_good_accel = Vec3::Zero();
+    Vec3 last_good_gyro = Vec3::Zero();
+
     typename ImuData<Scalar>::Ptr data = popFromImuDataQueue();
     BASALT_ASSERT_MSG(data, "first IMU measurment is nullptr");
 
     data->accel = calib.calib_accel_bias.getCalibrated(data->accel);
     data->gyro = calib.calib_gyro_bias.getCalibrated(data->gyro);
+    last_good_accel = data->accel;
+    last_good_gyro = data->gyro;
 
     while (true) {
       vision_data_queue.pop(curr_frame);
@@ -311,16 +322,57 @@ void SqrtKeypointVioEstimator<Scalar_>::initialize(const Eigen::Vector3d& bg_,
         // every single frame and never suppresses future correction --
         // vision or a later well-tracked IMU span can still freely pull
         // the estimate back once available.
+        const bool starved = latest_tracked_count < kBiasFreezeTrackedCountThresh;
         const Vec3 accel_cov =
-            latest_tracked_count < kBiasFreezeTrackedCountThresh
-                ? nominal_accel_cov * Scalar(kStarvedAccelCovInflationFactor)
-                : nominal_accel_cov;
+            starved ? nominal_accel_cov * Scalar(kStarvedAccelCovInflationFactor)
+                    : nominal_accel_cov;
+
+        // Stop the estimator's own position/velocity from advancing at
+        // all during a starved stretch that also looks stationary
+        // (isLikelyStationary(), see that method) -- a step further than
+        // the accel_cov inflation above. That only de-weights this
+        // interval's accel factor RELATIVE TO other constraints in the
+        // bundle adjustment; it does nothing when there's no vision/prior
+        // signal for it to compete against, which is exactly the
+        // camera-covered case. Confirmed live (2026-09-25): even with a
+        // downstream publish-layer override making the pose LOOK frozen
+        // immediately after release, the estimator's own internal state
+        // was still silently drifting underneath (up to 3.4m over a
+        // single ~5s blackout) and reasserted itself the moment a new
+        // keyframe was built from it a beat later -- a display-layer fix
+        // alone can't out-run that. Substituting the last known-good
+        // (pre-blackout) calibrated sample repeatedly, instead of the
+        // live one, integrates to ~zero net specific-force change --
+        // literally the same reading integrate() would see if the device
+        // had genuinely stayed still, so this reuses the exact same
+        // (already-correct) physics rather than a new approximation.
+        // Deliberately NOT gated on starved alone: if the device is
+        // genuinely moving while blind, holding the sample fixed would
+        // be actively wrong (worse than discounted dead-reckoning), so
+        // this only ever engages for the same narrow case
+        // isLikelyStationary() itself targets.
+        const bool substitute_stationary = starved && isLikelyStationary();
+
+        auto trackOrSubstitute = [&](ImuData<Scalar>& d) {
+          if (substitute_stationary) {
+            d.accel = last_good_accel;
+            d.gyro = last_good_gyro;
+          } else if (!starved) {
+            // An erratic (starved-but-moving) moment is never a good
+            // baseline for a LATER, different stationary episode, so
+            // only bank known-good samples from genuinely healthy
+            // tracking.
+            last_good_accel = d.accel;
+            last_good_gyro = d.gyro;
+          }
+        };
 
         while (data->t_ns <= prev_frame->t_ns) {
           data = popFromImuDataQueue();
           if (!data) break;
           data->accel = calib.calib_accel_bias.getCalibrated(data->accel);
           data->gyro = calib.calib_gyro_bias.getCalibrated(data->gyro);
+          trackOrSubstitute(*data);
         }
 
         while (data->t_ns <= curr_frame->t_ns) {
@@ -329,6 +381,7 @@ void SqrtKeypointVioEstimator<Scalar_>::initialize(const Eigen::Vector3d& bg_,
           if (!data) break;
           data->accel = calib.calib_accel_bias.getCalibrated(data->accel);
           data->gyro = calib.calib_gyro_bias.getCalibrated(data->gyro);
+          trackOrSubstitute(*data);
         }
 
         if (meas->get_start_t_ns() + meas->get_dt_ns() < curr_frame->t_ns) {
