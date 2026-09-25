@@ -469,8 +469,27 @@ SqrtKeypointVioEstimator<Scalar_>::popFromImuDataQueue() {
       }
       var /= double(accel_stationary_window.size());
 
-      latest_likely_stationary =
-          std::sqrt(var) <= config.vio_static_init_max_accel_std;
+      double accel_std = std::sqrt(var);
+      latest_likely_stationary = accel_std <= config.vio_static_init_max_accel_std;
+
+      // TEMPORARY diagnostic (2026-09-25): vio_static_init_max_accel_std
+      // (0.2 m/s^2) was tuned for the STARTUP static-init check -- a
+      // device resting untouched for a controlled 0.3s window. Live
+      // testing found isLikelyStationary() rarely reporting true during
+      // a realistic hand-held "hold it still" camera-cover test (1 of 8+
+      // force-releases in one run), suggesting ordinary hand
+      // tremor/micro-shake may exceed this threshold over several
+      // seconds even when the user is genuinely trying to hold still --
+      // logging the actual value to find out, rather than guessing a
+      // replacement threshold blind.
+      static int stationary_diag_counter = 0;
+      if (++stationary_diag_counter >= 30) {
+        stationary_diag_counter = 0;
+        std::cout << "[STATIONARY-DIAG] accel_std=" << accel_std
+                  << " threshold=" << config.vio_static_init_max_accel_std
+                  << " likely_stationary=" << latest_likely_stationary
+                  << " tracked_count=" << latest_tracked_count << std::endl;
+      }
     } else {
       // Not enough samples yet to judge -- don't assume stationary.
       latest_likely_stationary = false;
