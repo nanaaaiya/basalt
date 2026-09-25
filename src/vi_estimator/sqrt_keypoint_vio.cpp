@@ -196,6 +196,15 @@ void SqrtKeypointVioEstimator<Scalar_>::initialize(const Eigen::Vector3d& bg_,
         break;
       }
 
+      // Set inside the "if (prev_frame)" block below when this whole
+      // interval was fed substituted (believed-stationary) IMU samples --
+      // read by measure() to directly correct the predicted state's
+      // velocity/translation, not just the samples that produced it. See
+      // substitute_stationary's own comment further down for the full
+      // reasoning. False by default (e.g. the very first frame, before
+      // prev_frame exists).
+      bool substitute_stationary_for_measure = false;
+
       // Correct camera time offset
       // curr_frame->t_ns += calib.cam_time_offset_ns;
 
@@ -351,7 +360,8 @@ void SqrtKeypointVioEstimator<Scalar_>::initialize(const Eigen::Vector3d& bg_,
         // be actively wrong (worse than discounted dead-reckoning), so
         // this only ever engages for the same narrow case
         // isLikelyStationary() itself targets.
-        const bool substitute_stationary = starved && isLikelyStationary();
+        substitute_stationary_for_measure = starved && isLikelyStationary();
+        const bool substitute_stationary = substitute_stationary_for_measure;
 
         auto trackOrSubstitute = [&](ImuData<Scalar>& d) {
           if (substitute_stationary) {
@@ -393,7 +403,7 @@ void SqrtKeypointVioEstimator<Scalar_>::initialize(const Eigen::Vector3d& bg_,
         }
       }
 
-      measure(curr_frame, meas);
+      measure(curr_frame, meas, substitute_stationary_for_measure);
       prev_frame = curr_frame;
     }
 
@@ -511,7 +521,8 @@ SqrtKeypointVioEstimator<Scalar_>::popFromImuDataQueue() {
 template <class Scalar_>
 bool SqrtKeypointVioEstimator<Scalar_>::measure(
     const OpticalFlowResult::Ptr& opt_flow_meas,
-    const typename IntegratedImuMeasurement<Scalar>::Ptr& meas) {
+    const typename IntegratedImuMeasurement<Scalar>::Ptr& meas,
+    bool substitute_stationary) {
   stats_sums_.add("frame_id", opt_flow_meas->t_ns).format("none");
   Timer t_total;
 
@@ -534,6 +545,26 @@ bool SqrtKeypointVioEstimator<Scalar_>::measure(
 
     meas->predictState(frame_states.at(last_state_t_ns).getState(), g,
                        next_state);
+
+    // See substitute_stationary_for_measure's comment at its declaration
+    // site. Repeating the last known-good IMU sample throughout this
+    // interval (see popFromImuDataQueue()/proc_func's trackOrSubstitute)
+    // only prevents NEW drift from accumulating -- predictState() above
+    // still just carries forward whatever velocity the PREVIOUS state
+    // already had, uncorrected. If that velocity was already nonzero
+    // (e.g. a real disturbance right as the interval began, or mid-hold),
+    // it silently keeps translating into position drift for the rest of
+    // the interval. Confirmed live (2026-09-25): short believed-
+    // stationary holds showed near-zero drift, but longer ones (more time
+    // for one such disturbance to occur) still drifted up to 3.5m.
+    // Directly asserting zero velocity and zero net translation here is
+    // the correction step a real zero-velocity update would provide,
+    // without needing a new optimizer factor type.
+    if (substitute_stationary) {
+      next_state.vel_w_i.setZero();
+      next_state.T_w_i.translation() =
+          frame_states.at(last_state_t_ns).getState().T_w_i.translation();
+    }
 
     have_imu_prediction = true;
     imu_only_translation = next_state.T_w_i.translation();

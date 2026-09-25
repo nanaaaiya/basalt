@@ -118,8 +118,17 @@ class SqrtKeypointVioEstimator : public VioEstimatorBase,
 
   typename ImuData<Scalar>::Ptr popFromImuDataQueue();
 
+  // substitute_stationary: true when the WHOLE interval since the last
+  // state was fed substituted (last-known-good, repeated) IMU samples --
+  // see that flag's own comment at its computation site. Directly
+  // overrides the freshly-predicted state's velocity (to zero) and
+  // translation (held at the previous state's) rather than trusting
+  // predictState()'s propagated value, which only prevents NEW drift
+  // from accumulating and does nothing to correct an ALREADY-nonzero
+  // velocity left over from before the interval began.
   bool measure(const OpticalFlowResult::Ptr& opt_flow_meas,
-               const typename IntegratedImuMeasurement<Scalar>::Ptr& meas);
+               const typename IntegratedImuMeasurement<Scalar>::Ptr& meas,
+               bool substitute_stationary = false);
 
   // int64_t propagate();
   // void addNewState(int64_t data_t_ns);
