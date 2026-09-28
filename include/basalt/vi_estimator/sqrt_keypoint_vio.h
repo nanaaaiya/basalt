@@ -517,6 +517,32 @@ class SqrtKeypointVioEstimator : public VioEstimatorBase,
   std::chrono::steady_clock::time_point imu_vision_reweight_start_wall_;
   Scalar nominal_obs_std_dev{0};
 
+  // PROACTIVE counterpart to the reactive reweight above, for a gap that
+  // reweight structurally can't cover: imu_vision_disagreement can only
+  // be computed AFTER a frame's own optimize_and_marg() already ran (it
+  // compares the optimized result against the IMU prediction), so
+  // reweighting from that flag can only ever protect frame N+1 onward --
+  // it cannot protect frame N's own solve, the one that actually
+  // produced the bad result. Live-diagnosed (2026-09-28, pi5-49c62806):
+  // a single frame with tracked_count=7 -- just above the hard
+  // starvation cutoff (kBiasFreezeTrackedCountThresh=8), so not starved,
+  // and during genuine fast motion, so the isLikelyStationary()-gated
+  // protections elsewhere correctly don't apply either -- produced an
+  // un-recovered ~2m jump with nothing catching it. This term uses THIS
+  // frame's own tracked_count directly (known before optimize_and_marg()
+  // runs, same reasoning as kBiasFreezeTrackedCountThresh's header
+  // comment on why that check doesn't need to wait either), continuous
+  // (not on/off) so it only meaningfully engages right at the marginal
+  // edge: full kLowTrackedCountReweightFactor at/below
+  // kLowTrackedCountReweightThresh, rolling linearly to no extra
+  // downweight by double that. Combined with the reactive factor above
+  // via max(), not multiplied, so simultaneous triggers don't compound
+  // into an overly aggressive combined downweight. Reuses
+  // kImuVisionReweightFactor's own value (3.0) rather than inventing an
+  // unrelated number -- unproven against a live retest, first version of
+  // this mechanism.
+  static constexpr int kLowTrackedCountReweightThresh = 20;
+
   // Bias freeze: a SEPARATE mechanism from the reweight above, for a
   // different failure mode found on a real walking test (triangle-
   // pattern accuracy test, Pi5, 2026-09-21) -- during a sustained

@@ -912,6 +912,8 @@ bool SqrtKeypointVioEstimator<Scalar_>::measure(
   // after its optimization already ran (see below), so there's an
   // unavoidable one-frame lag (see the reweighting members' comment in
   // the header for why that's fine at this frame rate).
+  double reweight_factor = 1.0;
+
   if (imu_vision_disagreement) {
     auto now = std::chrono::steady_clock::now();
     if (!imu_vision_reweight_active_) {
@@ -922,19 +924,32 @@ bool SqrtKeypointVioEstimator<Scalar_>::measure(
                            now - imu_vision_reweight_start_wall_)
                            .count();
     if (active_s <= kImuVisionReweightMaxDurationS) {
-      obs_std_dev = nominal_obs_std_dev * Scalar(kImuVisionReweightFactor);
-    } else {
-      // Time cap exceeded -- give up reweighting for this episode and
-      // go back to trusting vision normally, rather than let IMU bias
-      // run uncorrected indefinitely (see header comment: this is the
-      // same failure mode as the global-weight-change blowup earlier
-      // this session, just bounded here instead of unbounded).
-      obs_std_dev = nominal_obs_std_dev;
+      reweight_factor = std::max(reweight_factor, kImuVisionReweightFactor);
     }
+    // else: time cap exceeded -- give up reweighting for this episode and
+    // go back to trusting vision normally, rather than let IMU bias
+    // run uncorrected indefinitely (see header comment: this is the
+    // same failure mode as the global-weight-change blowup earlier
+    // this session, just bounded here instead of unbounded).
   } else {
     imu_vision_reweight_active_ = false;
-    obs_std_dev = nominal_obs_std_dev;
   }
+
+  // Proactive counterpart -- see kLowTrackedCountReweightThresh's header
+  // comment for why this is needed in addition to the reactive term
+  // above (that one can only ever protect the frame AFTER a bad solve,
+  // never the bad solve itself). Uses THIS frame's own tracked_count,
+  // already known at this point in measure() -- no lag.
+  {
+    double low_count_alpha = std::clamp(
+        2.0 - double(latest_tracked_count) / kLowTrackedCountReweightThresh,
+        0.0, 1.0);
+    double low_count_factor =
+        1.0 + (kImuVisionReweightFactor - 1.0) * low_count_alpha;
+    reweight_factor = std::max(reweight_factor, low_count_factor);
+  }
+
+  obs_std_dev = nominal_obs_std_dev * Scalar(reweight_factor);
 
   // Bias freeze -- see kBiasFreezeTrackedCountThresh's header comment for
   // the failure mode this addresses (distinct from the reweight block
