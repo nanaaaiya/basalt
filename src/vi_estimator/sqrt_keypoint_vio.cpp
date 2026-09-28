@@ -196,15 +196,6 @@ void SqrtKeypointVioEstimator<Scalar_>::initialize(const Eigen::Vector3d& bg_,
         break;
       }
 
-      // Set inside the "if (prev_frame)" block below when this whole
-      // interval was fed substituted (believed-stationary) IMU samples --
-      // read by measure() to directly correct the predicted state's
-      // velocity/translation, not just the samples that produced it. See
-      // substitute_stationary's own comment further down for the full
-      // reasoning. False by default (e.g. the very first frame, before
-      // prev_frame exists).
-      bool substitute_stationary_for_measure = false;
-
       // Correct camera time offset
       // curr_frame->t_ns += calib.cam_time_offset_ns;
 
@@ -360,8 +351,7 @@ void SqrtKeypointVioEstimator<Scalar_>::initialize(const Eigen::Vector3d& bg_,
         // be actively wrong (worse than discounted dead-reckoning), so
         // this only ever engages for the same narrow case
         // isLikelyStationary() itself targets.
-        substitute_stationary_for_measure = starved && isLikelyStationary();
-        const bool substitute_stationary = substitute_stationary_for_measure;
+        const bool substitute_stationary = starved && isLikelyStationary();
 
         auto trackOrSubstitute = [&](ImuData<Scalar>& d) {
           if (substitute_stationary) {
@@ -403,7 +393,7 @@ void SqrtKeypointVioEstimator<Scalar_>::initialize(const Eigen::Vector3d& bg_,
         }
       }
 
-      measure(curr_frame, meas, substitute_stationary_for_measure);
+      measure(curr_frame, meas);
       prev_frame = curr_frame;
     }
 
@@ -459,6 +449,8 @@ SqrtKeypointVioEstimator<Scalar_>::popFromImuDataQueue() {
     // now," not produce a metrically exact reading.
     accel_stationary_window.emplace_back(data->t_ns,
                                          data->accel.template cast<double>());
+    gyro_stationary_window.emplace_back(data->t_ns,
+                                        data->gyro.template cast<double>());
     int64_t window_ns =
         static_cast<int64_t>(config.vio_static_init_window_s * 1e9);
     while (accel_stationary_window.size() > 1 &&
@@ -467,37 +459,55 @@ SqrtKeypointVioEstimator<Scalar_>::popFromImuDataQueue() {
               window_ns) {
       accel_stationary_window.pop_front();
     }
+    while (gyro_stationary_window.size() > 1 &&
+          gyro_stationary_window.back().first -
+                  gyro_stationary_window.front().first >
+              window_ns) {
+      gyro_stationary_window.pop_front();
+    }
 
-    if (accel_stationary_window.size() >= 2) {
+    auto window_std = [](const std::deque<std::pair<int64_t, Eigen::Vector3d>>&
+                             window) {
       Eigen::Vector3d mean = Eigen::Vector3d::Zero();
-      for (const auto& kv : accel_stationary_window) mean += kv.second;
-      mean /= double(accel_stationary_window.size());
-
+      for (const auto& kv : window) mean += kv.second;
+      mean /= double(window.size());
       double var = 0;
-      for (const auto& kv : accel_stationary_window) {
-        var += (kv.second - mean).squaredNorm();
-      }
-      var /= double(accel_stationary_window.size());
+      for (const auto& kv : window) var += (kv.second - mean).squaredNorm();
+      var /= double(window.size());
+      return std::sqrt(var);
+    };
 
-      double accel_std = std::sqrt(var);
+    if (accel_stationary_window.size() >= 2 &&
+        gyro_stationary_window.size() >= 2) {
+      double accel_std = window_std(accel_stationary_window);
+      double gyro_std = window_std(gyro_stationary_window);
       latest_accel_std = accel_std;
-      latest_likely_stationary = accel_std <= config.vio_static_init_max_accel_std;
+      latest_gyro_std = gyro_std;
+      // Require BOTH accel and gyro to look calm -- see
+      // gyro_stationary_window's comment for why accel-std alone can't
+      // tell "not moving" from "moving at constant velocity" (an
+      // accelerometer only sees changes in velocity). Not a guarantee
+      // for the real-flight case, just a safer proxy than accel alone.
+      latest_likely_stationary =
+          accel_std <= config.vio_static_init_max_accel_std &&
+          gyro_std <= kStationaryMaxGyroStd;
 
-      // TEMPORARY diagnostic (2026-09-25): vio_static_init_max_accel_std
-      // (0.2 m/s^2) was tuned for the STARTUP static-init check -- a
-      // device resting untouched for a controlled 0.3s window. Live
-      // testing found isLikelyStationary() rarely reporting true during
-      // a realistic hand-held "hold it still" camera-cover test (1 of 8+
-      // force-releases in one run), suggesting ordinary hand
-      // tremor/micro-shake may exceed this threshold over several
-      // seconds even when the user is genuinely trying to hold still --
-      // logging the actual value to find out, rather than guessing a
-      // replacement threshold blind.
+      // TEMPORARY diagnostic (2026-09-25, extended 2026-09-28 with gyro):
+      // vio_static_init_max_accel_std (0.2 m/s^2) was tuned for the
+      // STARTUP static-init check -- a device resting untouched for a
+      // controlled 0.3s window. Live testing found isLikelyStationary()
+      // rarely reporting true during a realistic hand-held "hold it
+      // still" camera-cover test, suggesting ordinary hand tremor/
+      // micro-shake may exceed this threshold even when genuinely trying
+      // to hold still -- logging the actual values to calibrate both
+      // thresholds from real data rather than guessing blind.
       static int stationary_diag_counter = 0;
       if (++stationary_diag_counter >= 30) {
         stationary_diag_counter = 0;
         std::cout << "[STATIONARY-DIAG] accel_std=" << accel_std
-                  << " threshold=" << config.vio_static_init_max_accel_std
+                  << " accel_threshold=" << config.vio_static_init_max_accel_std
+                  << " gyro_std=" << gyro_std
+                  << " gyro_threshold=" << kStationaryMaxGyroStd
                   << " likely_stationary=" << latest_likely_stationary
                   << " tracked_count=" << latest_tracked_count << std::endl;
       }
@@ -522,8 +532,7 @@ SqrtKeypointVioEstimator<Scalar_>::popFromImuDataQueue() {
 template <class Scalar_>
 bool SqrtKeypointVioEstimator<Scalar_>::measure(
     const OpticalFlowResult::Ptr& opt_flow_meas,
-    const typename IntegratedImuMeasurement<Scalar>::Ptr& meas,
-    bool substitute_stationary) {
+    const typename IntegratedImuMeasurement<Scalar>::Ptr& meas) {
   stats_sums_.add("frame_id", opt_flow_meas->t_ns).format("none");
   Timer t_total;
 
@@ -547,24 +556,58 @@ bool SqrtKeypointVioEstimator<Scalar_>::measure(
     meas->predictState(frame_states.at(last_state_t_ns).getState(), g,
                        next_state);
 
-    // See substitute_stationary_for_measure's comment at its declaration
-    // site. Repeating the last known-good IMU sample throughout this
-    // interval (see popFromImuDataQueue()/proc_func's trackOrSubstitute)
-    // only prevents NEW drift from accumulating -- predictState() above
-    // still just carries forward whatever velocity the PREVIOUS state
-    // already had, uncorrected. If that velocity was already nonzero
-    // (e.g. a real disturbance right as the interval began, or mid-hold),
-    // it silently keeps translating into position drift for the rest of
-    // the interval. Confirmed live (2026-09-25): short believed-
-    // stationary holds showed near-zero drift, but longer ones (more time
-    // for one such disturbance to occur) still drifted up to 3.5m.
-    // Directly asserting zero velocity and zero net translation here is
-    // the correction step a real zero-velocity update would provide,
-    // without needing a new optimizer factor type.
-    if (substitute_stationary) {
-      next_state.vel_w_i.setZero();
-      next_state.T_w_i.translation() =
+    // Continuous, confidence-weighted pull toward "assume stationary",
+    // not a binary on/off switch -- computed directly from this
+    // estimator's own tracked_count/accel_std/gyro_std (see
+    // isLikelyStationary()), independent of whatever the caller passed
+    // in for the separate sample-substitution mechanism above.
+    //
+    // History: a binary version of this (fully zero velocity/
+    // translation whenever "believed stationary", never otherwise) was
+    // live-tested 2026-09-25/28. It worked well for holds that stayed
+    // confidently classified the whole time, but a SINGLE ~150ms real
+    // disturbance anywhere in a 5s hold flipped the classification to
+    // "not stationary" for the REST of the hold, at which point this
+    // fix contributed nothing at all and raw drift reverted to fully
+    // unconstrained IMU integration -- confirmed live: 18.9m and 30.2m
+    // drift on two holds that got disqualified partway through, despite
+    // the device being still for most of each. A hard switch is
+    // fragile exactly at the edges that matter most (the moment
+    // something replaces confident stillness with a brief blip). Also
+    // considered and rejected: applying full stationary-assumption
+    // unconditionally whenever starved, regardless of classification --
+    // accelerometers only sense CHANGES in velocity, so a vehicle
+    // cruising at constant speed looks just as "stationary" to accel
+    // data as one sitting still; doing that unconditionally would
+    // falsely zero out a real, constant flight velocity the moment
+    // tracking degrades, which is actively dangerous for the live
+    // flight use case (see kStationaryMaxGyroStd's comment on gyro
+    // being a partial, imperfect mitigation for the same blind spot).
+    //
+    // This blends smoothly instead: full confidence (alpha=1, fully
+    // assume stationary) at/below each threshold, rolling off linearly
+    // to zero confidence (alpha=0, fully trust predictState()'s own
+    // prediction) by 2x threshold. A borderline moment still gets
+    // partial protection instead of either all or nothing, and a
+    // genuinely fast-moving vehicle (both accel AND gyro elevated, per
+    // kStationaryMaxGyroStd's reasoning) pulls alpha to 0 rather than
+    // freezing real motion.
+    bool starved_for_damping = latest_tracked_count < kBiasFreezeTrackedCountThresh;
+    if (starved_for_damping) {
+      double accel_alpha = std::clamp(
+          2.0 - double(latest_accel_std) / config.vio_static_init_max_accel_std,
+          0.0, 1.0);
+      double gyro_alpha = std::clamp(
+          2.0 - double(latest_gyro_std) / kStationaryMaxGyroStd, 0.0, 1.0);
+      double alpha = std::min(accel_alpha, gyro_alpha);
+
+      Vec3 stationary_pos =
           frame_states.at(last_state_t_ns).getState().T_w_i.translation();
+      next_state.vel_w_i =
+          Scalar(1.0 - alpha) * next_state.vel_w_i;
+      next_state.T_w_i.translation() =
+          Scalar(1.0 - alpha) * next_state.T_w_i.translation() +
+          Scalar(alpha) * stationary_pos;
     }
 
     have_imu_prediction = true;

@@ -118,17 +118,13 @@ class SqrtKeypointVioEstimator : public VioEstimatorBase,
 
   typename ImuData<Scalar>::Ptr popFromImuDataQueue();
 
-  // substitute_stationary: true when the WHOLE interval since the last
-  // state was fed substituted (last-known-good, repeated) IMU samples --
-  // see that flag's own comment at its computation site. Directly
-  // overrides the freshly-predicted state's velocity (to zero) and
-  // translation (held at the previous state's) rather than trusting
-  // predictState()'s propagated value, which only prevents NEW drift
-  // from accumulating and does nothing to correct an ALREADY-nonzero
-  // velocity left over from before the interval began.
+  // Applies a continuous, confidence-weighted pull toward "assume
+  // stationary" internally (see this method's own comment at its
+  // velocity/translation-blend site) whenever starved -- no longer
+  // needs the caller to say so; it reads its own tracked_count/
+  // accel_std/gyro_std directly.
   bool measure(const OpticalFlowResult::Ptr& opt_flow_meas,
-               const typename IntegratedImuMeasurement<Scalar>::Ptr& meas,
-               bool substitute_stationary = false);
+               const typename IntegratedImuMeasurement<Scalar>::Ptr& meas);
 
   // int64_t propagate();
   // void addNewState(int64_t data_t_ns);
@@ -256,6 +252,7 @@ class SqrtKeypointVioEstimator : public VioEstimatorBase,
   double getLatestAccelNorm() const override { return latest_accel_norm; }
   bool isLikelyStationary() const override { return latest_likely_stationary; }
   double getLatestAccelStd() const override { return latest_accel_std; }
+  double getLatestGyroStd() const override { return latest_gyro_std; }
   Eigen::Vector3d getLatestGyro() const {
     std::lock_guard<std::mutex> lock(latest_gyro_mutex);
     return latest_gyro;
@@ -350,8 +347,21 @@ class SqrtKeypointVioEstimator : public VioEstimatorBase,
   // latest_gyro_mutex (not a new mutex): updated at the same
   // per-IMU-sample chokepoint, already low-contention.
   std::deque<std::pair<int64_t, Eigen::Vector3d>> accel_stationary_window;
+  // Parallel gyro window, same timestamps as accel_stationary_window --
+  // see isLikelyStationary()'s comment for why accel-std alone isn't
+  // enough (it can't distinguish "not moving" from "moving at constant
+  // velocity", since accelerometers only see CHANGES in velocity).
+  // Requiring gyro to ALSO look calm is a real but imperfect proxy: a
+  // drone actually flying (even at constant translational velocity)
+  // will typically still show some rotation/vibration, whereas a
+  // handheld device deliberately held still should show very little of
+  // either. Not a guarantee -- perfectly smooth constant-velocity,
+  // constant-attitude flight would still pass both checks -- but far
+  // safer than accel-std alone, which passes it unconditionally.
+  std::deque<std::pair<int64_t, Eigen::Vector3d>> gyro_stationary_window;
   std::atomic<bool> latest_likely_stationary{false};
   std::atomic<double> latest_accel_std{0.0};
+  std::atomic<double> latest_gyro_std{0.0};
 
   mutable std::mutex latest_bias_mutex;
   Eigen::Vector3d latest_accel_bias{Eigen::Vector3d::Zero()};
@@ -530,6 +540,15 @@ class SqrtKeypointVioEstimator : public VioEstimatorBase,
   // kStarvationRecoveryGraceS/kStarvationPersistenceSeconds -- not
   // independently tuned.
   static constexpr double kBiasFreezeRecoveryGraceS = 0.5;
+  // Gyro-magnitude counterpart to vio_static_init_max_accel_std, for the
+  // SAME isLikelyStationary() check -- see gyro_stationary_window's
+  // comment. Picked from real hand-held-still data (2026-09-28): typical
+  // gyro_norm sat at 0.005-0.02 rad/s while genuinely holding still,
+  // with real disturbance moments spiking to 0.065-0.14; 0.05 sits
+  // between the two. Live-confirmed once but not yet stress-tested
+  // against genuine flight motion -- same "needs more validation" status
+  // as every other threshold in this file.
+  static constexpr double kStationaryMaxGyroStd = 0.05;
   bool low_tracked_count_streak_active_ = false;
   std::chrono::steady_clock::time_point low_tracked_count_since_wall_;
   bool has_good_tracked_count_streak_ = false;

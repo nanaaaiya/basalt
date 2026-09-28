@@ -146,6 +146,7 @@ class VioEstimatorBase {
   // revocation-logging use of it) rather than only ever seeing the
   // boolean.
   virtual double getLatestAccelStd() const { return 0.0; }
+  virtual double getLatestGyroStd() const { return 0.0; }
 
   // Current bias estimate the optimizer is carrying -- exposed so a
   // runaway raw trajectory can be diagnosed live (is the bias sitting at
