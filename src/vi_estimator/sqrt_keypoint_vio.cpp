@@ -543,6 +543,23 @@ bool SqrtKeypointVioEstimator<Scalar_>::measure(
   bool have_imu_prediction = false;
   Vec3 imu_only_translation = Vec3::Zero();
 
+  // See the "assume stationary" blend's comment further down for the
+  // full reasoning -- these need to survive past optimize_and_marg(),
+  // which is why they're declared at function scope instead of local to
+  // that block. Applying the blend only to predictState()'s OWN output
+  // (as an earlier version of this fix did) turned out to be
+  // insufficient: optimize_and_marg() below treats that as just an
+  // initial guess/linearization point, not a final answer, and reliably
+  // pulled it back out again via the still-nonzero-weighted IMU factor
+  // and whatever residual (possibly noisy) reprojection factors survive
+  // near-starvation -- confirmed live (2026-09-28): raw drift up to
+  // 18.9m/8.2m/8.3m on holds where isLikelyStationary() reported true
+  // for the ENTIRE duration (accel_std/gyro_std both comfortably under
+  // threshold throughout), ruling out misclassification as the cause.
+  bool apply_late_damping = false;
+  double late_damping_alpha = 0.0;
+  Vec3 late_damping_stationary_pos = Vec3::Zero();
+
   if (meas.get()) {
     BASALT_ASSERT(frame_states[last_state_t_ns].getState().t_ns ==
                   meas->get_start_t_ns());
@@ -556,58 +573,32 @@ bool SqrtKeypointVioEstimator<Scalar_>::measure(
     meas->predictState(frame_states.at(last_state_t_ns).getState(), g,
                        next_state);
 
-    // Continuous, confidence-weighted pull toward "assume stationary",
-    // not a binary on/off switch -- computed directly from this
-    // estimator's own tracked_count/accel_std/gyro_std (see
-    // isLikelyStationary()), independent of whatever the caller passed
-    // in for the separate sample-substitution mechanism above.
-    //
-    // History: a binary version of this (fully zero velocity/
-    // translation whenever "believed stationary", never otherwise) was
-    // live-tested 2026-09-25/28. It worked well for holds that stayed
-    // confidently classified the whole time, but a SINGLE ~150ms real
-    // disturbance anywhere in a 5s hold flipped the classification to
-    // "not stationary" for the REST of the hold, at which point this
-    // fix contributed nothing at all and raw drift reverted to fully
-    // unconstrained IMU integration -- confirmed live: 18.9m and 30.2m
-    // drift on two holds that got disqualified partway through, despite
-    // the device being still for most of each. A hard switch is
-    // fragile exactly at the edges that matter most (the moment
-    // something replaces confident stillness with a brief blip). Also
-    // considered and rejected: applying full stationary-assumption
-    // unconditionally whenever starved, regardless of classification --
-    // accelerometers only sense CHANGES in velocity, so a vehicle
-    // cruising at constant speed looks just as "stationary" to accel
-    // data as one sitting still; doing that unconditionally would
-    // falsely zero out a real, constant flight velocity the moment
-    // tracking degrades, which is actively dangerous for the live
-    // flight use case (see kStationaryMaxGyroStd's comment on gyro
-    // being a partial, imperfect mitigation for the same blind spot).
-    //
-    // This blends smoothly instead: full confidence (alpha=1, fully
-    // assume stationary) at/below each threshold, rolling off linearly
-    // to zero confidence (alpha=0, fully trust predictState()'s own
-    // prediction) by 2x threshold. A borderline moment still gets
-    // partial protection instead of either all or nothing, and a
-    // genuinely fast-moving vehicle (both accel AND gyro elevated, per
-    // kStationaryMaxGyroStd's reasoning) pulls alpha to 0 rather than
-    // freezing real motion.
-    bool starved_for_damping = latest_tracked_count < kBiasFreezeTrackedCountThresh;
-    if (starved_for_damping) {
+    // Continuous, confidence-weighted pull toward "assume stationary" --
+    // not a binary on/off switch (see this function's earlier history
+    // in the header comment on apply_late_damping), and not gated on
+    // starvation alone either (an accelerometer can't tell "not moving"
+    // from "moving at constant velocity" -- see kStationaryMaxGyroStd's
+    // comment on why gyro is required too). Applied here as a better
+    // initial guess for optimize_and_marg() below to linearize from;
+    // the version that actually has to stick is reapplied AFTER that
+    // call returns (see apply_late_damping's use further down) --
+    // stashed here since these are the only variables that need to
+    // survive that long.
+    apply_late_damping = latest_tracked_count < kBiasFreezeTrackedCountThresh;
+    if (apply_late_damping) {
       double accel_alpha = std::clamp(
           2.0 - double(latest_accel_std) / config.vio_static_init_max_accel_std,
           0.0, 1.0);
       double gyro_alpha = std::clamp(
           2.0 - double(latest_gyro_std) / kStationaryMaxGyroStd, 0.0, 1.0);
-      double alpha = std::min(accel_alpha, gyro_alpha);
-
-      Vec3 stationary_pos =
+      late_damping_alpha = std::min(accel_alpha, gyro_alpha);
+      late_damping_stationary_pos =
           frame_states.at(last_state_t_ns).getState().T_w_i.translation();
-      next_state.vel_w_i =
-          Scalar(1.0 - alpha) * next_state.vel_w_i;
+
+      next_state.vel_w_i = Scalar(1.0 - late_damping_alpha) * next_state.vel_w_i;
       next_state.T_w_i.translation() =
-          Scalar(1.0 - alpha) * next_state.T_w_i.translation() +
-          Scalar(alpha) * stationary_pos;
+          Scalar(1.0 - late_damping_alpha) * next_state.T_w_i.translation() +
+          Scalar(late_damping_alpha) * late_damping_stationary_pos;
     }
 
     have_imu_prediction = true;
@@ -965,6 +956,29 @@ bool SqrtKeypointVioEstimator<Scalar_>::measure(
     imu_vision_disagreement =
         !in_post_starvation_grace &&
         imu_vision_disagreement_count_ >= kImuVisionDisagreementPersistenceFrames;
+  }
+
+  // Reapply the stationary blend HERE, after optimize_and_marg() has
+  // already run -- see apply_late_damping's declaration for why the
+  // earlier application (before that call) wasn't enough on its own.
+  // frame_states[last_state_t_ns] at this point holds
+  // optimize_and_marg()'s own answer, pulled by the (still nonzero-
+  // weighted) IMU factor and whatever residual reprojection factors
+  // survive near-starvation; this overwrites it with the SAME blend
+  // computed earlier, so the stationary assumption is what's actually
+  // published/marginalized-forward, not just an initial guess the
+  // optimizer was free to move away from. Runs after the disagreement-
+  // detector block above so that detector still measures genuine
+  // pre-damping optimizer behavior, not this override's effect.
+  if (apply_late_damping && frame_states.count(last_state_t_ns) > 0) {
+    PoseVelBiasState<Scalar> damped_state =
+        frame_states.at(last_state_t_ns).getState();
+    damped_state.vel_w_i =
+        Scalar(1.0 - late_damping_alpha) * damped_state.vel_w_i;
+    damped_state.T_w_i.translation() =
+        Scalar(1.0 - late_damping_alpha) * damped_state.T_w_i.translation() +
+        Scalar(late_damping_alpha) * late_damping_stationary_pos;
+    frame_states[last_state_t_ns] = PoseVelBiasStateWithLin<Scalar>(damped_state);
   }
 
   if (out_state_queue) {
