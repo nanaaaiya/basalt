@@ -35,9 +35,12 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #pragma once
 
+#include <deque>
+#include <mutex>
 #include <thread>
 
 #include <sophus/se2.hpp>
+#include <sophus/se3.hpp>
 
 #include <tbb/blocked_range.h>
 #include <tbb/concurrent_unordered_map.h>
@@ -96,6 +99,30 @@ class FrameToFrameOpticalFlow : public OpticalFlowBase {
   }
 
   ~FrameToFrameOpticalFlow() { processing_thread->join(); }
+
+  // Feeds the rotation-compensated KLT seed (see trackPoints()'s comment
+  // for the full reasoning) -- called from whatever thread owns the raw
+  // IMU tap (see OakDDevice::setImuTapQueue()'s comment), NOT from
+  // processingLoop()'s thread, so this only ever touches gyro_queue_
+  // under gyro_mutex_. Stores raw IMU-frame samples rather than
+  // converting to any one camera's frame here, since a stereo rig tracks
+  // two cameras with different (if similar) extrinsics -- the per-camera
+  // conversion happens lazily in integrateRotation() instead.
+  void addIMUToQueue(const ImuData<double>::Ptr& data) override {
+    if (!data) return;
+
+    std::lock_guard<std::mutex> lock(gyro_mutex_);
+    gyro_queue_.emplace_back(data->t_ns, data->gyro);
+
+    // Trim to a bounded window -- comfortably more than the 1-2 frame
+    // intervals integrateRotation() ever actually needs (30fps => ~33ms
+    // apart), just generous enough to tolerate some jitter in when frames
+    // vs. IMU samples arrive relative to each other.
+    while (!gyro_queue_.empty() &&
+           data->t_ns - gyro_queue_.front().first > kGyroHistoryNs) {
+      gyro_queue_.pop_front();
+    }
+  }
 
   void processingLoop() {
     OpticalFlowInput::Ptr input_ptr;
@@ -165,12 +192,15 @@ class FrameToFrameOpticalFlow : public OpticalFlowBase {
       static const Eigen::aligned_map<KeypointId, Eigen::AffineCompact2f>
           kEmptyTransformMap;
 
+      int64_t t_ns_0 = prev_transforms ? prev_transforms->t_ns : -1;
+
       for (size_t i = 0; i < calib.intrinsics.size(); i++) {
         trackPoints(old_pyramid->at(i), pyramid->at(i),
                     prev_transforms ? prev_transforms->observations[i]
                                      : kEmptyTransformMap,
                     transforms->observations[i],
-                    new_transforms->observations[i]);
+                    new_transforms->observations[i], i, t_ns_0,
+                    transforms->t_ns, t_ns);
       }
 
       // 'transforms' (this call's N-1) becomes N-2 for the NEXT call,
@@ -190,8 +220,76 @@ class FrameToFrameOpticalFlow : public OpticalFlowBase {
     frame_counter++;
   }
 
-  // transform_map_0 is two frames back (N-2), used only to predict each
-  // track's constant-velocity seed below -- see seed_vec's comment.
+  // Sums buffered gyro samples in (t0_ns, t1_ns] into a first-order-
+  // integrated incremental rotation, converted from IMU frame into
+  // cam_id's own frame first (a rigid, constant rotation between the two,
+  // so angular velocity transforms by that rotation alone -- no lever-arm
+  // term needed, unlike linear velocity). Returns identity if no samples
+  // fall in that window (IMU tap not wired up yet, a startup gap, or
+  // t0_ns/t1_ns out of range) -- same "harmless no-op fallback" as every
+  // other optional signal in this codebase, since the caller's seed then
+  // just falls back to the un-rotated pixel.
+  Sophus::SO3<Scalar> integrateRotation(int64_t t0_ns, int64_t t1_ns,
+                                        size_t cam_id) const {
+    if (t0_ns < 0 || t1_ns <= t0_ns || cam_id >= calib.T_i_c.size())
+      return Sophus::SO3<Scalar>();
+
+    // R_ic: rotation from camera cam_id's frame into the IMU frame.
+    // omega_imu transforms into cam_id's frame via its inverse.
+    Sophus::SO3<Scalar> R_ic = calib.T_i_c[cam_id].so3();
+
+    std::lock_guard<std::mutex> lock(gyro_mutex_);
+
+    Vector3 accumulated = Vector3::Zero();
+    int64_t prev_t = t0_ns;
+    for (const auto& kv : gyro_queue_) {
+      if (kv.first <= t0_ns) continue;
+      if (kv.first > t1_ns) break;
+
+      Scalar dt = Scalar((kv.first - prev_t) / 1e9);
+      Vector3 omega_imu = kv.second.template cast<Scalar>();
+      Vector3 omega_cam = R_ic.inverse() * omega_imu;
+      accumulated += omega_cam * dt;
+      prev_t = kv.first;
+    }
+
+    return Sophus::SO3<Scalar>::exp(accumulated);
+  }
+
+  // Reprojects `pixel` through a pure rotation applied to its unprojected
+  // ray, predicting where a STATIC world point last seen at `pixel` will
+  // appear after the camera rotates by R_delta (R_delta in the same
+  // body-frame convention as integrateRotation()/preintegration.h:
+  // R_world_cam(N) = R_world_cam(N-1) * R_delta). For a fixed point,
+  // R_world_cam(N-1)*p_cam(N-1) = R_world_cam(N)*p_cam(N), which solves to
+  // p_cam(N) = R_delta.inverse() * p_cam(N-1) -- so this applies the
+  // INVERSE of R_delta, not R_delta itself; getting this backwards would
+  // predict motion in the wrong direction rather than just not helping.
+  // Depth-independent (scaling a ray's length along the same direction
+  // doesn't change where it projects), so this needs no depth hypothesis,
+  // unlike trackNewPointsStereoWithDepthSeeds(). Falls back to returning
+  // `pixel` unchanged if unproject/project fails (e.g. pixel outside the
+  // calibrated FOV after rotation) -- same fallback style as this file's
+  // other seeding helpers.
+  Vector2 rotateCompensatedPixel(const Vector2& pixel,
+                                 const Sophus::SO3<Scalar>& R_delta,
+                                 size_t cam_id) const {
+    Vector4 ray;
+    if (!calib.intrinsics[cam_id].unproject(pixel, ray)) return pixel;
+
+    Sophus::SO3<Scalar> R_delta_inv = R_delta.inverse();
+    Vector4 rotated;
+    rotated.template head<3>() = R_delta_inv * ray.template head<3>();
+    rotated[3] = ray[3];
+
+    Vector2 out;
+    if (!calib.intrinsics[cam_id].project(rotated, out)) return pixel;
+    return out;
+  }
+
+  // transform_map_0 is two frames back (N-2). t_ns_0/t_ns_1/t_ns_2 are
+  // the N-2/N-1/N frame timestamps -- used together with transform_map_0
+  // to predict each track's seed below. See seed_vec's comment.
   void trackPoints(const basalt::ManagedImagePyr<uint16_t>& pyr_1,
                    const basalt::ManagedImagePyr<uint16_t>& pyr_2,
                    const Eigen::aligned_map<KeypointId, Eigen::AffineCompact2f>&
@@ -199,39 +297,68 @@ class FrameToFrameOpticalFlow : public OpticalFlowBase {
                    const Eigen::aligned_map<KeypointId, Eigen::AffineCompact2f>&
                        transform_map_1,
                    Eigen::aligned_map<KeypointId, Eigen::AffineCompact2f>&
-                       transform_map_2) const {
+                       transform_map_2,
+                   size_t cam_id, int64_t t_ns_0, int64_t t_ns_1,
+                   int64_t t_ns_2) const {
     size_t num_points = transform_map_1.size();
 
     std::vector<KeypointId> ids;
     Eigen::aligned_vector<Eigen::AffineCompact2f> init_vec;
-    // Constant-velocity initial guess for trackPoint()'s search, predicted
-    // from each track's own last-two-frame displacement -- previously
+    // Predicted initial guess for trackPoint()'s search -- previously
     // this was always transform_1 unchanged (zero-motion seed). At high
     // speed/low FPS, frame-to-frame pixel displacement can exceed KLT's
     // small per-level convergence basin before the search even starts,
     // which is the dominant cause of tracked-point collapse during fast
     // motion (see this file's stereo depth-hypothesis seeding below for
     // the same "seed, not tracker, is the bottleneck" issue already
-    // solved there). Vision-only: uses each track's own recent motion,
-    // not a device-wide IMU estimate, so a track with no usable history
-    // just falls back to the old zero-motion seed rather than needing a
-    // correct depth/extrinsics-dependent global prediction. Unproven
-    // against a live 3m/s retest -- first version of this mechanism.
+    // solved there).
+    //
+    // Two components, combined so neither double-counts the other:
+    // 1. Rotation (R_1_to_2, from buffered gyro -- see integrateRotation())
+    //    applied to transform_1's pixel. Depth-independent and reacts
+    //    instantly to the CURRENT measured angular rate, unlike a vision-
+    //    history-based estimate, which would lag behind an accelerating
+    //    pan. Live-motivated (2026-09-28, pi5-092377b8): freezes during a
+    //    "walk around and look at things" test correlated with gyro rates
+    //    up to 2-4.6 rad/s, which pure translational seeding (the first
+    //    version of this mechanism) doesn't compensate for at all.
+    // 2. Residual translation, estimated from the track's own last-two-
+    //    frame displacement AFTER de-rotating frame N-2 into frame N-1's
+    //    frame (via R_0_to_1) -- isolates the parallax/translation-driven
+    //    component so it isn't counted twice (once implicitly via the
+    //    raw vision history, once explicitly via the rotation term).
+    //
+    // Falls back gracefully component-by-component: no gyro data yet ->
+    // integrateRotation() returns identity (rotation term is a no-op);
+    // no transform_map_0 entry (freshly added point, or first tracked
+    // frame) -> residual translation is zero. With both absent this is
+    // exactly the old zero-motion seed. Unproven against a live retest --
+    // second version of this mechanism, first with rotation compensation.
     Eigen::aligned_vector<Eigen::AffineCompact2f> seed_vec;
 
     ids.reserve(num_points);
     init_vec.reserve(num_points);
     seed_vec.reserve(num_points);
 
+    Sophus::SO3<Scalar> R_1_to_2 = integrateRotation(t_ns_1, t_ns_2, cam_id);
+    bool have_prev_frame = t_ns_0 >= 0;
+    Sophus::SO3<Scalar> R_0_to_1 =
+        have_prev_frame ? integrateRotation(t_ns_0, t_ns_1, cam_id)
+                        : Sophus::SO3<Scalar>();
+
     for (const auto& kv : transform_map_1) {
       ids.push_back(kv.first);
       init_vec.push_back(kv.second);
 
       Eigen::AffineCompact2f seed = kv.second;
+      seed.translation() =
+          rotateCompensatedPixel(kv.second.translation(), R_1_to_2, cam_id);
+
       auto it0 = transform_map_0.find(kv.first);
-      if (it0 != transform_map_0.end()) {
-        seed.translation() +=
-            (kv.second.translation() - it0->second.translation());
+      if (have_prev_frame && it0 != transform_map_0.end()) {
+        Vector2 rotated_n2 = rotateCompensatedPixel(
+            it0->second.translation(), R_0_to_1, cam_id);
+        seed.translation() += (kv.second.translation() - rotated_n2);
       }
       seed_vec.push_back(seed);
     }
@@ -599,6 +726,13 @@ class FrameToFrameOpticalFlow : public OpticalFlowBase {
   Matrix4 E;
   // See trackNewPointsStereoWithDepthSeeds().
   Sophus::SE3<Scalar> T_c1_c0_;
+
+  // See addIMUToQueue()/integrateRotation()'s comments. Raw IMU-frame
+  // samples, timestamp-ordered; converted to a given camera's frame only
+  // lazily, at integration time.
+  mutable std::mutex gyro_mutex_;
+  std::deque<std::pair<int64_t, Eigen::Vector3d>> gyro_queue_;
+  static constexpr int64_t kGyroHistoryNs = 500'000'000;  // 500ms
 
   std::shared_ptr<std::thread> processing_thread;
 };

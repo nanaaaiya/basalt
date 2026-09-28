@@ -214,6 +214,11 @@ Sophus::SE3d curr_raw_pose;
 std::mutex vio_state_mutex;
 tbb::concurrent_bounded_queue<std::vector<float>> vio_plot_queue;
 
+// Raw IMU tap, forwarded to opt_flow_ptr->addIMUToQueue() by t8 below --
+// see OakDDevice::setImuTapQueue()'s comment for why this is separate
+// from vio->imu_data_queue (the estimator's own consumption queue).
+tbb::concurrent_bounded_queue<basalt::ImuData<double>::Ptr> imu_tap_queue;
+
 // VIO variables
 basalt::Calibration<double> calib;
 
@@ -419,6 +424,8 @@ int main(int argc, char** argv) {
   // on the Pi5 in headless (--show-gui false) testing.
   oakd_device->setOutputQueues(&opt_flow_ptr->input_queue,
                                &vio->imu_data_queue);
+  imu_tap_queue.set_capacity(300);
+  oakd_device->setImuTapQueue(&imu_tap_queue);
   vio->initialize(
       Eigen::Vector3d(gyro_bias_init[0], gyro_bias_init[1], gyro_bias_init[2]),
       Eigen::Vector3d(accel_bias_init[0], accel_bias_init[1],
@@ -819,6 +826,20 @@ int main(int argc, char** argv) {
     }));
   }
 
+  // Forwards the raw IMU tap to opt_flow_ptr's rotation-compensated KLT
+  // seeding (see FrameToFrameOpticalFlow::addIMUToQueue()'s comment).
+  // Independent of show_gui/online_loop_closure for the same reason
+  // t6/t7 are -- this needs to run for a real headless flight too.
+  std::thread t8([&]() {
+    basalt::ImuData<double>::Ptr data;
+    while (!terminate) {
+      imu_tap_queue.pop(data);
+      if (!data) break;  // shutdown sentinel, pushed below
+      opt_flow_ptr->addIMUToQueue(data);
+    }
+    std::cout << "Finished t8" << std::endl;
+  });
+
   if (show_gui) {
     pangolin::CreateWindowAndBind("OAK-D Lite Vio", 1800, 1000);
 
@@ -956,15 +977,20 @@ int main(int argc, char** argv) {
   if (online_loop_closure) online_loop_closure->stop();
   if (occupancy_mapper) occupancy_mapper->stop();
 
-  // Push nullptr to output queues to unblock waiting threads
+  // Push nullptr to output queues to unblock waiting threads. imu_tap_queue
+  // needs its own push -- OakDDevice::stop() only sentinels the queues it
+  // knows about from setOutputQueues()/setDepthOutputQueue(), not this one
+  // (see setImuTapQueue()'s comment: a raw, independent tap).
   out_vis_queue.push(nullptr);
   out_state_queue.push(nullptr);
+  imu_tap_queue.push(nullptr);
 
   if (t3.get()) t3->join();
   t4.join();
   if (t5.get()) t5->join();
   t6.join();
   if (t7.get()) t7->join();
+  t8.join();
 
   if (dashboard_client) dashboard_client->stop();
 

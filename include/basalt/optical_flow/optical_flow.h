@@ -40,6 +40,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #include <basalt/utils/vio_config.h>
 
+#include <basalt/imu/imu_types.h>
 #include <basalt/io/dataset_io.h>
 #include <basalt/calibration/calibration.hpp>
 #include <basalt/camera/stereographic_param.hpp>
@@ -78,6 +79,14 @@ class OpticalFlowBase {
   tbb::concurrent_bounded_queue<OpticalFlowResult::Ptr>* output_queue = nullptr;
 
   Eigen::MatrixXf patch_coord;
+
+  // Optional raw gyro feed (see OakDDevice::setImuTapQueue()'s comment for
+  // where this can come from) -- lets a track's KLT search seed be
+  // compensated for camera rotation between frames instead of assuming
+  // zero motion, which otherwise fails during fast panning/turning (see
+  // FrameToFrameOpticalFlow's override for the full reasoning). Trivial
+  // no-op default so other implementations aren't forced to support it.
+  virtual void addIMUToQueue(const ImuData<double>::Ptr&) {}
 };
 
 class OpticalFlowFactory {
