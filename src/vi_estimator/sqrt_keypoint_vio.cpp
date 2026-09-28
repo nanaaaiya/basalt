@@ -977,8 +977,36 @@ bool SqrtKeypointVioEstimator<Scalar_>::measure(
         gyro_bias_sqrt_weight = nominal_gyro_bias_sqrt_weight;
       }
     } else if (!bias_freeze_active_) {
-      accel_bias_sqrt_weight = nominal_accel_bias_sqrt_weight;
-      gyro_bias_sqrt_weight = nominal_gyro_bias_sqrt_weight;
+      if (apply_nominal_stationary_damping) {
+        // Same root cause as kNominalStationaryVelDampingScale's comment
+        // above (weak bias/position observability while genuinely
+        // still), but for bias specifically. Live-diagnosed (2026-09-28,
+        // pi5-a13d464d): accel_bias[0] climbed from 0.03 to 0.12 (and
+        // accel_bias[2] swung from +0.05 to -0.08) over ~10s while
+        // tracked_count stayed at 10-45 the entire time -- never
+        // dropping below kBiasFreezeTrackedCountThresh, so the
+        // persisted-starvation freeze above never engaged at all, yet
+        // the bias diverged anyway, and the resulting velocity/position
+        // error is exactly what the gentler velocity nudge alone wasn't
+        // strong enough to counteract. Unlike the velocity nudge, this
+        // uses the FULL kBiasFreezeWeightMultiplier at alpha=1 (not a
+        // scaled-down fraction) -- a physical bias genuinely doesn't
+        // change on a timescale of seconds regardless of whether vision
+        // happens to be healthy, so there's no reason to trust it less
+        // here than during outright starvation. Continuous in the same
+        // alpha as the velocity nudge (not on/off), so this rolls back
+        // to nominal the instant real motion is detected -- same
+        // safety argument as everywhere else this alpha is used.
+        double bias_boost =
+            1.0 + (kBiasFreezeWeightMultiplier - 1.0) * nominal_stationary_alpha;
+        accel_bias_sqrt_weight =
+            nominal_accel_bias_sqrt_weight * Scalar(bias_boost);
+        gyro_bias_sqrt_weight =
+            nominal_gyro_bias_sqrt_weight * Scalar(bias_boost);
+      } else {
+        accel_bias_sqrt_weight = nominal_accel_bias_sqrt_weight;
+        gyro_bias_sqrt_weight = nominal_gyro_bias_sqrt_weight;
+      }
     }
   }
 
