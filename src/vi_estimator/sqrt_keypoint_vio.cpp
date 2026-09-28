@@ -560,6 +560,31 @@ bool SqrtKeypointVioEstimator<Scalar_>::measure(
   double late_damping_alpha = 0.0;
   Vec3 late_damping_stationary_pos = Vec3::Zero();
 
+  // Gentler counterpart to the starvation-only damping above, for a
+  // DIFFERENT failure mode found live (2026-09-28, pi5-a9ca4037): with
+  // starvation-hold leaks now fixed (36 holds, ~1.2cm total raw drift
+  // across the whole test), a ~220s bench test still showed ~20-34cm of
+  // slow position creep during ORDINARY nominal tracking -- confirmed
+  // via gyro_norm staying under 0.05 rad/s for 99.7% of all nominal
+  // (non-starved) samples in that test, i.e. the device was genuinely
+  // static almost the entire time, not just during the covered holds.
+  // Near-zero real translation gives vision-based position/scale weak
+  // observability (little to no parallax baseline for new landmarks),
+  // so residual IMU/bias noise still random-walks position even with
+  // vision nominally healthy. Unlike the starvation case, vision IS
+  // available and should stay in charge of position -- this only ever
+  // nudges velocity (never overrides translation directly), and only by
+  // a small fraction of the same confidence alpha, so it acts as a mild
+  // prior rather than fighting genuine vision-driven corrections. Rolls
+  // off to zero via the identical alpha the instant accel_std/gyro_std
+  // indicate real motion, so it cannot fire during actual flight -- same
+  // safety argument as apply_late_damping's gyro-gating above. Needs a
+  // live retest to confirm it actually reduces the creep before the
+  // scale constant below is trusted.
+  static constexpr double kNominalStationaryVelDampingScale = 0.15;
+  bool apply_nominal_stationary_damping = false;
+  double nominal_stationary_alpha = 0.0;
+
   if (meas.get()) {
     BASALT_ASSERT(frame_states[last_state_t_ns].getState().t_ns ==
                   meas->get_start_t_ns());
@@ -615,6 +640,24 @@ bool SqrtKeypointVioEstimator<Scalar_>::measure(
       // Recovered (or never starved) -- next episode gets a fresh
       // anchor, not this one's stale position.
       starved_episode_active_ = false;
+
+      // See kNominalStationaryVelDampingScale's comment above -- a mild,
+      // velocity-only nudge while genuinely still, active whether or not
+      // vision is currently healthy (unlike apply_late_damping, which
+      // only fires on starvation).
+      double accel_alpha = std::clamp(
+          2.0 - double(latest_accel_std) / config.vio_static_init_max_accel_std,
+          0.0, 1.0);
+      double gyro_alpha = std::clamp(
+          2.0 - double(latest_gyro_std) / kStationaryMaxGyroStd, 0.0, 1.0);
+      nominal_stationary_alpha = std::min(accel_alpha, gyro_alpha);
+      apply_nominal_stationary_damping = nominal_stationary_alpha > 0.0;
+
+      if (apply_nominal_stationary_damping) {
+        next_state.vel_w_i =
+            Scalar(1.0 - kNominalStationaryVelDampingScale * nominal_stationary_alpha) *
+            next_state.vel_w_i;
+      }
     }
 
     have_imu_prediction = true;
@@ -1009,6 +1052,18 @@ bool SqrtKeypointVioEstimator<Scalar_>::measure(
     damped_state.T_w_i.translation() =
         Scalar(1.0 - late_damping_alpha) * damped_state.T_w_i.translation() +
         Scalar(late_damping_alpha) * late_damping_stationary_pos;
+    frame_states[last_state_t_ns] = PoseVelBiasStateWithLin<Scalar>(damped_state);
+  } else if (apply_nominal_stationary_damping &&
+             frame_states.count(last_state_t_ns) > 0) {
+    // Same reapply-after-optimize reasoning as the starvation case above,
+    // scaled down to this mechanism's gentler velocity-only nudge -- the
+    // IMU factor can otherwise pull optimize_and_marg()'s own velocity
+    // answer right back before this ever reaches out_state_queue.
+    PoseVelBiasState<Scalar> damped_state =
+        frame_states.at(last_state_t_ns).getState();
+    damped_state.vel_w_i =
+        Scalar(1.0 - kNominalStationaryVelDampingScale * nominal_stationary_alpha) *
+        damped_state.vel_w_i;
     frame_states[last_state_t_ns] = PoseVelBiasStateWithLin<Scalar>(damped_state);
   }
 
