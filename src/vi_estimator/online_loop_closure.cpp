@@ -1597,12 +1597,31 @@ bool OnlineLoopClosure::getSmoothedCorrectedPose(
   // isn't gated by this), so it still gets a chance to self-correct;
   // only what's published live is held back until it does.
   if (drift_held_) {
-    // Revoke the stationary belief the instant a non-stationary sample
-    // arrives while held -- see hold_believed_stationary_'s comment.
+    // Revoke the stationary belief once non-stationary samples persist
+    // for kNonStationaryRevokeS, not on a single sample -- see that
+    // constant's comment for why an instant revoke was too fragile.
     // Only meaningful for a starvation-triggered hold (drift_held_since_
     // t_ns_ < 0); a residual-triggered one never reads this flag.
-    if (drift_held_since_t_ns_ < 0 && !latest_reported_likely_stationary_) {
-      hold_believed_stationary_ = false;
+    if (drift_held_since_t_ns_ < 0) {
+      if (!latest_reported_likely_stationary_) {
+        auto now_ns = std::chrono::steady_clock::now();
+        if (!non_stationary_active_) {
+          non_stationary_active_ = true;
+          non_stationary_since_wall_ = now_ns;
+        }
+        double non_stationary_s =
+            std::chrono::duration<double>(now_ns - non_stationary_since_wall_)
+                .count();
+        if (non_stationary_s >= kNonStationaryRevokeS) {
+          hold_believed_stationary_ = false;
+        }
+      } else {
+        // A genuinely stationary sample interrupts the run -- a brief
+        // spike that didn't persist long enough to revoke was noise, not
+        // real motion, so don't let it leave a partial streak lying
+        // around to combine with some LATER, unrelated spike.
+        non_stationary_active_ = false;
+      }
     }
 
     // Wall-clock watchdog for kDriftGateMaxHoldSeconds -- see
@@ -1691,9 +1710,12 @@ bool OnlineLoopClosure::getSmoothedCorrectedPose(
       drift_held_since_wall_ = now;
       // See hold_believed_stationary_'s comment -- starts true only if
       // the accel check already looks stationary at the moment of
-      // tripping; revoked (never re-armed) the instant that stops being
-      // true while still held (see the drift_held_ block above).
+      // tripping; revoked once non-stationary samples persist for
+      // kNonStationaryRevokeS (see the drift_held_ block above). Reset
+      // non_stationary_active_ too so a stale streak from whatever
+      // ended the PREVIOUS hold can't combine with this new one's.
       hold_believed_stationary_ = latest_reported_likely_stationary_;
+      non_stationary_active_ = false;
       drift_gate_events.try_push(DriftGateEvent::kTripped);
       std::cout << "[ONLINE-LOOP] DRIFT GATE TRIPPED (starvation: "
                    "tracked_count="

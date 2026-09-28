@@ -542,15 +542,28 @@ class OnlineLoopClosure {
   // override below before the first real report arrives.
   std::atomic<bool> latest_reported_likely_stationary_{false};
 
-  // Tracks whether NO non-stationary sample has been seen since the
-  // CURRENT hold began -- only meaningful for a starvation-triggered
-  // hold (drift_held_since_t_ns_ < 0, see that member's comment); a
-  // residual-triggered (walking) hold never reads this. Initialized to
-  // whatever the accel check says at the moment of tripping, then
-  // revoked (never re-armed) the instant a non-stationary sample arrives
-  // while still held -- if the device moved partway through, the
-  // override below must not apply.
+  // Tracks whether the device has stayed stationary (with hysteresis --
+  // see kNonStationaryRevokeS below) since the CURRENT hold began --
+  // only meaningful for a starvation-triggered hold (drift_held_since_
+  // t_ns_ < 0, see that member's comment); a residual-triggered (walking)
+  // hold never reads this. Initialized to whatever the accel check says
+  // at the moment of tripping.
   mutable bool hold_believed_stationary_ = false;
+  // Wall-clock time the CURRENT continuous run of non-stationary samples
+  // began, while held -- NOT reset on every non-stationary sample (see
+  // non_stationary_active_ below), only when a genuinely stationary
+  // sample interrupts the run. hold_believed_stationary_ only gets
+  // revoked once THIS streak itself persists for kNonStationaryRevokeS --
+  // a live camera-cover test found individual accel-std samples spiking
+  // above threshold ~7% of the time even while genuinely holding still
+  // (200Hz IMU sampling means a 5-second hold has ~1000 chances for a
+  // single-sample spike), which under an instant-revoke policy
+  // disqualified all but 1 of several holds from the stationary-release
+  // override despite the device barely moving -- same class of bug, same
+  // fix, as kStarvationRecoveryGraceS below.
+  mutable bool non_stationary_active_ = false;
+  mutable std::chrono::steady_clock::time_point non_stationary_since_wall_;
+  static constexpr double kNonStationaryRevokeS = 0.15;
   // Set at the moment a starvation-triggered, believed-stationary hold
   // force-releases (see getSmoothedCorrectedPose()'s wall-clock
   // watchdog) -- makes the immediately-following not-held computation
