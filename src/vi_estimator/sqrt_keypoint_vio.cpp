@@ -586,19 +586,35 @@ bool SqrtKeypointVioEstimator<Scalar_>::measure(
     // survive that long.
     apply_late_damping = latest_tracked_count < kBiasFreezeTrackedCountThresh;
     if (apply_late_damping) {
+      // Anchor to a FIXED position captured once at episode start, not
+      // recomputed from the previous frame every time -- see
+      // starved_episode_anchor_pos_'s comment for why a rolling
+      // reference let leaked drift become the new baseline instead of
+      // ever correcting back.
+      if (!starved_episode_active_) {
+        starved_episode_active_ = true;
+        starved_episode_anchor_pos_ =
+            frame_states.at(last_state_t_ns).getState().T_w_i.translation()
+                .template cast<double>();
+      }
+      late_damping_stationary_pos =
+          starved_episode_anchor_pos_.template cast<Scalar>();
+
       double accel_alpha = std::clamp(
           2.0 - double(latest_accel_std) / config.vio_static_init_max_accel_std,
           0.0, 1.0);
       double gyro_alpha = std::clamp(
           2.0 - double(latest_gyro_std) / kStationaryMaxGyroStd, 0.0, 1.0);
       late_damping_alpha = std::min(accel_alpha, gyro_alpha);
-      late_damping_stationary_pos =
-          frame_states.at(last_state_t_ns).getState().T_w_i.translation();
 
       next_state.vel_w_i = Scalar(1.0 - late_damping_alpha) * next_state.vel_w_i;
       next_state.T_w_i.translation() =
           Scalar(1.0 - late_damping_alpha) * next_state.T_w_i.translation() +
           Scalar(late_damping_alpha) * late_damping_stationary_pos;
+    } else {
+      // Recovered (or never starved) -- next episode gets a fresh
+      // anchor, not this one's stale position.
+      starved_episode_active_ = false;
     }
 
     have_imu_prediction = true;

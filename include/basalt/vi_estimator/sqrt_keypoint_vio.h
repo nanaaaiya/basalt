@@ -363,6 +363,21 @@ class SqrtKeypointVioEstimator : public VioEstimatorBase,
   std::atomic<double> latest_accel_std{0.0};
   std::atomic<double> latest_gyro_std{0.0};
 
+  // Fixed anchor for the "assume stationary" blend in measure() -- set
+  // ONCE at the moment a starvation episode begins (tracked_count first
+  // drops below kBiasFreezeTrackedCountThresh) and held fixed for the
+  // WHOLE episode, not recomputed from the previous frame every time.
+  // Live-diagnosed (2026-09-28): using the previous frame's own position
+  // as the blend target let any drift that leaked through during a
+  // brief low-confidence window become the new "stationary" baseline
+  // for every frame after it, since that's a moving target -- a single
+  // ~174ms real disturbance mid-episode left a PERMANENT ~1.9m offset
+  // this way, because once confidence returned, the blend just locked
+  // onto wherever the leaked drift had already reached instead of
+  // pulling back toward where the episode actually started.
+  bool starved_episode_active_ = false;
+  Eigen::Matrix<double, 3, 1> starved_episode_anchor_pos_{Eigen::Vector3d::Zero()};
+
   mutable std::mutex latest_bias_mutex;
   Eigen::Vector3d latest_accel_bias{Eigen::Vector3d::Zero()};
   Eigen::Vector3d latest_gyro_bias{Eigen::Vector3d::Zero()};
