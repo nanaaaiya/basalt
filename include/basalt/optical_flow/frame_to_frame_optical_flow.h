@@ -162,12 +162,20 @@ class FrameToFrameOpticalFlow : public OpticalFlowBase {
       new_transforms->observations.resize(calib.intrinsics.size());
       new_transforms->t_ns = t_ns;
 
+      static const Eigen::aligned_map<KeypointId, Eigen::AffineCompact2f>
+          kEmptyTransformMap;
+
       for (size_t i = 0; i < calib.intrinsics.size(); i++) {
         trackPoints(old_pyramid->at(i), pyramid->at(i),
+                    prev_transforms ? prev_transforms->observations[i]
+                                     : kEmptyTransformMap,
                     transforms->observations[i],
                     new_transforms->observations[i]);
       }
 
+      // 'transforms' (this call's N-1) becomes N-2 for the NEXT call,
+      // before it's overwritten below -- see prev_transforms's comment.
+      prev_transforms = transforms;
       transforms = new_transforms;
       transforms->input_images = new_img_vec;
 
@@ -182,8 +190,12 @@ class FrameToFrameOpticalFlow : public OpticalFlowBase {
     frame_counter++;
   }
 
+  // transform_map_0 is two frames back (N-2), used only to predict each
+  // track's constant-velocity seed below -- see seed_vec's comment.
   void trackPoints(const basalt::ManagedImagePyr<uint16_t>& pyr_1,
                    const basalt::ManagedImagePyr<uint16_t>& pyr_2,
+                   const Eigen::aligned_map<KeypointId, Eigen::AffineCompact2f>&
+                       transform_map_0,
                    const Eigen::aligned_map<KeypointId, Eigen::AffineCompact2f>&
                        transform_map_1,
                    Eigen::aligned_map<KeypointId, Eigen::AffineCompact2f>&
@@ -192,13 +204,36 @@ class FrameToFrameOpticalFlow : public OpticalFlowBase {
 
     std::vector<KeypointId> ids;
     Eigen::aligned_vector<Eigen::AffineCompact2f> init_vec;
+    // Constant-velocity initial guess for trackPoint()'s search, predicted
+    // from each track's own last-two-frame displacement -- previously
+    // this was always transform_1 unchanged (zero-motion seed). At high
+    // speed/low FPS, frame-to-frame pixel displacement can exceed KLT's
+    // small per-level convergence basin before the search even starts,
+    // which is the dominant cause of tracked-point collapse during fast
+    // motion (see this file's stereo depth-hypothesis seeding below for
+    // the same "seed, not tracker, is the bottleneck" issue already
+    // solved there). Vision-only: uses each track's own recent motion,
+    // not a device-wide IMU estimate, so a track with no usable history
+    // just falls back to the old zero-motion seed rather than needing a
+    // correct depth/extrinsics-dependent global prediction. Unproven
+    // against a live 3m/s retest -- first version of this mechanism.
+    Eigen::aligned_vector<Eigen::AffineCompact2f> seed_vec;
 
     ids.reserve(num_points);
     init_vec.reserve(num_points);
+    seed_vec.reserve(num_points);
 
     for (const auto& kv : transform_map_1) {
       ids.push_back(kv.first);
       init_vec.push_back(kv.second);
+
+      Eigen::AffineCompact2f seed = kv.second;
+      auto it0 = transform_map_0.find(kv.first);
+      if (it0 != transform_map_0.end()) {
+        seed.translation() +=
+            (kv.second.translation() - it0->second.translation());
+      }
+      seed_vec.push_back(seed);
     }
 
     tbb::concurrent_unordered_map<
@@ -213,7 +248,7 @@ class FrameToFrameOpticalFlow : public OpticalFlowBase {
         const KeypointId id = ids[r];
 
         const Eigen::AffineCompact2f& transform_1 = init_vec[r];
-        Eigen::AffineCompact2f transform_2 = transform_1;
+        Eigen::AffineCompact2f transform_2 = seed_vec[r];
 
         bool valid = trackPoint(pyr_1, pyr_2, transform_1, transform_2);
 
@@ -553,6 +588,11 @@ class FrameToFrameOpticalFlow : public OpticalFlowBase {
   basalt::Calibration<Scalar> calib;
 
   OpticalFlowResult::Ptr transforms;
+  // One extra frame of history behind 'transforms', kept so trackPoints()
+  // can compute each track's recent 2D pixel velocity (see its own
+  // comment for why) -- null until the third processed frame, since
+  // there's no N-2 yet on the first tracked step.
+  OpticalFlowResult::Ptr prev_transforms;
   std::shared_ptr<std::vector<basalt::ManagedImagePyr<uint16_t>>> old_pyramid,
       pyramid;
 
