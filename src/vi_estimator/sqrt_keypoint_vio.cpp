@@ -905,16 +905,31 @@ bool SqrtKeypointVioEstimator<Scalar_>::measure(
       double freeze_active_s =
           std::chrono::duration<double>(now - bias_freeze_start_wall_)
               .count();
-      if (freeze_active_s <= kBiasFreezeMaxDurationS) {
+      // Live-diagnosed (2026-09-28, pi5-8c777169): a 9.3s full-cover hold
+      // outlived this cap by ~3.3s, leaving bias completely unprotected
+      // for the rest of the blackout -- when vision returned, the solver
+      // had to reconcile whatever the bias had wandered to in that
+      // unprotected tail, surfacing as a smooth ~1.8s, ~10m position
+      // ramp right at recovery. The cap's own rationale (don't suppress
+      // bias self-correction indefinitely) only applies when we can't
+      // tell if the device is actually moving -- while latest_likely_stationary
+      // is true (same accel+gyro-gated classifier as the position-anchor
+      // damping above), there's no legitimate reason for the bias to be
+      // changing at all, so the cap is skipped and the freeze holds for
+      // the whole episode. For a genuine fast-motion starvation (problem
+      // 2's scenario), latest_likely_stationary is false and this cap
+      // still applies exactly as before -- unchanged safety margin there.
+      if (freeze_active_s <= kBiasFreezeMaxDurationS || latest_likely_stationary) {
         accel_bias_sqrt_weight =
             nominal_accel_bias_sqrt_weight * Scalar(kBiasFreezeWeightMultiplier);
         gyro_bias_sqrt_weight =
             nominal_gyro_bias_sqrt_weight * Scalar(kBiasFreezeWeightMultiplier);
       } else {
-        // Time cap exceeded -- same reasoning as the reweight block's own
-        // cap: give up freezing for this episode rather than let bias
-        // self-correction stay suppressed indefinitely through a long
-        // blackout.
+        // Time cap exceeded and not confidently stationary -- same
+        // reasoning as the reweight block's own cap: give up freezing
+        // for this episode rather than let bias self-correction stay
+        // suppressed indefinitely through a long blackout of unknown
+        // motion.
         accel_bias_sqrt_weight = nominal_accel_bias_sqrt_weight;
         gyro_bias_sqrt_weight = nominal_gyro_bias_sqrt_weight;
       }
