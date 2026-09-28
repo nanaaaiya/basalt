@@ -378,6 +378,27 @@ class SqrtKeypointVioEstimator : public VioEstimatorBase,
   bool starved_episode_active_ = false;
   Eigen::Matrix<double, 3, 1> starved_episode_anchor_pos_{Eigen::Vector3d::Zero()};
 
+  // Same fixed-anchor pattern as starved_episode_anchor_pos_ above, but
+  // for NOMINAL tracking (vision healthy) -- for a different failure
+  // mode found live (2026-09-28, pi5-14b55bfc): two people walked
+  // through frame while the camera itself never moved (confirmed:
+  // accel_std/gyro_std both stayed far under threshold, likely_stationary=1,
+  // for the entire event), yet enough tracked points moved with them
+  // that the optimizer read it as ~1m of real camera motion -- a single
+  // frame jumped 23cm on its own. isImuVisionDisagreement() (designed
+  // for exactly this class of dynamic-scene corruption) didn't catch it;
+  // the corrupted position becomes the new baseline for its own
+  // per-step IMU-prediction comparison the instant it's accepted, so a
+  // short run of moderate jumps plus one big one didn't clearly exceed
+  // its persistence-frame threshold. This is a direct, independent
+  // defense instead: when the IMU alone is confident the device hasn't
+  // moved, don't let vision alone justify a large position change.
+  // Anchored (not rolling) once stationary confidence engages, for the
+  // exact reason starved_episode_anchor_pos_ needed the same fix.
+  bool nominal_stationary_pos_anchor_active_ = false;
+  Eigen::Matrix<double, 3, 1> nominal_stationary_pos_anchor_{
+      Eigen::Vector3d::Zero()};
+
   mutable std::mutex latest_bias_mutex;
   Eigen::Vector3d latest_accel_bias{Eigen::Vector3d::Zero()};
   Eigen::Vector3d latest_gyro_bias{Eigen::Vector3d::Zero()};

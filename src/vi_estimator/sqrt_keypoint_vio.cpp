@@ -585,6 +585,21 @@ bool SqrtKeypointVioEstimator<Scalar_>::measure(
   bool apply_nominal_stationary_damping = false;
   double nominal_stationary_alpha = 0.0;
 
+  // Position counterpart to the velocity-only nudge above -- see
+  // nominal_stationary_pos_anchor_'s header comment for the dynamic-
+  // scene-corruption failure mode this targets (moving people/objects
+  // mistaken for camera motion while the IMU independently confirms the
+  // camera itself never moved). Unlike the velocity nudge, this overrides
+  // T_w_i.translation() directly, so it needs to be more assertive to
+  // actually resist a large vision-driven position pull -- 0.4 is a
+  // first guess, meaningfully stronger than the velocity nudge's 0.15 but
+  // short of the starvation anchor's full 1.0, so a real slow motion the
+  // imperfect stationary classifier still misreads as "still" isn't
+  // completely locked out, just resisted. Needs a live retest against
+  // the same people-passing-by scenario to confirm the scale is right.
+  static constexpr double kNominalStationaryPosDampingScale = 0.4;
+  Vec3 nominal_stationary_pos_target = Vec3::Zero();
+
   if (meas.get()) {
     BASALT_ASSERT(frame_states[last_state_t_ns].getState().t_ns ==
                   meas->get_start_t_ns());
@@ -611,6 +626,14 @@ bool SqrtKeypointVioEstimator<Scalar_>::measure(
     // survive that long.
     apply_late_damping = latest_tracked_count < kBiasFreezeTrackedCountThresh;
     if (apply_late_damping) {
+      // Starvation anchor takes over position entirely -- the nominal
+      // anchor (if any was active going into this starvation episode) is
+      // now stale; whenever nominal-stationary damping next engages
+      // after recovery, it should capture a fresh anchor from the
+      // post-recovery position, not blend back toward wherever it was
+      // pinned before starvation started.
+      nominal_stationary_pos_anchor_active_ = false;
+
       // Anchor to a FIXED position captured once at episode start, not
       // recomputed from the previous frame every time -- see
       // starved_episode_anchor_pos_'s comment for why a rolling
@@ -657,6 +680,27 @@ bool SqrtKeypointVioEstimator<Scalar_>::measure(
         next_state.vel_w_i =
             Scalar(1.0 - kNominalStationaryVelDampingScale * nominal_stationary_alpha) *
             next_state.vel_w_i;
+
+        // See nominal_stationary_pos_anchor_'s comment -- fixed anchor
+        // captured once when this stationary streak begins, same
+        // rolling-reference-bug avoidance as starved_episode_anchor_pos_.
+        if (!nominal_stationary_pos_anchor_active_) {
+          nominal_stationary_pos_anchor_active_ = true;
+          nominal_stationary_pos_anchor_ =
+              next_state.T_w_i.translation().template cast<double>();
+        }
+        nominal_stationary_pos_target =
+            nominal_stationary_pos_anchor_.template cast<Scalar>();
+
+        next_state.T_w_i.translation() =
+            Scalar(1.0 - kNominalStationaryPosDampingScale * nominal_stationary_alpha) *
+                next_state.T_w_i.translation() +
+            Scalar(kNominalStationaryPosDampingScale * nominal_stationary_alpha) *
+                nominal_stationary_pos_target;
+      } else {
+        // Real motion detected -- next stationary streak gets a fresh
+        // anchor, not this one's stale position.
+        nominal_stationary_pos_anchor_active_ = false;
       }
     }
 
@@ -1083,15 +1127,21 @@ bool SqrtKeypointVioEstimator<Scalar_>::measure(
     frame_states[last_state_t_ns] = PoseVelBiasStateWithLin<Scalar>(damped_state);
   } else if (apply_nominal_stationary_damping &&
              frame_states.count(last_state_t_ns) > 0) {
-    // Same reapply-after-optimize reasoning as the starvation case above,
-    // scaled down to this mechanism's gentler velocity-only nudge -- the
-    // IMU factor can otherwise pull optimize_and_marg()'s own velocity
-    // answer right back before this ever reaches out_state_queue.
+    // Same reapply-after-optimize reasoning as the starvation case above.
+    // Critical for the position term specifically -- a corrupted
+    // reprojection pull (see nominal_stationary_pos_anchor_'s comment)
+    // is exactly what optimize_and_marg() would otherwise restore here,
+    // same as the IMU factor alone would pull the velocity nudge back.
     PoseVelBiasState<Scalar> damped_state =
         frame_states.at(last_state_t_ns).getState();
     damped_state.vel_w_i =
         Scalar(1.0 - kNominalStationaryVelDampingScale * nominal_stationary_alpha) *
         damped_state.vel_w_i;
+    damped_state.T_w_i.translation() =
+        Scalar(1.0 - kNominalStationaryPosDampingScale * nominal_stationary_alpha) *
+            damped_state.T_w_i.translation() +
+        Scalar(kNominalStationaryPosDampingScale * nominal_stationary_alpha) *
+            nominal_stationary_pos_target;
     frame_states[last_state_t_ns] = PoseVelBiasStateWithLin<Scalar>(damped_state);
   }
 
