@@ -1549,8 +1549,10 @@ void OnlineLoopClosure::reportTrackingHealth(double tracked_ratio,
   latest_reported_total_observed_count_ = total_observed_count;
 }
 
-void OnlineLoopClosure::reportAccelStability(bool likely_stationary) {
+void OnlineLoopClosure::reportAccelStability(bool likely_stationary,
+                                             double accel_std) {
   latest_reported_likely_stationary_ = likely_stationary;
+  latest_reported_accel_std_ = accel_std;
 }
 
 Eigen::aligned_vector<Eigen::Vector3d> OnlineLoopClosure::getCorrectedTrajectory()
@@ -1612,7 +1614,12 @@ bool OnlineLoopClosure::getSmoothedCorrectedPose(
         double non_stationary_s =
             std::chrono::duration<double>(now_ns - non_stationary_since_wall_)
                 .count();
-        if (non_stationary_s >= kNonStationaryRevokeS) {
+        if (non_stationary_s >= kNonStationaryRevokeS && hold_believed_stationary_) {
+          std::cout << "[ONLINE-LOOP] STATIONARY BELIEF REVOKED: non-stationary "
+                       "for " << non_stationary_s
+                    << "s (>= " << kNonStationaryRevokeS
+                    << "s), accel_std=" << latest_reported_accel_std_
+                    << std::endl;
           hold_believed_stationary_ = false;
         }
       } else {

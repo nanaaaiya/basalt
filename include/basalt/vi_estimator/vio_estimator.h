@@ -141,6 +141,11 @@ class VioEstimatorBase {
   // for why this matters: distinguishing a real camera-cover-while-still
   // episode from an ordinary tracking-loss-while-moving one.
   virtual bool isLikelyStationary() const { return false; }
+  // The actual accel-std value behind isLikelyStationary()'s verdict --
+  // exposed for diagnosing marginal cases (see OnlineLoopClosure's
+  // revocation-logging use of it) rather than only ever seeing the
+  // boolean.
+  virtual double getLatestAccelStd() const { return 0.0; }
 
   // Current bias estimate the optimizer is carrying -- exposed so a
   // runaway raw trajectory can be diagnosed live (is the bias sitting at

@@ -480,6 +480,7 @@ SqrtKeypointVioEstimator<Scalar_>::popFromImuDataQueue() {
       var /= double(accel_stationary_window.size());
 
       double accel_std = std::sqrt(var);
+      latest_accel_std = accel_std;
       latest_likely_stationary = accel_std <= config.vio_static_init_max_accel_std;
 
       // TEMPORARY diagnostic (2026-09-25): vio_static_init_max_accel_std

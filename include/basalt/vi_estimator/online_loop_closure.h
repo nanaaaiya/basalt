@@ -279,7 +279,7 @@ class OnlineLoopClosure {
   // check it against -- confirmed live, up to 3.4m over a single ~5s
   // blackout) from an ordinary tracking-loss-while-moving one, where
   // the same override would be wrong to apply.
-  void reportAccelStability(bool likely_stationary);
+  void reportAccelStability(bool likely_stationary, double accel_std);
 
   // Same as getCorrectedTrajectory(), but paired with each keyframe's
   // timestamp -- needed for logging/analysis (matching timestamps up
@@ -541,6 +541,10 @@ class OnlineLoopClosure {
   // Defaults false (don't assume stationary) so nothing engages the
   // override below before the first real report arrives.
   std::atomic<bool> latest_reported_likely_stationary_{false};
+  // Reported alongside the boolean above, purely for the revocation log
+  // in getSmoothedCorrectedPose() -- lets a live test show the actual
+  // peak value behind a revocation instead of only the boolean verdict.
+  std::atomic<double> latest_reported_accel_std_{0.0};
 
   // Tracks whether the device has stayed stationary (with hysteresis --
   // see kNonStationaryRevokeS below) since the CURRENT hold began --

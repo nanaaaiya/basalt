@@ -255,6 +255,7 @@ class SqrtKeypointVioEstimator : public VioEstimatorBase,
   double getLatestGyroNorm() const override { return latest_gyro_norm; }
   double getLatestAccelNorm() const override { return latest_accel_norm; }
   bool isLikelyStationary() const override { return latest_likely_stationary; }
+  double getLatestAccelStd() const override { return latest_accel_std; }
   Eigen::Vector3d getLatestGyro() const {
     std::lock_guard<std::mutex> lock(latest_gyro_mutex);
     return latest_gyro;
@@ -350,6 +351,7 @@ class SqrtKeypointVioEstimator : public VioEstimatorBase,
   // per-IMU-sample chokepoint, already low-contention.
   std::deque<std::pair<int64_t, Eigen::Vector3d>> accel_stationary_window;
   std::atomic<bool> latest_likely_stationary{false};
+  std::atomic<double> latest_accel_std{0.0};
 
   mutable std::mutex latest_bias_mutex;
   Eigen::Vector3d latest_accel_bias{Eigen::Vector3d::Zero()};

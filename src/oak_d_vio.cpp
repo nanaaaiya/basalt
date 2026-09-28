@@ -581,7 +581,8 @@ int main(int argc, char** argv) {
           // lets a starvation hold's force-release tell a real
           // camera-cover-while-still episode from an ordinary
           // tracking-loss-while-moving one.
-          online_loop_closure->reportAccelStability(vio->isLikelyStationary());
+          online_loop_closure->reportAccelStability(vio->isLikelyStationary(),
+                                                    vio->getLatestAccelStd());
         }
 
         if (health.primary_reason != "nominal") {
