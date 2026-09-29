@@ -138,6 +138,36 @@ void OakDDevice::start() {
   pipeline.start();
   std::cout << "[OAKD]: device connected, streaming" << std::endl;
 
+  if (enable_stereo_depth_) {
+    // See DepthIntrinsics's header comment for why this must be Luxonis's
+    // own factory calibration, not calib_'s (Basalt's own, of the RAW
+    // lens). Queried at 640x480 -- OccupancyMapper's existing scale_u/
+    // scale_v logic already adapts to whatever resolution the depth
+    // stream actually outputs (see its own comment), same as it already
+    // does for calib_'s resolution.
+    auto device = pipeline.getDefaultDevice();
+    if (device) {
+      auto calib = device->readCalibration();
+      auto intr = calib.getCameraIntrinsics(dai::CameraBoardSocket::CAM_B,
+                                            640, 480);
+      depth_intrinsics_.fx = intr[0][0];
+      depth_intrinsics_.fy = intr[1][1];
+      depth_intrinsics_.cx = intr[0][2];
+      depth_intrinsics_.cy = intr[1][2];
+      depth_intrinsics_.width = 640;
+      depth_intrinsics_.height = 480;
+      std::cout << "[OAKD] Depth (rectified) intrinsics: fx="
+                << depth_intrinsics_.fx << " fy=" << depth_intrinsics_.fy
+                << " cx=" << depth_intrinsics_.cx
+                << " cy=" << depth_intrinsics_.cy << " @ 640x480"
+                << std::endl;
+    } else {
+      std::cerr << "[OAKD] Could not get device handle for depth "
+                   "intrinsics -- occupancy mapping will be wrong"
+                << std::endl;
+    }
+  }
+
   device_thread = std::thread(&OakDDevice::deviceLoop, this);
 }
 

@@ -41,9 +41,10 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 namespace basalt {
 
-OccupancyMapper::OccupancyMapper(const Calibration<double>& calib,
+OccupancyMapper::OccupancyMapper(const DepthIntrinsics& depth_intrinsics,
                                   double voxel_size, int depth_stride)
-    : calib_(calib), depth_stride_(std::max(1, depth_stride)) {
+    : depth_intrinsics_(depth_intrinsics),
+      depth_stride_(std::max(1, depth_stride)) {
   tree_.reset(new octomap::OcTree(voxel_size));
   tree_->enableChangeDetection(true);
   input_queue_.set_capacity(4);
@@ -86,39 +87,39 @@ void OccupancyMapper::processingThreadMain() {
 }
 
 void OccupancyMapper::insertFrame(const DepthFrameInput::Ptr& frame) {
-  if (frame->cam_id < 0 ||
-      static_cast<size_t>(frame->cam_id) >= calib_.intrinsics.size()) {
-    return;
-  }
-  const auto& cam = calib_.intrinsics[frame->cam_id];
   const cv::Mat& depth = frame->depth_mm;
+  if (depth_intrinsics_.width <= 0 || depth_intrinsics_.height <= 0) return;
 
-  // The depth node is free to output at a lower resolution than the
-  // calibration's (DepthAI's StereoDepth default preset does this --
-  // observed 320x240 depth frames against a 640x480 calibration). The
-  // intrinsics (fx, fy, cx, cy) are only valid in the calibration's own
-  // resolution, so a raw depth-image pixel must be rescaled into that
-  // resolution before unprojecting -- otherwise every pixel is
-  // back-projected through the wrong focal length/principal point,
-  // distorting the point cloud more the further a pixel is from center.
-  // This keeps the fix correct at whatever resolution the depth stream
-  // actually outputs, rather than forcing the device to output at full
-  // calibration resolution (which costs real USB bandwidth and can
-  // destabilize an already-marginal connection).
+  // The depth node is free to output at a lower resolution than
+  // depth_intrinsics_'s own reference resolution (DepthAI's StereoDepth
+  // default preset does this -- observed 320x240 depth frames against a
+  // 640x480 query). fx/fy/cx/cy are only valid at that reference
+  // resolution, so a raw depth-image pixel must be rescaled into it
+  // before unprojecting -- otherwise every pixel is back-projected
+  // through the wrong focal length/principal point, distorting the point
+  // cloud more the further a pixel is from center. This keeps the fix
+  // correct at whatever resolution the depth stream actually outputs,
+  // rather than forcing the device to output at full resolution (which
+  // costs real USB bandwidth and can destabilize an already-marginal
+  // connection).
   double scale_u = 1.0, scale_v = 1.0;
-  if (static_cast<size_t>(frame->cam_id) < calib_.resolution.size() &&
-      depth.cols > 0 && depth.rows > 0) {
-    const Eigen::Vector2i& calib_res = calib_.resolution[frame->cam_id];
-    scale_u = static_cast<double>(calib_res.x()) / depth.cols;
-    scale_v = static_cast<double>(calib_res.y()) / depth.rows;
+  if (depth.cols > 0 && depth.rows > 0) {
+    scale_u = static_cast<double>(depth_intrinsics_.width) / depth.cols;
+    scale_v = static_cast<double>(depth_intrinsics_.height) / depth.rows;
   }
 
   // Back-project every depth_stride_'th pixel into a world-frame point
-  // cloud. Each pixel's camera model unproject() gives a unit bearing
-  // vector (not a z=1-plane point -- see basalt-headers' camera models),
-  // so it's rescaled along that ray until its z-component equals the
-  // depth value: standard "depth image" semantics (perpendicular distance
-  // from the image plane), matching what DepthAI's StereoDepth outputs.
+  // cloud, using PLAIN pinhole unprojection (no distortion model) --
+  // see DepthIntrinsics's header comment for why: StereoDepth's own
+  // output is already rectified/undistorted by construction, and using
+  // Basalt's own (RAW-lens) camera model here previously produced a
+  // severely warped point cloud on OAK-D Pro W, live-diagnosed
+  // 2026-09-29 (a 21% focal-length mismatch plus a completely different
+  // distortion model family vs. Luxonis's own factory calibration, which
+  // is what StereoDepth actually rectifies against). Each pixel's ray is
+  // rescaled along its bearing until its z-component equals the depth
+  // value: standard "depth image" semantics (perpendicular distance from
+  // the image plane), matching what DepthAI's StereoDepth outputs.
   octomap::Pointcloud cloud;
   for (int v = 0; v < depth.rows; v += depth_stride_) {
     const uint16_t* row = depth.ptr<uint16_t>(v);
@@ -126,14 +127,13 @@ void OccupancyMapper::insertFrame(const DepthFrameInput::Ptr& frame) {
       uint16_t d_mm = row[u];
       if (d_mm == 0) continue;  // no valid return at this pixel
 
-      Eigen::Vector2d proj(static_cast<double>(u) * scale_u,
-                            static_cast<double>(v) * scale_v);
-      Eigen::Vector3d bearing;
-      if (!cam.unproject(proj, bearing)) continue;
-      if (bearing.z() <= 1e-6) continue;  // behind or parallel to the image plane
+      double u_calib = static_cast<double>(u) * scale_u;
+      double v_calib = static_cast<double>(v) * scale_v;
+      double bx = (u_calib - depth_intrinsics_.cx) / depth_intrinsics_.fx;
+      double by = (v_calib - depth_intrinsics_.cy) / depth_intrinsics_.fy;
 
       double z_m = d_mm / 1000.0;
-      Eigen::Vector3d p_cam = bearing * (z_m / bearing.z());
+      Eigen::Vector3d p_cam(bx * z_m, by * z_m, z_m);
       Eigen::Vector3d p_world = frame->T_w_c * p_cam;
       cloud.push_back(static_cast<float>(p_world.x()),
                        static_cast<float>(p_world.y()),

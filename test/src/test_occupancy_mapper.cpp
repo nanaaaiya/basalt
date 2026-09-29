@@ -7,21 +7,22 @@
 
 namespace {
 
-// A single-camera calibration with identity extrinsics (camera frame ==
-// IMU/world frame) and a simple pinhole model -- deliberately no
-// distortion, so every math step in insertFrame() is hand-checkable.
-basalt::Calibration<double> makeTestCalib() {
-  basalt::Calibration<double> calib;
-  calib.T_i_c.push_back(Sophus::SE3d());  // identity
-
-  basalt::GenericCamera<double> cam;
-  // fx=fy=100, principal point at (50, 50) -- matches the 100x100 test
-  // depth images below exactly, so the center pixel's bearing vector is
-  // exactly (0, 0, 1) with no rounding to worry about.
-  cam.variant = basalt::PinholeCamera<double>(Eigen::Vector4d(100, 100, 50, 50));
-  calib.intrinsics.push_back(cam);
-
-  return calib;
+// A simple pinhole intrinsics set, matching the plain-pinhole math
+// insertFrame() itself uses (see DepthIntrinsics's header comment for why
+// there's no distortion model at all here anymore -- StereoDepth's own
+// output is already rectified/undistorted by construction).
+// fx=fy=100, principal point at (50, 50) -- matches the 100x100 test
+// depth images below exactly, so the center pixel's bearing vector is
+// exactly (0, 0, 1) with no rounding to worry about.
+basalt::DepthIntrinsics makeTestIntrinsics() {
+  basalt::DepthIntrinsics intr;
+  intr.fx = 100;
+  intr.fy = 100;
+  intr.cx = 50;
+  intr.cy = 50;
+  intr.width = 100;
+  intr.height = 100;
+  return intr;
 }
 
 // depth_mm at the exact center pixel (the principal point), 0 everywhere
@@ -30,17 +31,6 @@ cv::Mat makeCenterPixelDepth(uint16_t depth_mm) {
   cv::Mat depth = cv::Mat::zeros(100, 100, CV_16UC1);
   depth.at<uint16_t>(50, 50) = depth_mm;
   return depth;
-}
-
-// Records that the calibration's own intrinsics were computed for a
-// 100x100 image (matching makeTestCalib()'s fx=fy=100, cx=cy=50), for the
-// resolution-mismatch test below -- makeTestCalib() itself leaves
-// calib.resolution empty, which every other test above relies on to keep
-// insertFrame()'s scale factor at a no-op 1.0.
-basalt::Calibration<double> makeTestCalibWithResolution(int w, int h) {
-  basalt::Calibration<double> calib = makeTestCalib();
-  calib.resolution.push_back(Eigen::Vector2i(w, h));
-  return calib;
 }
 
 // pollVoxelDelta() is fed by an async processing thread -- poll with a
@@ -60,7 +50,7 @@ bool pollWithTimeout(basalt::OccupancyMapper& mapper, basalt::VoxelDelta& out,
 }  // namespace
 
 TEST(OccupancyMapperTest, SingleRayMarksOneOccupiedVoxel) {
-  basalt::OccupancyMapper mapper(makeTestCalib(), /*voxel_size=*/0.2,
+  basalt::OccupancyMapper mapper(makeTestIntrinsics(), /*voxel_size=*/0.2,
                                   /*depth_stride=*/1);
   mapper.start();
 
@@ -70,7 +60,6 @@ TEST(OccupancyMapperTest, SingleRayMarksOneOccupiedVoxel) {
   frame->depth_mm = makeCenterPixelDepth(2100);  // 2.1m -- deliberately not
   // an exact multiple of the 0.2m voxel size, to avoid floating-point
   // voxel-boundary ambiguity in this test.
-  frame->cam_id = 0;
   mapper.addDepthFrame(frame);
 
   basalt::VoxelDelta delta;
@@ -91,7 +80,7 @@ TEST(OccupancyMapperTest, SingleRayMarksOneOccupiedVoxel) {
 }
 
 TEST(OccupancyMapperTest, ReinsertingTheSamePointProducesNoChange) {
-  basalt::OccupancyMapper mapper(makeTestCalib(), /*voxel_size=*/0.2,
+  basalt::OccupancyMapper mapper(makeTestIntrinsics(), /*voxel_size=*/0.2,
                                   /*depth_stride=*/1);
   mapper.start();
 
@@ -128,7 +117,7 @@ TEST(OccupancyMapperTest, ReinsertingTheSamePointProducesNoChange) {
 }
 
 TEST(OccupancyMapperTest, RayPastAnOccupiedVoxelClearsIt) {
-  basalt::OccupancyMapper mapper(makeTestCalib(), /*voxel_size=*/0.2,
+  basalt::OccupancyMapper mapper(makeTestIntrinsics(), /*voxel_size=*/0.2,
                                   /*depth_stride=*/1);
   mapper.start();
 
@@ -178,7 +167,7 @@ TEST(OccupancyMapperTest, RayPastAnOccupiedVoxelClearsIt) {
 }
 
 TEST(OccupancyMapperTest, AllInvalidDepthProducesNoDelta) {
-  basalt::OccupancyMapper mapper(makeTestCalib(), /*voxel_size=*/0.2);
+  basalt::OccupancyMapper mapper(makeTestIntrinsics(), /*voxel_size=*/0.2);
   mapper.start();
 
   auto frame = std::make_shared<basalt::DepthFrameInput>();
@@ -194,16 +183,17 @@ TEST(OccupancyMapperTest, AllInvalidDepthProducesNoDelta) {
 
 TEST(OccupancyMapperTest, DepthResolutionLowerThanCalibrationIsScaled) {
   // Reproduces the real "fan-shaped map" bug: the depth stream outputs at
-  // half the calibration's resolution (mirrors DepthAI's StereoDepth
-  // DEFAULT preset producing 320x240 depth against a 640x480 calibration).
-  // The calibration here is declared for a 100x100 image (fx=fy=100,
-  // cx=cy=50), but the depth frame is only 50x50 -- so the true principal
-  // point (50, 50) lands at (25, 25) in the actual depth image. Without
-  // the fix, pixel (25, 25) is unprojected directly, landing far off the
-  // optical axis and back-projecting to the wrong point; with the fix, it
-  // scales up to (50, 50) before unprojecting, giving exactly the same
-  // on-axis (0, 0, depth) result as SingleRayMarksOneOccupiedVoxel above.
-  basalt::OccupancyMapper mapper(makeTestCalibWithResolution(100, 100),
+  // half depth_intrinsics_'s own reference resolution (mirrors DepthAI's
+  // StereoDepth DEFAULT preset producing 320x240 depth against a 640x480
+  // query). The intrinsics here are declared for a 100x100 image (fx=fy=
+  // 100, cx=cy=50), but the depth frame is only 50x50 -- so the true
+  // principal point (50, 50) lands at (25, 25) in the actual depth image.
+  // Without the fix, pixel (25, 25) is unprojected directly, landing far
+  // off the optical axis and back-projecting to the wrong point; with the
+  // fix, it scales up to (50, 50) before unprojecting, giving exactly the
+  // same on-axis (0, 0, depth) result as SingleRayMarksOneOccupiedVoxel
+  // above.
+  basalt::OccupancyMapper mapper(makeTestIntrinsics(),
                                   /*voxel_size=*/0.2, /*depth_stride=*/1);
   mapper.start();
 
@@ -229,6 +219,6 @@ TEST(OccupancyMapperTest, StopIsSafeWithoutStart) {
   // stop() must be safe to call even if start() never ran (mirrors
   // OakDDevice/DashboardClient's own guard idiom) -- also covers the
   // destructor path, since ~OccupancyMapper() calls stop().
-  basalt::OccupancyMapper mapper(makeTestCalib(), /*voxel_size=*/0.2);
+  basalt::OccupancyMapper mapper(makeTestIntrinsics(), /*voxel_size=*/0.2);
   mapper.stop();
 }

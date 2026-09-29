@@ -141,6 +141,38 @@ class OakDDevice {
   void setImuTapQueue(
       tbb::concurrent_bounded_queue<ImuData<double>::Ptr>* imu_tap_queue);
 
+  // Plain pinhole intrinsics for whatever camera StereoDepth's depth
+  // output is rectified/aligned to (currently CAM_B/left -- no explicit
+  // setDepthAlign() call exists, so this assumes DepthAI's default;
+  // see start()'s comment). "Plain pinhole" is deliberate, not an
+  // approximation: StereoDepth's own depth output is ALREADY undistorted
+  // by construction (block-matching depth algorithms fundamentally
+  // require rectified input), so no distortion coefficients apply here at
+  // all -- unlike calib_.intrinsics[cam_id], which describes the RAW,
+  // un-rectified lens (needed for VIO/optical-flow, which reads raw
+  // frames, but wrong for depth). fx/fy/cx/cy are reported at
+  // `width`x`height`; OccupancyMapper scales them to whatever resolution
+  // the actual depth stream outputs, same as it already did for the
+  // calib-vs-depth-resolution mismatch (see its own comment).
+  struct DepthIntrinsics {
+    double fx = 0, fy = 0, cx = 0, cy = 0;
+    int width = 0, height = 0;
+  };
+
+  // Only meaningful once start() has run (queries the live device's own
+  // factory calibration) -- see start()'s comment for why this can't be
+  // known any earlier. Live-diagnosed (2026-09-29, OAK-D Pro W): using
+  // calib_.intrinsics[cam_id] (Basalt's own kb4 fit of the RAW lens) to
+  // unproject StereoDepth's RECTIFIED output produced a severely warped
+  // point cloud -- Luxonis's own factory calibration (queried here) has a
+  // 21% different focal length AND a completely different distortion
+  // model family (their own "Perspective"/8-parameter model vs our kb4
+  // fit), because StereoDepth rectifies internally using ITS OWN
+  // calibration, never Basalt's. Harmless/unused on the OAK-D Lite, where
+  // the two calibrations happened to be close enough that this mismatch
+  // was too small to notice.
+  DepthIntrinsics getDepthIntrinsics() const { return depth_intrinsics_; }
+
   // IR laser dot projector / IR flood light intensity, OAK-D Pro W only
   // (both silently no-ops on hardware without them -- DepthAI's own
   // setIr*Intensity() return false rather than throwing when unsupported,
@@ -167,6 +199,7 @@ class OakDDevice {
   void deviceLoop();
 
   const bool enable_stereo_depth_;
+  DepthIntrinsics depth_intrinsics_;
 
   std::atomic<bool> running{false};
   std::thread device_thread;

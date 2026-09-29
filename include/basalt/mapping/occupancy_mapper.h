@@ -99,8 +99,9 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 // see octomap's own includes just to hold an OccupancyMapper::Ptr.
 #include <octomap/OcTreeKey.h>
 
-#include <basalt/calibration/calibration.hpp>
 #include <basalt/utils/eigen_utils.hpp>
+
+#include <sophus/se3.hpp>
 
 namespace octomap {
 class OcTree;
@@ -116,9 +117,21 @@ struct DepthFrameInput {
   int64_t t_ns;
   Sophus::SE3d T_w_c;  // camera pose in world frame at capture time
   cv::Mat depth_mm;    // CV_16UC1, millimeters, 0 == invalid/no return
-  int cam_id = 0;      // which calib_.intrinsics[cam_id] applies
 
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+};
+
+// Plain pinhole intrinsics for whatever camera StereoDepth's depth output
+// is rectified/aligned to -- see OakDDevice::DepthIntrinsics's comment for
+// why this must come from the device's own factory calibration, not
+// Basalt's own (of the RAW, un-rectified lens): StereoDepth rectifies
+// internally using its own calibration, and a mismatch here produces a
+// severely warped point cloud (live-diagnosed on OAK-D Pro W, 2026-09-29
+// -- see this file's own header comment). No distortion coefficients,
+// deliberately: the rectified depth output is undistorted by construction.
+struct DepthIntrinsics {
+  double fx = 0, fy = 0, cx = 0, cy = 0;
+  int width = 0, height = 0;
 };
 
 // One incremental update since the previous insertion, read straight from
@@ -140,7 +153,7 @@ class OccupancyMapper {
   // subset of pixels, not by using a different depth algorithm), and at
   // depth-camera resolutions a stride of 4 already means the far majority
   // of pixels are still represented at typical voxel sizes.
-  OccupancyMapper(const Calibration<double>& calib, double voxel_size,
+  OccupancyMapper(const DepthIntrinsics& depth_intrinsics, double voxel_size,
                    int depth_stride = 4);
   ~OccupancyMapper();
 
@@ -162,7 +175,7 @@ class OccupancyMapper {
   void processingThreadMain();
   void insertFrame(const DepthFrameInput::Ptr& frame);
 
-  Calibration<double> calib_;
+  DepthIntrinsics depth_intrinsics_;
   int depth_stride_;
 
   std::unique_ptr<octomap::OcTree> tree_;

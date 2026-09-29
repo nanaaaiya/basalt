@@ -495,8 +495,20 @@ int main(int argc, char** argv) {
   }
 
   if (enable_occupancy_mapping) {
+    // Luxonis's own factory calibration, NOT Basalt's calib -- see
+    // OccupancyMapper::DepthIntrinsics's header comment for why using
+    // Basalt's own (RAW-lens) camera model here produced a severely
+    // warped point cloud on OAK-D Pro W.
+    auto oakd_intr = oakd_device->getDepthIntrinsics();
+    basalt::DepthIntrinsics depth_intr;
+    depth_intr.fx = oakd_intr.fx;
+    depth_intr.fy = oakd_intr.fy;
+    depth_intr.cx = oakd_intr.cx;
+    depth_intr.cy = oakd_intr.cy;
+    depth_intr.width = oakd_intr.width;
+    depth_intr.height = oakd_intr.height;
     occupancy_mapper.reset(new basalt::OccupancyMapper(
-        calib, occupancy_voxel_size, occupancy_depth_stride));
+        depth_intr, occupancy_voxel_size, occupancy_depth_stride));
     occupancy_mapper->start();
     depth_queue.set_capacity(4);
     oakd_device->setDepthOutputQueue(&depth_queue);
@@ -831,7 +843,6 @@ int main(int argc, char** argv) {
         input->t_ns = static_cast<int64_t>(t_sec * 1e9);
         input->T_w_c = pose * calib.T_i_c[0];
         input->depth_mm = depth_frame->getCvFrame();
-        input->cam_id = 0;
         occupancy_mapper->addDepthFrame(input);
 
         basalt::VoxelDelta delta;
