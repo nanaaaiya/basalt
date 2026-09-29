@@ -289,6 +289,27 @@ int main(int argc, char** argv) {
                  "grid -- independent of the depth stream's own ~30fps, "
                  "since mapping doesn't need every frame.");
 
+  // OAK-D Pro W only -- silently a no-op on hardware without an IR
+  // projector (see OakDDevice::setIrEmitters()'s comment). Off by default,
+  // same reasoning as enable_occupancy_mapping above: opt-in for a feature
+  // this specific hardware needs recalibration/live validation before
+  // being trusted unconditionally. Live-verified crash-safe in isolation
+  // via basalt_test_ir_emitters before being wired in here.
+  bool enable_ir_emitters = false;
+  app.add_option("--enable-ir-emitters", enable_ir_emitters,
+                 "Turn on the OAK-D Pro W's IR laser dot projector + flood "
+                 "light for active depth (see basalt_test_ir_emitters).");
+  double ir_laser_intensity = 0.5;
+  app.add_option("--ir-laser-intensity", ir_laser_intensity,
+                 "IR laser dot projector intensity, 0.0-1.0. Only applied "
+                 "if --enable-ir-emitters is set.");
+  double ir_flood_intensity = 0.0;
+  app.add_option("--ir-flood-intensity", ir_flood_intensity,
+                 "IR flood light intensity, 0.0-1.0. Only applied if "
+                 "--enable-ir-emitters is set. Off by default -- the dot "
+                 "projector alone is what active depth needs; flood mainly "
+                 "helps plain image brightness in the dark.");
+
   // Default: a fresh timestamped folder per run, so repeated test runs
   // don't clobber each other and can be compared later -- see
   // writeTrajectoryLogs() for what actually gets written into it.
@@ -408,6 +429,11 @@ int main(int argc, char** argv) {
   } catch (const std::exception& e) {
     std::cerr << "Failed to start OAK-D Lite: " << e.what() << std::endl;
     return 1;
+  }
+
+  if (enable_ir_emitters) {
+    oakd_device->setIrEmitters(static_cast<float>(ir_laser_intensity),
+                                static_cast<float>(ir_flood_intensity));
   }
 
   opt_flow_ptr = basalt::OpticalFlowFactory::getOpticalFlow(vio_config, calib);

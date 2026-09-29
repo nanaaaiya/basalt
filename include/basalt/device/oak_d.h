@@ -33,8 +33,22 @@ OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 */
 
-// Live driver for a Luxonis OAK-D Lite (stereo mono cameras + BMI270 IMU),
-// modeled directly on RsT265Device's public shape (start()/stop()/
+// Live driver for a Luxonis OAK-D camera (stereo mono cameras + IMU). This
+// branch (oakd-pro) targets the OAK-D Pro W specifically: OV9282 wide-FOV
+// global-shutter mono pair, active depth via IR laser dot projector (see
+// setIrEmitters() below), and a BNO086 9-axis IMU -- confirmed by direct
+// query (device.getConnectedIMU()) on real hardware 2026-09-29, NOT the
+// BMI270 the OAK-D Lite (this driver's original target) uses. IMU_RATE=200
+// with ACCELEROMETER_RAW/GYROSCOPE_RAW reports (see enableIMUSensor() in
+// the .cpp) is unchanged and live-verified to still work on the BNO086
+// (~191Hz measured, close enough to the 200Hz request to match the Lite's
+// own real-world jitter) -- DepthAI's raw IMU report types are chip-
+// agnostic at the API level, so no code change was needed there, only
+// this comment. Actual noise characteristics (bias stability, noise
+// density) differ from BMI270's and are captured fresh by
+// basalt_calibrate_imu regardless of which chip is behind the API, same
+// as for any new physical unit.
+// Modeled directly on RsT265Device's public shape (start()/stop()/
 // setOutputQueues()) so it drops into the same OpticalFlowBase::input_queue /
 // VioEstimatorBase::imu_data_queue wiring used by rs_t265_vio.cpp. Unlike the
 // T265, the OAK-D has no on-device factory calibration to query at runtime --
@@ -126,6 +140,19 @@ class OakDDevice {
   // here instead of trying to intercept setOutputQueues()'s queue.
   void setImuTapQueue(
       tbb::concurrent_bounded_queue<ImuData<double>::Ptr>* imu_tap_queue);
+
+  // IR laser dot projector / IR flood light intensity, OAK-D Pro W only
+  // (both silently no-ops on hardware without them -- DepthAI's own
+  // setIr*Intensity() return false rather than throwing when unsupported,
+  // per live testing). 0.0 = off, 1.0 = maximum. A plain runtime call on
+  // dai::Device, NOT a dai::CameraControl message -- see this class's
+  // header comment on why that distinction matters here. Live-verified
+  // safe (no firmware crash, full 0.0-1.0 range, both laser and flood)
+  // via basalt_test_ir_emitters before this was ever wired in here.
+  // Must be called after start() (pipeline.getDefaultDevice() is only
+  // valid once the pipeline has actually started) -- a no-op before
+  // that, logged rather than silently dropped.
+  void setIrEmitters(float laser_intensity, float flood_intensity);
 
   OpticalFlowInput::Ptr getLastImageData() const;
 

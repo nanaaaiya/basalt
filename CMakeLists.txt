@@ -508,6 +508,13 @@ if(depthai_FOUND)
   # header comment).
   add_executable(basalt_test_camera_exposure src/test_camera_exposure.cpp)
   target_link_libraries(basalt_test_camera_exposure basalt::opencv depthai::core)
+
+  # Isolated IR-emitter test (OAK-D Pro W) -- same isolation rationale as
+  # basalt_test_camera_exposure above: tests setIrLaserDotProjectorIntensity()/
+  # setIrFloodLightIntensity() in complete isolation before either is
+  # allowed near oak_d.cpp.
+  add_executable(basalt_test_ir_emitters src/test_ir_emitters.cpp)
+  target_link_libraries(basalt_test_ir_emitters basalt::opencv depthai::core)
 else()
   message(WARNING "depthai-core not found, skipping basalt_oak_d_vio target")
 endif()

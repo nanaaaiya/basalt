@@ -109,6 +109,17 @@ void OakDDevice::start() {
     // they're the same raw, unrectified outputs VIO also reads.
     auto stereo = pipeline.create<dai::node::StereoDepth>();
     stereo->setDefaultProfilePreset(dai::node::StereoDepth::PresetMode::DEFAULT);
+    // Untouched on the OAK-D Lite (bare DEFAULT preset, no filtering) --
+    // worth enabling now since this is a fresh integration anyway and
+    // active depth (OAK-D Pro W's IR laser projector, see setIrEmitters())
+    // should make left-right consistency checking and subpixel refinement
+    // meaningfully more effective than they'd have been on pure passive
+    // stereo. Confidence threshold left near DepthAI's own default (55) --
+    // an explicit first guess, not yet live-tuned against this specific
+    // camera's actual noise floor.
+    stereo->setLeftRightCheck(true);
+    stereo->setSubpixel(true);
+    stereo->initialConfig->setConfidenceThreshold(55);
     // The DEFAULT preset downscales its own output resolution regardless
     // of the 640x480 mono input (found producing 320x240 depth frames in
     // testing). Deliberately left at that lower resolution rather than
@@ -128,6 +139,26 @@ void OakDDevice::start() {
   std::cout << "[OAKD]: device connected, streaming" << std::endl;
 
   device_thread = std::thread(&OakDDevice::deviceLoop, this);
+}
+
+void OakDDevice::setIrEmitters(float laser_intensity, float flood_intensity) {
+  if (!running.load()) {
+    std::cerr << "[OAKD] setIrEmitters() called before start() -- no-op"
+              << std::endl;
+    return;
+  }
+  auto device = pipeline.getDefaultDevice();
+  if (!device) {
+    std::cerr << "[OAKD] setIrEmitters(): no device handle available"
+              << std::endl;
+    return;
+  }
+  bool laser_ok = device->setIrLaserDotProjectorIntensity(laser_intensity);
+  bool flood_ok = device->setIrFloodLightIntensity(flood_intensity);
+  std::cout << "[OAKD] IR laser intensity=" << laser_intensity << " ("
+            << (laser_ok ? "ok" : "unsupported/failed") << "), flood intensity="
+            << flood_intensity << " (" << (flood_ok ? "ok" : "unsupported/failed")
+            << ")" << std::endl;
 }
 
 void OakDDevice::stop() {
