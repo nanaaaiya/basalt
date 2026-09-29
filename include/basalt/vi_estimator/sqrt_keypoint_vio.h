@@ -326,6 +326,15 @@ class SqrtKeypointVioEstimator : public VioEstimatorBase,
 
   int64_t last_state_t_ns;
 
+  // Guards against a non-monotonic IMU sample reaching
+  // IntegratedImuMeasurement::propagateState() (a vendored basalt-headers
+  // assertion, data.t_ns > curr_state.t_ns, that hard-aborts the whole
+  // process on violation) -- see popFromImuDataQueue()'s comment. Only
+  // ever read/written from the estimator's own single processing thread,
+  // so a plain int64_t (not atomic) is correct here, same as
+  // last_state_t_ns above. -1 means "no sample seen yet".
+  int64_t last_imu_t_ns_ = -1;
+
   std::atomic<double> latest_tracked_ratio{1.0};
   std::atomic<int> latest_tracked_count{0};
   std::atomic<int> latest_total_observed_count{0};

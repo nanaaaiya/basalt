@@ -425,7 +425,36 @@ template <class Scalar_>
 typename ImuData<Scalar_>::Ptr
 SqrtKeypointVioEstimator<Scalar_>::popFromImuDataQueue() {
   ImuData<double>::Ptr data;
-  imu_data_queue.pop(data);
+
+  // Guards against a non-monotonic IMU sample reaching
+  // IntegratedImuMeasurement::propagateState() further downstream (a
+  // vendored basalt-headers assertion -- data.t_ns > curr_state.t_ns --
+  // that hard-aborts the WHOLE PROCESS on violation, not something to
+  // patch directly). Live-diagnosed (2026-09-29, OAK-D Pro W): a
+  // device/driver quirk under this camera's heavier combined load
+  // (StereoDepth + IR emitters + wide mono, well beyond what the OAK-D
+  // Lite ever asked of it) delivered two consecutive IMU samples with an
+  // inverted timestamp (~0.7ms observed), crashing the whole pipeline.
+  // On real flight hardware, an unrecoverable crash from one bad
+  // timestamp is unacceptable -- drop the offending sample and keep
+  // going instead. One dropped IMU sample at ~200Hz is negligible; a
+  // crashed VIO process is not.
+  while (true) {
+    imu_data_queue.pop(data);
+    if (!data) break;  // shutdown sentinel -- never gets a t_ns check; the
+                       // shared null-handling below (and the templated
+                       // Scalar_ cast at this function's end) already
+                       // handles it correctly.
+
+    if (last_imu_t_ns_ >= 0 && data->t_ns <= last_imu_t_ns_) {
+      std::cerr << "[VIO] Dropping non-monotonic IMU sample: t_ns="
+                << data->t_ns << " <= last accepted t_ns=" << last_imu_t_ns_
+                << std::endl;
+      continue;
+    }
+    last_imu_t_ns_ = data->t_ns;
+    break;
+  }
 
   // Single chokepoint for every IMU sample this estimator ever consumes --
   // record rotation rate here (rather than at each of this function's
