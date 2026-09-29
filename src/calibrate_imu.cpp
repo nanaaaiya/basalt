@@ -104,12 +104,27 @@ int main(int argc, char** argv) {
     cv.setOptImuScale(true);
     while (!cv.optimizeWithParam(true)) {
     }
-    cv.initMocap();
-    cv.setOptMocap(true);
-    while (!cv.optimizeWithParam(true)) {
-    }
     cv.saveCalib();
-    cv.saveMocapCalib();
+
+    // A live camera+IMU recording (no external mocap/ground-truth system)
+    // has no mocap data at all -- initMocap() detects this and bails out
+    // without actually setting up the mocap-fit optimization terms, but
+    // previously this path called setOptMocap(true) and re-optimized
+    // regardless, leaving optimizeWithParam(true) trying to converge a
+    // term that was never set up. Confirmed live (2026-09-29): it then
+    // never returns true, hanging this loop forever. Only attempt the
+    // mocap stage when the dataset genuinely has mocap data to fit.
+    if (cv.hasMocapData()) {
+      cv.initMocap();
+      cv.setOptMocap(true);
+      while (!cv.optimizeWithParam(true)) {
+      }
+      cv.saveMocapCalib();
+    } else {
+      std::cout << "No mocap data in dataset -- skipping mocap calibration "
+                   "stage."
+                << std::endl;
+    }
     return 0;
   }
 

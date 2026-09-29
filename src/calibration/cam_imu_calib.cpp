@@ -1167,4 +1167,8 @@ void CamImuCalib::drawPlots() {
 
 bool CamImuCalib::hasCorners() const { return !calib_corners.empty(); }
 
+bool CamImuCalib::hasMocapData() const {
+  return vio_dataset.get() && !vio_dataset->get_gt_timestamps().empty();
+}
+
 }  // namespace basalt

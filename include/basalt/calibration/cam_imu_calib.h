@@ -103,6 +103,18 @@ class CamImuCalib {
 
   bool hasCorners() const;
 
+  // Whether the loaded dataset has any mocap/ground-truth data at all.
+  // A live camera+IMU recording (e.g. basalt_oak_d_calib_record) never
+  // does -- initMocap() already detects and logs this ("The dataset
+  // contains no Mocap data!") but returns silently rather than signaling
+  // failure, and the --no-gui path in calibrate_imu.cpp previously called
+  // setOptMocap(true)/optimizeWithParam() regardless, leaving the
+  // optimizer trying to converge a mocap-fit term that was never actually
+  // set up. Confirmed live (2026-09-29): optimizeWithParam(true) then
+  // never returns true, hanging the --no-gui path's while loop forever.
+  // Callers should check this before enabling mocap optimization.
+  bool hasMocapData() const;
+
   void setOptIntrinsics(bool opt) { opt_intr = opt; }
   void setOptCamTimeOffset(bool opt) { opt_cam_time_offset = opt; }
   void setOptImuScale(bool opt) { opt_imu_scale = opt; }
