@@ -363,6 +363,11 @@ class OnlineLoopClosure {
   void solvePoseGraph();
   void checkDriftGate();  // called by solvePoseGraph() -- see its .cpp comment
 
+  // What to actually output while drift_held_ is true -- see
+  // held_position_only_'s own comment for why a low-parallax hold blends
+  // live rotation with frozen translation instead of freezing everything.
+  Sophus::SE3d heldOutputPose(const Sophus::SE3d& current_raw_pose) const;
+
   // Shared by checkDriftGate()'s keyframe-gated timeout and
   // getSmoothedCorrectedPose()'s wall-clock watchdog (see
   // drift_held_since_wall_) -- both need to trigger the exact same
@@ -412,6 +417,22 @@ class OnlineLoopClosure {
   // see that method's comment for why a release needs to be triggerable
   // from both places.
   mutable bool drift_held_ = false;
+  // True only for a hold tripped by the low-parallax trigger (see
+  // kLowParallaxMinTriangulatedPoints in the .cpp) -- false for the other
+  // two (residual-based and starvation). While true, getSmoothedCorrectedPose()
+  // freezes only held_pose_'s TRANSLATION and keeps outputting LIVE
+  // orientation from current_raw_pose, instead of freezing the whole
+  // pose. Live-diagnosed 2026-10-01: a user rotating the camera in place
+  // to scan a wall has plenty of gyro activity (so the OTHER triggers'
+  // "confirmed stationary" gate never fires) but can still have near-zero
+  // translation, under which position drifts exactly like the fully-
+  // stationary case -- freezing orientation too in that case would make
+  // the live view visibly stop rotating while the camera is obviously
+  // still turning, which is a worse, more confusing artifact than the
+  // drift it would be guarding against. Residual and starvation holds
+  // keep freezing everything, since those can indicate the RAW pose
+  // itself (not just position) is untrustworthy.
+  mutable bool held_position_only_ = false;
   // mutable: both written from checkDriftGate() (non-const) on a normal
   // residual-based trip, AND from getSmoothedCorrectedPose() (const) on
   // a starvation trip -- see kStarvationMinTrackedCount in the .cpp.
@@ -465,6 +486,25 @@ class OnlineLoopClosure {
   // to VIO's own logical time.
   mutable bool release_blending_ = false;
   mutable Sophus::SE3d release_blend_start_pose_;
+  // True if release_blend_start_pose_ was captured FROM a position-only
+  // hold (held_position_only_ was true at that moment) -- its rotation is
+  // therefore the STALE value from whenever the hold originally tripped,
+  // not the live rotation the display was actually showing throughout
+  // the hold (see heldOutputPose()). Blending from it unmodified would
+  // make orientation visibly jump backward right at release, then blend
+  // back to live again -- a worse glitch than not blending at all. The
+  // two sites that capture release_blend_start_pose_ from held_pose_
+  // (checkDriftGate()'s confirmed release, forceReleaseDriftHoldLocked())
+  // don't have a live raw pose available to fix this at capture time;
+  // consumed, one-shot, the first time getSmoothedCorrectedPose() handles
+  // this blend (same "recomputed on first use" pattern as
+  // release_blend_duration_s_) -- that call DOES have current_raw_pose,
+  // and swaps release_blend_start_pose_'s rotation for
+  // current_raw_pose.so3() right before the blend duration gets computed
+  // from it. Left false (a no-op) by the OTHER arm site (the general
+  // target-jump detector), which already captures from last_published_pose_
+  // / out, both already-live poses.
+  mutable bool release_blend_start_was_position_only_ = false;
   mutable std::chrono::steady_clock::time_point release_blend_start_wall_;
   static constexpr double kReleaseBlendDurationS = 0.4;
   // Actual duration in use for the blend currently in flight -- a fixed
@@ -607,6 +647,16 @@ class OnlineLoopClosure {
   // time the way an instant reset did.
   mutable bool has_good_streak_ = false;
   mutable std::chrono::steady_clock::time_point good_streak_since_wall_;
+
+  // Same pattern as starvation_active_/has_good_streak_ above, for the
+  // separate low-parallax trigger (see kLowParallaxMinTriangulatedPoints
+  // in the .cpp): confirmed-stationary IMU reading + poor triangulation
+  // yield, persisted long enough to trip a hold even though tracked_count
+  // stays healthy the whole time (so the starvation trigger never fires).
+  mutable bool low_parallax_active_ = false;
+  mutable std::chrono::steady_clock::time_point low_parallax_since_wall_;
+  mutable bool has_good_parallax_streak_ = false;
+  mutable std::chrono::steady_clock::time_point good_parallax_streak_since_wall_;
 
   // Continuously updated by getSmoothedCorrectedPose() (mutable: that
   // method is const) every time it publishes a live, not-held pose --

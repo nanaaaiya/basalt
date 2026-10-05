@@ -385,6 +385,46 @@ constexpr double kStarvationPersistenceSeconds = 2.0;
 // an extended bad stretch -- picked as roughly double the longest single
 // flicker observed there (~0.4s), not independently tuned.
 constexpr double kStarvationRecoveryGraceS = 1.0;
+// Tiered reaction speed: kStarvationPersistenceSeconds (2.0s) exists to
+// reject brief flickers (see its own comment), but that same 2s delay
+// means a genuinely catastrophic collapse -- tracked_count crashing from
+// healthy to near-zero in a single frame, e.g. from fast rotation
+// outrunning KLT's search window -- gets a 2-second head start to free-
+// drift on IMU-only integration before the hold even engages. Live-
+// diagnosed 2026-10-01: three starvation episodes in one 72s test, all
+// at tracked_count 1-6 (well under kStarvationMinTrackedCount's
+// borderline 8), each with its own ~2s unprotected drift window, leaving
+// a map with distinct layers despite the hold mechanism "working". A
+// reading this low isn't a flicker that might recover on its own --
+// it's as close to a confirmed camera-covered/total-blackout signal as
+// this metric gets, so it gets a much shorter confirmation window
+// instead of the flicker-safe one. Reasoned, not live-tuned, same
+// caveat as this file's other thresholds.
+constexpr int kStarvationSevereMaxTrackedCount = 3;
+constexpr double kStarvationSeverePersistenceSeconds = 0.3;
+
+// Low-parallax trigger (separate from the starvation one above): holds
+// the live pose when the IMU says the device isn't really moving AND
+// recent triangulation yield is poor, even though tracked_count/
+// total_observed_count look perfectly healthy. Live-diagnosed 2026-10-01:
+// pointing continuously at one close, low-texture wall for ~100s let the
+// CORRECTED position drift >0.5m with neither the starvation trigger
+// (tracked_count stayed fine -- an untextured-but-IR-dot-covered wall
+// gives KLT plenty to follow frame-to-frame even with zero camera
+// translation) nor checkDriftGate()'s residual check (raw VIO and the
+// pose graph drift TOGETHER when both are starved of parallax by the
+// same weak visual signal, so there's no disagreement between them to
+// detect) ever tripping. A confirmed-stationary IMU reading is an
+// independent, non-visual signal: if it's true, there is no legitimate
+// reason for position to be changing at all, so holding it is safe by
+// construction, not a guess.
+constexpr int kLowParallaxMinTriangulatedPoints = 10;
+// Longer than kStarvationPersistenceSeconds -- this is a slower, lower-
+// urgency failure mode (slow drift, not a camera-covered blackout), so
+// there's room to wait longer for confirmation and avoid tripping on a
+// normal brief pause.
+constexpr double kLowParallaxPersistenceSeconds = 3.0;
+constexpr double kLowParallaxRecoveryGraceS = 1.0;
 
 // Decompose R = Rz(yaw) * Ry(pitch) * Rx(roll). Assumes no gimbal lock
 // (pitch away from +-90 deg), a reasonable assumption for a handheld/mobile
@@ -1427,6 +1467,12 @@ void OnlineLoopClosure::checkDriftGate() {
         held_anchor_raw_pose_ = T_reference_raw;
       }
       drift_held_ = true;
+      // Freezes everything (not position-only) -- a residual trip means
+      // the pose GRAPH's correction disagrees with raw VIO's own motion
+      // estimate, a real reason to distrust the current pose generally,
+      // not a targeted low-parallax situation. See held_position_only_'s
+      // comment for the contrast with the low-parallax trigger.
+      held_position_only_ = false;
       drift_held_since_t_ns_ = newest.t_ns;
       drift_held_since_wall_ = std::chrono::steady_clock::now();
       drift_gate_events.try_push(DriftGateEvent::kTripped);
@@ -1451,6 +1497,11 @@ void OnlineLoopClosure::checkDriftGate() {
       keyframes_since_anchor_refresh_ = 0;
       release_blending_ = true;
       release_blend_start_pose_ = held_pose_;
+      // See release_blend_start_was_position_only_'s header comment --
+      // this capture has no live raw pose to fix up held_pose_'s stale
+      // rotation with right now, so it's deferred to the first
+      // getSmoothedCorrectedPose() call that handles this blend instead.
+      release_blend_start_was_position_only_ = held_position_only_;
       release_blend_start_wall_ = std::chrono::steady_clock::now();
       release_blend_duration_s_ = -1.0;  // recomputed on first use -- see comment
       // See forceReleaseDriftHoldLocked()'s matching reset -- same bug,
@@ -1499,6 +1550,12 @@ void OnlineLoopClosure::forceReleaseDriftHoldLocked() const {
   keyframes_since_anchor_refresh_ = 0;
   release_blending_ = true;
   release_blend_start_pose_ = held_pose_;
+  // See release_blend_start_was_position_only_'s header comment -- read
+  // before drift_held_'s own reset above would matter, but
+  // held_position_only_ isn't touched by this function, so order doesn't
+  // actually matter here; kept at this point anyway to sit next to the
+  // pose capture it describes.
+  release_blend_start_was_position_only_ = held_position_only_;
   release_blend_start_wall_ = std::chrono::steady_clock::now();
   release_blend_duration_s_ = -1.0;  // recomputed on first use -- see comment
   last_forced_release_wall_ = release_blend_start_wall_;
@@ -1586,6 +1643,14 @@ bool OnlineLoopClosure::getLatestCorrectedPose(Sophus::SE3d& out) const {
   return true;
 }
 
+Sophus::SE3d OnlineLoopClosure::heldOutputPose(
+    const Sophus::SE3d& current_raw_pose) const {
+  if (held_position_only_) {
+    return Sophus::SE3d(current_raw_pose.so3(), held_pose_.translation());
+  }
+  return held_pose_;
+}
+
 bool OnlineLoopClosure::getSmoothedCorrectedPose(
     const Sophus::SE3d& current_raw_pose, Sophus::SE3d& out) const {
   std::lock_guard<std::mutex> lock(state_mutex_);
@@ -1665,7 +1730,7 @@ bool OnlineLoopClosure::getSmoothedCorrectedPose(
                         : "")
                 << std::endl;
     } else {
-      out = held_pose_;
+      out = heldOutputPose(current_raw_pose);
       return true;
     }
   }
@@ -1696,7 +1761,16 @@ bool OnlineLoopClosure::getSmoothedCorrectedPose(
     }
     double starved_s =
         std::chrono::duration<double>(now - starvation_since_wall_).count();
-    if (starved_s >= kStarvationPersistenceSeconds) {
+    // See kStarvationSevereMaxTrackedCount's comment -- re-evaluated every
+    // tick against the CURRENT sample, not just the sample that started
+    // this streak, so a streak that started borderline and then crashes
+    // severely gets the fast reaction from the moment it actually turns
+    // severe, not stuck waiting out the slower timer it was started with.
+    double required_persistence_s =
+        latest_reported_tracked_count_ <= kStarvationSevereMaxTrackedCount
+            ? kStarvationSeverePersistenceSeconds
+            : kStarvationPersistenceSeconds;
+    if (starved_s >= required_persistence_s) {
       // Freeze at wherever the live pose actually was an instant ago,
       // same reasoning as checkDriftGate()'s own trip -- see held_pose_'s
       // header comment for why last_published_pose_, not some graph node.
@@ -1723,6 +1797,13 @@ bool OnlineLoopClosure::getSmoothedCorrectedPose(
       // ended the PREVIOUS hold can't combine with this new one's.
       hold_believed_stationary_ = latest_reported_likely_stationary_;
       non_stationary_active_ = false;
+      // Freezes everything (not position-only) -- a starvation episode
+      // (camera covered, chronic tracking loss) can mean the RAW pose
+      // itself, not just position, is untrustworthy. See
+      // held_position_only_'s comment for the contrast with the low-
+      // parallax trigger below, where tracked_count staying healthy is
+      // exactly what makes it safe to keep trusting live orientation.
+      held_position_only_ = false;
       drift_gate_events.try_push(DriftGateEvent::kTripped);
       std::cout << "[ONLINE-LOOP] DRIFT GATE TRIPPED (starvation: "
                    "tracked_count="
@@ -1732,7 +1813,7 @@ bool OnlineLoopClosure::getSmoothedCorrectedPose(
                 << latest_reported_total_observed_count_
                 << ", starved for " << starved_s
                 << "s) -- holding live pose in place" << std::endl;
-      out = held_pose_;
+      out = heldOutputPose(current_raw_pose);
       return true;
     }
   } else if (starvation_active_) {
@@ -1748,6 +1829,97 @@ bool OnlineLoopClosure::getSmoothedCorrectedPose(
     if (good_s >= kStarvationRecoveryGraceS) {
       starvation_active_ = false;
       has_good_streak_ = false;
+    }
+  }
+
+  // Low-parallax trigger (see kLowParallaxMinTriangulatedPoints's comment
+  // above) -- only evaluated when not starved: that trigger already owns
+  // holding the pose when tracking itself is bad, and at this point
+  // drift_held_ is definitely false either way (same reasoning as the
+  // starvation trigger above), so there's no risk of the two conflicting.
+  if (!starved) {
+    // NOT gated on latest_reported_likely_stationary_ (unlike the
+    // starvation trigger) -- see held_position_only_'s header comment.
+    // That gate existed to avoid misreading real constant-velocity
+    // motion as "stationary" and then freezing ORIENTATION during real
+    // flight, but this trigger only ever freezes translation (rotation
+    // keeps tracking current_raw_pose live, via heldOutputPose()), so
+    // that risk doesn't apply here. Gating purely on sustained low
+    // triangulation yield directly targets the actual problem (weak
+    // parallax to constrain position), regardless of whether that's from
+    // full stillness or rotation-dominated motion with little real
+    // translation -- live-diagnosed 2026-10-01: rotating the camera in
+    // place to scan a wall has plenty of gyro activity (so
+    // likely_stationary was never true) but still had near-zero real
+    // translation, and position still drifted continuously the same way
+    // the fully-stationary case did.
+    bool low_parallax =
+        latest_triangulated_points.load() < kLowParallaxMinTriangulatedPoints;
+    if (low_parallax) {
+      has_good_parallax_streak_ = false;
+      if (!low_parallax_active_) {
+        low_parallax_active_ = true;
+        low_parallax_since_wall_ = now;
+      }
+      double low_parallax_s =
+          std::chrono::duration<double>(now - low_parallax_since_wall_)
+              .count();
+      if (low_parallax_s >= kLowParallaxPersistenceSeconds) {
+        // Same freeze-at-last-live-pose reasoning as the starvation
+        // trigger and checkDriftGate() itself -- see held_pose_'s header
+        // comment.
+        if (have_last_published_pose_) {
+          held_pose_ = last_published_pose_;
+          held_anchor_raw_pose_ = last_raw_pose_seen_;
+        } else {
+          const LoopKeyframe& newest = keyframes_.back();
+          held_pose_ = Sophus::SE3d(
+              composeYPR(newest.roll, newest.pitch, newest.yaw),
+              newest.t_opt);
+          held_anchor_raw_pose_ = newest.T_w_i_raw;
+        }
+        drift_held_ = true;
+        // No keyframe backing this trip, same convention as the
+        // starvation trigger -- the wall-clock watchdog above governs
+        // release, not checkDriftGate()'s keyframe-gated timeout.
+        drift_held_since_t_ns_ = -1;
+        drift_held_since_wall_ = now;
+        // Position-only -- see held_position_only_'s header comment for
+        // why this trigger specifically never freezes orientation.
+        held_position_only_ = true;
+        // Reflects whatever the accel check actually shows right now
+        // (often false here, e.g. mid-rotation) -- NOT hardcoded true
+        // the way it used to be back when this trigger required
+        // likely_stationary_ to fire at all. Still meaningful for the
+        // same reason it is on the starvation path: it governs whether a
+        // wall-clock force-release resets the raw-drift reference
+        // instead of releasing into whatever raw VIO's translation
+        // accumulated during the hold.
+        hold_believed_stationary_ = latest_reported_likely_stationary_;
+        non_stationary_active_ = false;
+        drift_gate_events.try_push(DriftGateEvent::kTripped);
+        std::cout << "[ONLINE-LOOP] DRIFT GATE TRIPPED (low parallax: "
+                     "triangulated_points="
+                  << latest_triangulated_points.load()
+                  << ", low for " << low_parallax_s
+                  << "s, likely_stationary=" << latest_reported_likely_stationary_
+                  << ") -- holding position (orientation stays live)"
+                  << std::endl;
+        out = heldOutputPose(current_raw_pose);
+        return true;
+      }
+    } else if (low_parallax_active_) {
+      if (!has_good_parallax_streak_) {
+        has_good_parallax_streak_ = true;
+        good_parallax_streak_since_wall_ = now;
+      }
+      double good_s = std::chrono::duration<double>(
+                          now - good_parallax_streak_since_wall_)
+                          .count();
+      if (good_s >= kLowParallaxRecoveryGraceS) {
+        low_parallax_active_ = false;
+        has_good_parallax_streak_ = false;
+      }
     }
   }
 
@@ -1802,6 +1974,12 @@ bool OnlineLoopClosure::getSmoothedCorrectedPose(
       release_blending_ = true;
       release_blend_start_pose_ =
           have_last_published_pose_ ? last_published_pose_ : out;
+      // Both candidates here (last_published_pose_, out) are already-live
+      // poses, never a stale frozen one -- see
+      // release_blend_start_was_position_only_'s header comment for why
+      // this needs explicitly clearing rather than leaving whatever an
+      // earlier, unrelated position-only release's capture left behind.
+      release_blend_start_was_position_only_ = false;
       release_blend_start_wall_ = std::chrono::steady_clock::now();
       release_blend_duration_s_ = -1.0;  // recomputed on first use below
     }
@@ -1825,6 +2003,15 @@ bool OnlineLoopClosure::getSmoothedCorrectedPose(
     // fast for the same fixed window. Held fixed for the rest of this
     // blend so alpha stays monotonic even though target keeps moving.
     if (release_blend_duration_s_ < 0.0) {
+      // See release_blend_start_was_position_only_'s header comment --
+      // one-shot fixup of a position-only release's stale rotation,
+      // right here where current_raw_pose is actually available, before
+      // it gets used (just below, and for the rest of this blend).
+      if (release_blend_start_was_position_only_) {
+        release_blend_start_pose_ = Sophus::SE3d(
+            current_raw_pose.so3(), release_blend_start_pose_.translation());
+        release_blend_start_was_position_only_ = false;
+      }
       double total_jump_m =
           (out.translation() - release_blend_start_pose_.translation())
               .norm();
