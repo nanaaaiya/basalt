@@ -110,7 +110,11 @@ class OakDDevice {
   // later. Defaults to false so every existing caller (just
   // `new OakDDevice`) keeps paying zero extra device-side compute for a
   // stream it never asked for.
-  explicit OakDDevice(bool enable_stereo_depth = false);
+  // depth_full_res: feed StereoDepth from separate native 1280x800 mono
+  // outputs at DEPTH_FULL_RES_FPS (VIO keeps its 640x480 30 fps streams).
+  // ~1.7x finer depth than the 640x480 crop with the full FOV; 10 fps keeps
+  // the device from saturating (at 30 fps VIO's own streams fell to 17 fps).
+  explicit OakDDevice(bool enable_stereo_depth = false, bool depth_full_res = true);
   ~OakDDevice();
 
   void start();
@@ -199,6 +203,8 @@ class OakDDevice {
   void deviceLoop();
 
   const bool enable_stereo_depth_;
+  const bool depth_full_res_;
+  static constexpr float DEPTH_FULL_RES_FPS = 10.0f;
   DepthIntrinsics depth_intrinsics_;
 
   std::atomic<bool> running{false};

@@ -365,6 +365,10 @@ int main(int argc, char** argv) {
   // Default: a fresh timestamped folder per run, so repeated test runs
   // don't clobber each other and can be compared later -- see
   // writeTrajectoryLogs() for what actually gets written into it.
+  bool depth_full_res = true;
+  app.add_option("--depth-full-res", depth_full_res,
+                 "Depth from the mono sensors' native 1280x800 at 10 fps (VIO "
+                 "stays 640x480 30 fps). false = old 640x480 crop depth.");
 
   std::string log_dir;
   app.add_option("--log-dir", log_dir,
@@ -475,7 +479,8 @@ int main(int argc, char** argv) {
 
   load_data(cam_calib_path);
 
-  oakd_device.reset(new basalt::OakDDevice(enable_occupancy_mapping));
+  oakd_device.reset(
+      new basalt::OakDDevice(enable_occupancy_mapping, depth_full_res));
 
   try {
     oakd_device->start();

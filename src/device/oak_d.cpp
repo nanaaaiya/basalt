@@ -55,8 +55,9 @@ double to_seconds(
 
 }  // namespace
 
-OakDDevice::OakDDevice(bool enable_stereo_depth)
-    : enable_stereo_depth_(enable_stereo_depth) {}
+OakDDevice::OakDDevice(bool enable_stereo_depth, bool depth_full_res)
+    : enable_stereo_depth_(enable_stereo_depth),
+      depth_full_res_(depth_full_res) {}
 
 OakDDevice::~OakDDevice() { stop(); }
 
@@ -158,8 +159,17 @@ void OakDDevice::start() {
     // unprojecting, so the intrinsics stay correct at whatever resolution
     // the depth stream actually outputs -- see its comment for the fuller
     // explanation of the fan-shaped-map bug this was fixing.
-    leftOut->link(stereo->left);
-    rightOut->link(stereo->right);
+    if (depth_full_res_) {
+      camLeft->requestOutput(std::make_pair(1280u, 800u), std::nullopt,
+                             dai::ImgResizeMode::CROP, DEPTH_FULL_RES_FPS)
+          ->link(stereo->left);
+      camRight->requestOutput(std::make_pair(1280u, 800u), std::nullopt,
+                              dai::ImgResizeMode::CROP, DEPTH_FULL_RES_FPS)
+          ->link(stereo->right);
+    } else {
+      leftOut->link(stereo->left);
+      rightOut->link(stereo->right);
+    }
     q_depth = stereo->depth.createOutputQueue(8, false);
   }
 
@@ -184,7 +194,9 @@ void OakDDevice::start() {
       // amount, fanning one wall into several sheets in both the live map
       // and offline TSDF.
       auto calib = device->readCalibration();
-      constexpr int kSensorW = 1280, kSensorH = 800, kOutW = 640, kOutH = 480;
+      constexpr int kSensorW = 1280, kSensorH = 800;
+      const int kOutW = depth_full_res_ ? 1280 : 640;
+      const int kOutH = depth_full_res_ ? 800 : 480;
       auto intr = calib.getCameraIntrinsics(dai::CameraBoardSocket::CAM_B,
                                             kSensorW, kSensorH);
       const double s = std::max(static_cast<double>(kOutW) / kSensorW,
