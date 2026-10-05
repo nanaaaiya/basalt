@@ -119,7 +119,35 @@ void OakDDevice::start() {
     // camera's actual noise floor.
     stereo->setLeftRightCheck(true);
     stereo->setSubpixel(true);
+    // depthai v3: disparities with confidence OVER this threshold are kept,
+    // so a higher value is stricter. 180 left only ~9% of a wall with depth
+    // in a real scan (and 39% vs 65% at 55 on a static bench test), far too
+    // sparse for surface fusion. 55 is depthai's own default.
     stereo->initialConfig->setConfidenceThreshold(55);
+    // Matches depthai-core's own examples/python/StereoDepth/stereo.py,
+    // confirmed by the user to produce a visibly correct depth map on
+    // this exact device -- that example enables this and we didn't.
+    // Extends the disparity search range, which mainly improves NEAR-
+    // range accuracy -- relevant since this rig's real test distance
+    // (~0.4-0.5m) is close enough that plain (non-extended) disparity
+    // range is a plausible contributor to the bad-depth-value pattern
+    // diagnosed 2026-09-29 (min/max depth filter, IR intensity).
+    stereo->setExtendedDisparity(true);
+    // The DEFAULT preset's temporal filter blends each pixel's disparity
+    // with previous frames, which assumes a still camera -- while panning
+    // it smears surfaces from earlier viewpoints into the current frame.
+    stereo->initialConfig->postProcessing.temporalFilter.enable = false;
+    // CRITICAL: without this, depth alignment defaults to AUTO, which for a
+    // non-RGB-aligned stereo pair resolves to the RIGHT camera's rectified
+    // frame -- but depth_intrinsics_ (queried below via CAM_B) and
+    // oak_d_vio.cpp's T_w_c composition (pose * calib.T_i_c[0], cam0/left's
+    // extrinsic) both assume depth lives in the LEFT camera's frame. That
+    // mismatch is a rigid offset roughly one baseline (~7.5cm) in a fixed
+    // direction for every point -- live-diagnosed as the cause of the
+    // "line of voxels swept off to one side, overlapping the frustum"
+    // pattern on OAK-D Pro W, 2026-09-29 (see occupancy_mapper.h's header
+    // comment for the sibling wrong-camera-model bug this compounded with).
+    stereo->setDepthAlign(dai::CameraBoardSocket::CAM_B);
     // The DEFAULT preset downscales its own output resolution regardless
     // of the 640x480 mono input (found producing 320x240 depth frames in
     // testing). Deliberately left at that lower resolution rather than
@@ -147,19 +175,31 @@ void OakDDevice::start() {
     // does for calib_'s resolution.
     auto device = pipeline.getDefaultDevice();
     if (device) {
+      // requestOutput(640x480) from the 1280x800 OV9282 scales by 0.6 and
+      // CROPS the width (768 -> 640), so focal length is 0.6x native, not
+      // the 0.5x that getCameraIntrinsics(CAM_B, 640, 480) assumes (it
+      // returned fx=282 where the real frames have 338.5 -- confirmed via
+      // ImgFrame::getTransformation() on the mono stream). The 20% focal
+      // error tilted every depth frame's surfaces by a view-angle-dependent
+      // amount, fanning one wall into several sheets in both the live map
+      // and offline TSDF.
       auto calib = device->readCalibration();
+      constexpr int kSensorW = 1280, kSensorH = 800, kOutW = 640, kOutH = 480;
       auto intr = calib.getCameraIntrinsics(dai::CameraBoardSocket::CAM_B,
-                                            640, 480);
-      depth_intrinsics_.fx = intr[0][0];
-      depth_intrinsics_.fy = intr[1][1];
-      depth_intrinsics_.cx = intr[0][2];
-      depth_intrinsics_.cy = intr[1][2];
-      depth_intrinsics_.width = 640;
-      depth_intrinsics_.height = 480;
+                                            kSensorW, kSensorH);
+      const double s = std::max(static_cast<double>(kOutW) / kSensorW,
+                                static_cast<double>(kOutH) / kSensorH);
+      depth_intrinsics_.fx = intr[0][0] * s;
+      depth_intrinsics_.fy = intr[1][1] * s;
+      depth_intrinsics_.cx = intr[0][2] * s - (kSensorW * s - kOutW) / 2.0;
+      depth_intrinsics_.cy = intr[1][2] * s - (kSensorH * s - kOutH) / 2.0;
+      depth_intrinsics_.width = kOutW;
+      depth_intrinsics_.height = kOutH;
       std::cout << "[OAKD] Depth (rectified) intrinsics: fx="
                 << depth_intrinsics_.fx << " fy=" << depth_intrinsics_.fy
                 << " cx=" << depth_intrinsics_.cx
-                << " cy=" << depth_intrinsics_.cy << " @ 640x480"
+                << " cy=" << depth_intrinsics_.cy << " @ " << kOutW << "x"
+                << kOutH
                 << std::endl;
     } else {
       std::cerr << "[OAKD] Could not get device handle for depth "
