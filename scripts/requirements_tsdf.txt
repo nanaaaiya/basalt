@@ -1,0 +1,4 @@
+open3d==0.18.0
+numpy<2
+opencv-python-headless<4.11
+scipy
