@@ -39,6 +39,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <chrono>
 #include <cmath>
 #include <iostream>
+#include <limits>
 
 #include <Eigen/Sparse>
 #include <Eigen/SparseCholesky>
@@ -2053,6 +2054,58 @@ Eigen::aligned_vector<Eigen::Vector3d> OnlineLoopClosure::buildPointCloud()
     for (const auto& p_c0 : kf.pts3d) out.push_back(T_w_c0 * p_c0);
   }
   return out;
+}
+
+bool OnlineLoopClosure::getCorrectedPoseForRebuild(
+    int64_t t_ns, const Sophus::SE3d& raw_pose_at_t, Sophus::SE3d& out) const {
+  std::lock_guard<std::mutex> lock(state_mutex_);
+  if (keyframes_.empty()) return false;
+
+  // Nearest keyframe by capture time -- keyframes_ is insertion-ordered
+  // (ascending t_ns), but a plain linear scan is simplest and plenty fast
+  // for the keyframe counts this ever sees (a sparse subset of all
+  // frames, and this is only called from a rate-limited rebuild, not a
+  // hot path).
+  size_t best_idx = 0;
+  int64_t best_diff = std::numeric_limits<int64_t>::max();
+  for (size_t i = 0; i < keyframes_.size(); ++i) {
+    int64_t diff = std::abs(keyframes_[i].t_ns - t_ns);
+    if (diff < best_diff) {
+      best_diff = diff;
+      best_idx = i;
+    }
+  }
+
+  // Reject (skip, don't guess) if the nearest keyframe is too far away in
+  // time to trust the raw delta between them. Unlike the LIVE path
+  // (getSmoothedCorrectedPose()), which benefits from this whole class's
+  // blending/drift-gate-hold protection against brief raw-VIO hiccups,
+  // this is a bare "anchor + raw delta" computation with none of that --
+  // a short raw-VIO glitch between ref.t_ns and t_ns that's far too brief
+  // to ever trip a drift-gate hold (and so never shows up in the live,
+  // smoothed trajectory at all) still corrupts T_raw_delta here just the
+  // same, misplacing only this one retained frame's points as a new,
+  // disconnected cluster -- live-diagnosed 2026-10-01: a rebuild
+  // introduced a ~3m-offset cluster from a near-stationary, near-constant-
+  // orientation segment where keyframes happened to be sparse. Skipping
+  // ungrounded corrections instead of guessing with a stale/distant
+  // anchor is a straightforward, if conservative, fix -- the live map
+  // just has one less consolidated-looking frame in that stretch instead
+  // of a confidently-wrong one. Reasoned, not live-tuned, same caveat as
+  // every other threshold in this file.
+  constexpr int64_t kMaxKeyframeGapNs = 1'000'000'000;  // 1.0s
+  if (best_diff > kMaxKeyframeGapNs) return false;
+
+  // Same "anchor's corrected pose + raw delta since then" composition
+  // checkDriftGate() uses for its own residual prediction -- see this
+  // method's header comment for why it's duplicated here read-only
+  // rather than calling into that shared logic directly.
+  const LoopKeyframe& ref = keyframes_[best_idx];
+  Sophus::SE3d T_reference_corrected(composeYPR(ref.roll, ref.pitch, ref.yaw),
+                                     ref.t_opt);
+  Sophus::SE3d T_raw_delta = ref.T_w_i_raw.inverse() * raw_pose_at_t;
+  out = T_reference_corrected * T_raw_delta;
+  return true;
 }
 
 }  // namespace basalt

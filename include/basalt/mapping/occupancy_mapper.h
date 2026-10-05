@@ -82,6 +82,9 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #pragma once
 
 #include <atomic>
+#include <chrono>
+#include <deque>
+#include <functional>
 #include <memory>
 #include <thread>
 
@@ -116,6 +119,13 @@ struct DepthFrameInput {
 
   int64_t t_ns;
   Sophus::SE3d T_w_c;  // camera pose in world frame at capture time
+  // RAW (not loop-closure-corrected) body/IMU pose at capture time --
+  // needed alongside T_w_c so a later rebuild() can ask for a FRESH
+  // corrected pose at this same t_ns once the pose graph has moved on,
+  // instead of being stuck with whatever correction (if any) was live at
+  // insertion time. See rebuild()'s own comment for why T_w_c alone,
+  // frozen at insertion, can't be retroactively fixed.
+  Sophus::SE3d T_w_i_raw;
   cv::Mat depth_mm;    // CV_16UC1, millimeters, 0 == invalid/no return
 
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
@@ -129,6 +139,11 @@ struct DepthFrameInput {
 // severely warped point cloud (live-diagnosed on OAK-D Pro W, 2026-09-29
 // -- see this file's own header comment). No distortion coefficients,
 // deliberately: the rectified depth output is undistorted by construction.
+// NOTE: these intrinsics alone aren't sufficient -- the depth frame they're
+// applied to must also actually be aligned to the same camera (left/CAM_B)
+// they were queried for. See OakDDevice::start()'s setDepthAlign() call and
+// its comment for a second, compounding bug (wrong depth alignment socket,
+// defaulting to the right camera) found alongside this one, 2026-09-29.
 struct DepthIntrinsics {
   double fx = 0, fy = 0, cx = 0, cy = 0;
   int width = 0, height = 0;
@@ -153,8 +168,23 @@ class OccupancyMapper {
   // subset of pixels, not by using a different depth algorithm), and at
   // depth-camera resolutions a stride of 4 already means the far majority
   // of pixels are still represented at typical voxel sizes.
+  //
+  // min/max_depth_mm: reject any pixel outside [min, max] before
+  // unprojecting it. 0 means "no limit" (the default, kept for
+  // test_occupancy_mapper.cpp's synthetic depths, which have nothing to do
+  // with real sensor noise). Real hardware needs this: live-diagnosed on
+  // OAK-D Pro W, 2026-09-29 -- active-IR stereo pointed at a close, flat,
+  // low-texture wall produces genuine high-confidence FALSE matches (the
+  // periodic IR dot pattern aliases onto the wrong dot), which read as a
+  // coherent phantom surface many meters away rather than random noise, and
+  // sail straight through setConfidenceThreshold() since they're
+  // internally consistent matches, just to the wrong dot. Hand-verified
+  // against real pixels that the *unprojection math* was already correct
+  // (see occupancy_mapper.cpp's git history) -- this filter is the actual
+  // fix for that symptom, not a coordinate bug.
   OccupancyMapper(const DepthIntrinsics& depth_intrinsics, double voxel_size,
-                   int depth_stride = 4);
+                   int depth_stride = 4, int min_depth_mm = 0,
+                   int max_depth_mm = 0);
   ~OccupancyMapper();
 
   OccupancyMapper(const OccupancyMapper&) = delete;
@@ -171,12 +201,58 @@ class OccupancyMapper {
   // produced since the last call.
   bool pollVoxelDelta(VoxelDelta& delta_out);
 
+  // Looks up the best CURRENTLY-known corrected camera pose for a frame
+  // retained at capture time (t_ns + its original raw body pose) --
+  // returns false if no correction is available yet (e.g. no keyframes
+  // processed yet), in which case rebuild() skips that frame rather than
+  // guessing. Set once, before start(), from oak_d_vio.cpp (wraps
+  // OnlineLoopClosure::getCorrectedPoseForRebuild() + the IMU-to-camera
+  // extrinsic) -- kept as an injected function rather than a hard
+  // dependency so this class still doesn't need to know OnlineLoopClosure
+  // or calibration details exist, matching its existing design (see the
+  // class header comment: "this class only ever consumes a pose").
+  using PoseLookupFn = std::function<bool(
+      int64_t t_ns, const Sophus::SE3d& raw_pose_at_capture,
+      Sophus::SE3d& corrected_camera_pose_out)>;
+  void setPoseLookup(PoseLookupFn fn);
+
+  // Asks the processing thread to rebuild the WHOLE map from retained
+  // frames, each re-projected using pose_lookup_'s CURRENT answer instead
+  // of whatever pose was live when it was first inserted. See rebuild()'s
+  // own comment for why this exists: a live, incrementally-built octree
+  // has no way to retroactively fix voxels placed before a later loop-
+  // closure correction arrives, so they sit there as permanent ghost
+  // layers. Cheap and safe to call often -- internally rate-limited (see
+  // kRebuildCooldownS in the .cpp), so e.g. calling this on every single
+  // loop-closure event is fine; excess requests are just dropped, not
+  // queued up. No-op if setPoseLookup() was never called. Non-blocking.
+  void requestRebuild();
+
  private:
   void processingThreadMain();
   void insertFrame(const DepthFrameInput::Ptr& frame);
+  void rebuild();
+
+  // Shared by insertFrame() (one frame's worth of points at a time) and
+  // rebuild() (all retained frames' points, in one pass) -- inserts a
+  // world-frame point cloud from one pose's origin. Does NOT publish a
+  // VoxelDelta itself; call publishChanges() afterward (once per
+  // insertFrame() call, but only ONCE total after rebuild()'s whole
+  // batch -- see its own comment for why per-frame diffing during a
+  // rebuild would be wrong, not just wasteful).
+  void insertPointsIntoTree(const Eigen::aligned_vector<Eigen::Vector3d>& points_world,
+                             const Eigen::Vector3d& origin);
+  // Diffs octomap's own change-detection against occupied_keys_ and
+  // pushes the result as one VoxelDelta -- the tail end both
+  // insertFrame() and rebuild() share. See occupied_keys_'s comment for
+  // why this re-querying approach is correct regardless of how the tree
+  // got here.
+  void publishChanges();
 
   DepthIntrinsics depth_intrinsics_;
   int depth_stride_;
+  int min_depth_mm_;
+  int max_depth_mm_;
 
   std::unique_ptr<octomap::OcTree> tree_;
 
@@ -186,6 +262,30 @@ class OccupancyMapper {
   // includes plain unknown-to-known-free cells along every ray, of no
   // interest to a renderer that never drew them in the first place).
   octomap::KeySet occupied_keys_;
+
+  // One entry per frame actually inserted into the tree, kept around so
+  // rebuild() can replay them all against fresher pose corrections.
+  // Stores only the already-filtered, already-stride-reduced CAMERA-
+  // frame points (not the raw depth image -- a full-resolution depth
+  // image per frame would blow memory on a long session; this is already
+  // exactly what insertFrame() would unproject anyway, just captured once
+  // and reused instead of recomputed). Bounded by kMaxRetainedFrames (see
+  // the .cpp) -- oldest frames drop off the front once exceeded, same
+  // reasoning as any other bounded live buffer in this codebase: a
+  // multi-hour session shouldn't grow this without limit.
+  struct RetainedFrame {
+    int64_t t_ns;
+    Sophus::SE3d T_w_i_raw;
+    Eigen::aligned_vector<Eigen::Vector3d> points_cam;
+  };
+  std::deque<RetainedFrame> retained_frames_;
+
+  PoseLookupFn pose_lookup_;
+  std::atomic<bool> rebuild_requested_{false};
+  // Wall-clock time of the last actual rebuild -- see kRebuildCooldownS.
+  // Not initialized to "now" so the very first request isn't throttled.
+  std::chrono::steady_clock::time_point last_rebuild_wall_{};
+  bool has_rebuilt_once_ = false;
 
   std::atomic<bool> running_{false};
   std::thread thread_;

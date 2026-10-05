@@ -36,15 +36,19 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <basalt/mapping/occupancy_mapper.h>
 
 #include <algorithm>
+#include <iostream>
 
 #include <octomap/octomap.h>
 
 namespace basalt {
 
 OccupancyMapper::OccupancyMapper(const DepthIntrinsics& depth_intrinsics,
-                                  double voxel_size, int depth_stride)
+                                  double voxel_size, int depth_stride,
+                                  int min_depth_mm, int max_depth_mm)
     : depth_intrinsics_(depth_intrinsics),
-      depth_stride_(std::max(1, depth_stride)) {
+      depth_stride_(std::max(1, depth_stride)),
+      min_depth_mm_(min_depth_mm),
+      max_depth_mm_(max_depth_mm) {
   tree_.reset(new octomap::OcTree(voxel_size));
   tree_->enableChangeDetection(true);
   input_queue_.set_capacity(4);
@@ -77,12 +81,42 @@ bool OccupancyMapper::pollVoxelDelta(VoxelDelta& delta_out) {
   return output_queue_.try_pop(delta_out);
 }
 
+void OccupancyMapper::setPoseLookup(PoseLookupFn fn) {
+  pose_lookup_ = std::move(fn);
+}
+
+void OccupancyMapper::requestRebuild() { rebuild_requested_.store(true); }
+
+// How often rebuild() is actually allowed to run, no matter how often
+// requestRebuild() gets called -- e.g. a live loop-closure-heavy burst can
+// fire many times a second (observed directly, 2026-09-29/30 sessions), and
+// a full rebuild replays every retained frame, not just one. Excess
+// requests inside the cooldown are simply dropped (see requestRebuild()'s
+// own comment) -- the NEXT request after the cooldown expires picks it back
+// up, so nothing needs to be queued. A reasoned starting point, not a
+// live-tuned value -- same caveat as this file's other constants.
+constexpr double kRebuildCooldownS = 3.0;
+// Caps retained_frames_ -- see its own header comment. At the default
+// occupancy_rate_hz=5, 3000 frames is ~10 minutes of a live session.
+constexpr size_t kMaxRetainedFrames = 3000;
+
 void OccupancyMapper::processingThreadMain() {
   while (true) {
     DepthFrameInput::Ptr frame;
-    input_queue_.pop(frame);
-    if (!frame) break;  // shutdown sentinel
-    insertFrame(frame);
+    if (input_queue_.try_pop(frame)) {
+      if (!frame) break;  // shutdown sentinel
+      insertFrame(frame);
+      continue;  // prioritize draining new frames over a pending rebuild
+    }
+    if (rebuild_requested_.exchange(false)) {
+      rebuild();
+      continue;
+    }
+    // Neither queue had anything ready -- avoid a busy-spin. Short enough
+    // that a shutdown (stop() flips running_ then pushes the sentinel)
+    // still feels immediate, long enough not to burn a core doing nothing.
+    if (!running_.load()) break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
   }
 }
 
@@ -120,12 +154,21 @@ void OccupancyMapper::insertFrame(const DepthFrameInput::Ptr& frame) {
   // rescaled along its bearing until its z-component equals the depth
   // value: standard "depth image" semantics (perpendicular distance from
   // the image plane), matching what DepthAI's StereoDepth outputs.
-  octomap::Pointcloud cloud;
+  Eigen::aligned_vector<Eigen::Vector3d> points_cam;
   for (int v = 0; v < depth.rows; v += depth_stride_) {
     const uint16_t* row = depth.ptr<uint16_t>(v);
     for (int u = 0; u < depth.cols; u += depth_stride_) {
       uint16_t d_mm = row[u];
       if (d_mm == 0) continue;  // no valid return at this pixel
+      // See DepthIntrinsics's header comment / this class's constructor
+      // comment: rejects high-confidence but wrong stereo matches (a real,
+      // observed failure mode of active-IR depth on close, flat,
+      // low-texture surfaces), not just a sanity clamp. min_depth_mm_ is
+      // checked on the raw (forward) depth value -- fine, near-field
+      // clipping doesn't meaningfully depend on viewing angle. max_depth_mm_
+      // is deliberately NOT checked here: see below, it has to be checked
+      // on the actual 3D point, not this raw value.
+      if (min_depth_mm_ > 0 && d_mm < min_depth_mm_) continue;
 
       double u_calib = static_cast<double>(u) * scale_u;
       double v_calib = static_cast<double>(v) * scale_v;
@@ -134,21 +177,61 @@ void OccupancyMapper::insertFrame(const DepthFrameInput::Ptr& frame) {
 
       double z_m = d_mm / 1000.0;
       Eigen::Vector3d p_cam(bx * z_m, by * z_m, z_m);
-      Eigen::Vector3d p_world = frame->T_w_c * p_cam;
-      cloud.push_back(static_cast<float>(p_world.x()),
-                       static_cast<float>(p_world.y()),
-                       static_cast<float>(p_world.z()));
+      // max_depth_mm_ has to cap the true 3D distance (p_cam.norm()), not
+      // the raw depth-image value d_mm: on a wide-FOV lens, an off-axis
+      // pixel's bearing ray points well away from straight-ahead, so its
+      // actual distance from the camera can be far more than its forward
+      // (z) depth value. Checking d_mm alone let edge-of-frame pixels at
+      // exactly the cutoff sail through at much greater real distance --
+      // live-diagnosed on OAK-D Pro W, 2026-09-29: a near-stationary
+      // camera (pose within 0.2m of origin the whole run) still produced
+      // voxels up to 5.2m away, matching this camera's real intrinsics'
+      // worst-case corner ratio (z * sqrt(1+bx^2+by^2) ~= z * 1.74) at
+      // the old 3000mm cutoff almost exactly (3.0 * 1.74 ~= 5.2m).
+      if (max_depth_mm_ > 0 && p_cam.norm() * 1000.0 > max_depth_mm_) {
+        continue;
+      }
+      points_cam.push_back(p_cam);
     }
   }
 
-  if (cloud.size() == 0) return;
+  if (points_cam.empty()) return;
 
-  const Eigen::Vector3d& origin = frame->T_w_c.translation();
+  Eigen::aligned_vector<Eigen::Vector3d> points_world;
+  points_world.reserve(points_cam.size());
+  for (const auto& p_cam : points_cam) points_world.push_back(frame->T_w_c * p_cam);
+  insertPointsIntoTree(points_world, frame->T_w_c.translation());
+  publishChanges();
+
+  // Retained AFTER insertion, with the points already computed above --
+  // see RetainedFrame's header comment for why this is cheap (reusing
+  // work already done, not a second unprojection pass).
+  // Only worth the memory (~1 MB/frame at stride 2) if a rebuild can
+  // actually use it.
+  if (!pose_lookup_) return;
+  retained_frames_.push_back(
+      RetainedFrame{frame->t_ns, frame->T_w_i_raw, std::move(points_cam)});
+  while (retained_frames_.size() > kMaxRetainedFrames) {
+    retained_frames_.pop_front();
+  }
+}
+
+void OccupancyMapper::insertPointsIntoTree(
+    const Eigen::aligned_vector<Eigen::Vector3d>& points_world,
+    const Eigen::Vector3d& origin) {
+  if (points_world.empty()) return;
+  octomap::Pointcloud cloud;
+  for (const auto& p : points_world) {
+    cloud.push_back(static_cast<float>(p.x()), static_cast<float>(p.y()),
+                     static_cast<float>(p.z()));
+  }
   tree_->insertPointCloud(
       cloud, octomap::point3d(static_cast<float>(origin.x()),
                                static_cast<float>(origin.y()),
                                static_cast<float>(origin.z())));
+}
 
+void OccupancyMapper::publishChanges() {
   // octomap's own change-detection gives us the changed-cell set since
   // the last reset, but that includes every plain unknown-to-known-free
   // cell along each ray too -- of no interest to a renderer that never
@@ -157,7 +240,11 @@ void OccupancyMapper::insertFrame(const DepthFrameInput::Ptr& frame) {
   // occupied_keys_'s comment in the header). Re-querying each key's
   // current occupancy (rather than trusting whatever the change-detection
   // map's own stored value means) is deliberate: it's correct regardless
-  // of that map's exact internal semantics.
+  // of that map's exact internal semantics -- including after rebuild()'s
+  // clear()+reinsert-everything, where it's what makes the published
+  // delta the correct NET change (only cells that actually ended up in a
+  // different state than before the rebuild), not a spurious remove-then-
+  // readd of every voxel that happened to survive unchanged.
   VoxelDelta delta;
   for (auto it = tree_->changedKeysBegin(); it != tree_->changedKeysEnd();
        ++it) {
@@ -182,6 +269,66 @@ void OccupancyMapper::insertFrame(const DepthFrameInput::Ptr& frame) {
   if (!delta.added.empty() || !delta.removed.empty()) {
     output_queue_.try_push(std::move(delta));
   }
+}
+
+void OccupancyMapper::rebuild() {
+  // See this class's header comment on requestRebuild()/RetainedFrame for
+  // why this exists: a live, incrementally-built octree has no way to
+  // retroactively fix voxels placed using a pose that a LATER loop-closure
+  // correction has since revised -- they just sit there as permanent
+  // ghost layers (exactly the "map got created multiple times and
+  // overlaps on itself" symptom live-diagnosed 2026-10-01). This clears
+  // the whole tree and replays every retained frame using pose_lookup_'s
+  // CURRENT best answer instead of the pose that was live at insertion
+  // time, then publishes ONE net diff -- so a voxel that didn't actually
+  // move between rebuilds produces no spurious add/remove churn on the
+  // dashboard, only real changes do.
+  // TEMPORARY diagnostic logging -- added 2026-10-01 after a live test
+  // showed no visible improvement and there was no way to tell from the
+  // console whether rebuild() ran at all, skipped, or ran but didn't
+  // change much. Remove once this path is confirmed working live.
+  if (!pose_lookup_) {
+    std::cerr << "[OCCMAP-REBUILD] skipped: no pose_lookup_ set"
+              << std::endl;
+    return;  // no caller wired one up -- nothing to do
+  }
+
+  auto now = std::chrono::steady_clock::now();
+  if (has_rebuilt_once_) {
+    double elapsed =
+        std::chrono::duration<double>(now - last_rebuild_wall_).count();
+    if (elapsed < kRebuildCooldownS) {
+      std::cerr << "[OCCMAP-REBUILD] skipped: cooldown (" << elapsed << "s < "
+                << kRebuildCooldownS << "s)" << std::endl;
+      return;  // see kRebuildCooldownS
+    }
+  }
+
+  tree_->clear();
+  tree_->enableChangeDetection(true);  // defensive -- see constructor
+
+  size_t used = 0, skipped_no_pose = 0;
+  for (const auto& rf : retained_frames_) {
+    Sophus::SE3d T_w_c;
+    if (!pose_lookup_(rf.t_ns, rf.T_w_i_raw, T_w_c)) {
+      ++skipped_no_pose;
+      continue;
+    }
+    ++used;
+    Eigen::aligned_vector<Eigen::Vector3d> points_world;
+    points_world.reserve(rf.points_cam.size());
+    for (const auto& p_cam : rf.points_cam) points_world.push_back(T_w_c * p_cam);
+    insertPointsIntoTree(points_world, T_w_c.translation());
+  }
+
+  size_t occupied_before = occupied_keys_.size();
+  publishChanges();
+  last_rebuild_wall_ = now;
+  has_rebuilt_once_ = true;
+  std::cerr << "[OCCMAP-REBUILD] retained_frames=" << retained_frames_.size()
+            << " used=" << used << " skipped_no_pose=" << skipped_no_pose
+            << " occupied_before=" << occupied_before
+            << " occupied_after=" << occupied_keys_.size() << std::endl;
 }
 
 }  // namespace basalt
