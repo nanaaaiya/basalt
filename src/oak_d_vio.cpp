@@ -54,6 +54,8 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #include <sophus/se3.hpp>
 
+#include <opencv2/imgcodecs.hpp>
+
 #include <tbb/concurrent_queue.h>
 #include <tbb/global_control.h>
 
@@ -365,10 +367,18 @@ int main(int argc, char** argv) {
   // Default: a fresh timestamped folder per run, so repeated test runs
   // don't clobber each other and can be compared later -- see
   // writeTrajectoryLogs() for what actually gets written into it.
+  // Offline reconstruction input (see scripts/offline_tsdf.py): every
+  // processed depth frame as a 16-bit PNG plus the full raw VIO
+  // trajectory, so poses can be interpolated at each depth timestamp
+  // offline instead of trusting the live nearest-pose pairing.
   bool depth_full_res = true;
   app.add_option("--depth-full-res", depth_full_res,
                  "Depth from the mono sensors' native 1280x800 at 10 fps (VIO "
                  "stays 640x480 30 fps). false = old 640x480 crop depth.");
+  std::string record_depth_dir;
+  app.add_option("--record-depth-dir", record_depth_dir,
+                 "Record depth frames + raw trajectory here for offline TSDF "
+                 "reconstruction (enables the depth stream).");
 
   std::string log_dir;
   app.add_option("--log-dir", log_dir,
@@ -479,8 +489,10 @@ int main(int argc, char** argv) {
 
   load_data(cam_calib_path);
 
+  const bool record_depth = !record_depth_dir.empty();
   oakd_device.reset(
-      new basalt::OakDDevice(enable_occupancy_mapping, depth_full_res));
+      new basalt::OakDDevice(enable_occupancy_mapping || record_depth,
+                              depth_full_res));
 
   try {
     oakd_device->start();
@@ -577,7 +589,32 @@ int main(int argc, char** argv) {
     // TSDF path (--record-depth-dir) instead.
   }
 
-  if (occupancy_mapper) {
+  std::ofstream rec_frames, rec_traj;
+  if (record_depth) {
+    basalt::fs::create_directories(record_depth_dir + "/depth");
+    auto intr = oakd_device->getDepthIntrinsics();
+    const Sophus::SE3d& T_i_c = calib.T_i_c[0];
+    Eigen::Quaterniond q = T_i_c.so3().unit_quaternion();
+    std::ofstream meta(record_depth_dir + "/meta.json");
+    meta.precision(10);
+    meta << "{\n  \"fx\": " << intr.fx << ", \"fy\": " << intr.fy
+         << ", \"cx\": " << intr.cx << ", \"cy\": " << intr.cy
+         << ",\n  \"width\": " << intr.width << ", \"height\": " << intr.height
+         << ",\n  \"depth_scale\": 1000.0,\n  \"T_i_c\": {\"px\": "
+         << T_i_c.translation().x() << ", \"py\": " << T_i_c.translation().y()
+         << ", \"pz\": " << T_i_c.translation().z() << ", \"qx\": " << q.x()
+         << ", \"qy\": " << q.y() << ", \"qz\": " << q.z() << ", \"qw\": "
+         << q.w() << "}\n}\n";
+    rec_frames.open(record_depth_dir + "/frames.csv");
+    rec_frames << "t_ns,file" << std::endl;
+    rec_traj.open(record_depth_dir + "/trajectory.csv");
+    rec_traj << "t_ns,tx,ty,tz,qx,qy,qz,qw" << std::endl;
+    rec_traj.precision(10);
+    std::cout << "[RECORD] depth + trajectory -> " << record_depth_dir
+              << std::endl;
+  }
+
+  if (occupancy_mapper || record_depth) {
     depth_queue.set_capacity(4);
     oakd_device->setDepthOutputQueue(&depth_queue);
   }
@@ -633,6 +670,13 @@ int main(int argc, char** argv) {
         }
       }
 
+      if (rec_traj.is_open()) {
+        Eigen::Quaterniond q = T_w_i.so3().unit_quaternion();
+        const Eigen::Vector3d& p = T_w_i.translation();
+        rec_traj << t_ns << ',' << p.x() << ',' << p.y() << ',' << p.z() << ','
+                 << q.x() << ',' << q.y() << ',' << q.z() << ',' << q.w()
+                 << std::endl;  // flush: the process can abort on exit, losing buffered rows
+      }
 
       if (dashboard_client) {
         Eigen::Quaterniond q = T_w_i.so3().unit_quaternion();
@@ -875,7 +919,7 @@ int main(int argc, char** argv) {
   // Independent of show_gui for the same reason t6 is -- a real headless
   // flight still needs mapping to run.
   std::shared_ptr<std::thread> t7;
-  if (occupancy_mapper) {
+  if (occupancy_mapper || record_depth) {
     t7.reset(new std::thread([&]() {
       auto last_processed = std::chrono::steady_clock::now();
       const auto min_interval = std::chrono::duration<double>(
@@ -897,6 +941,14 @@ int main(int argc, char** argv) {
                            .count();
         int64_t depth_t_ns = static_cast<int64_t>(t_sec * 1e9);
 
+        if (record_depth) {
+          std::string name = std::to_string(depth_t_ns) + ".png";
+          if (cv::imwrite(record_depth_dir + "/depth/" + name,
+                          depth_frame->getCvFrame())) {
+            rec_frames << depth_t_ns << ',' << name << std::endl;
+          }
+        }
+        if (!occupancy_mapper) continue;
 
         // Pose AT THE DEPTH FRAME'S OWN CAPTURE TIME. VIO usually lags the
         // depth stream, so wait (briefly) for a VIO state at or after
