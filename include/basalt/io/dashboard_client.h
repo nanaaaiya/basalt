@@ -67,6 +67,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #include <atomic>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
@@ -149,6 +150,12 @@ class DashboardClient {
   // way oak_d_vio.cpp already drains vio_plot_queue/localization_queue.
   bool pollSaveMapCommand(std::string& run_id_out);
 
+  // Announces where this run records depth (--record-depth-dir) so the
+  // dashboard's "Build map" can fetch it. Sent as a "run_info" message at
+  // the start of every connection (each connection is a new run on the
+  // dashboard), and right away if already connected.
+  void setRunInfo(const std::string& record_dir);
+
   bool isConnected() const { return connected_; }
 
  private:
@@ -161,6 +168,9 @@ class DashboardClient {
 
   std::atomic<bool> running_{false};
   std::atomic<bool> connected_{false};
+  std::mutex run_info_mutex_;
+  std::string run_info_line_;  // empty until setRunInfo()
+  std::atomic<int> run_info_version_{0};
   std::thread connection_thread_;
 
   // Outgoing: bounded, drop-oldest-effectively-never (try_push just fails

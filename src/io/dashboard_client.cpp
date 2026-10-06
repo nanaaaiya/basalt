@@ -38,11 +38,13 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <pwd.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -173,8 +175,48 @@ void DashboardClient::connectionThreadMain() {
   }
 }
 
+void DashboardClient::setRunInfo(const std::string& record_dir) {
+  char host[256] = {0};
+  ::gethostname(host, sizeof(host) - 1);
+  const char* user = std::getenv("USER");
+  if (!user) {
+    const passwd* pw = ::getpwuid(::getuid());
+    user = pw ? pw->pw_name : "";
+  }
+  nlohmann::json j;
+  j["type"] = "run_info";
+  j["record_dir"] = record_dir;
+  j["host"] = host;
+  j["user"] = user;
+  {
+    std::lock_guard<std::mutex> lock(run_info_mutex_);
+    run_info_line_ = j.dump();
+  }
+  ++run_info_version_;
+}
+
+static bool sendAll(int fd, const std::string& line) {
+  size_t sent = 0;
+  while (sent < line.size()) {
+    ssize_t n = ::send(fd, line.data() + sent, line.size() - sent, MSG_NOSIGNAL);
+    if (n <= 0) return false;
+    sent += static_cast<size_t>(n);
+  }
+  return true;
+}
+
 void DashboardClient::writerThreadMain(int fd) {
+  int run_info_sent = 0;  // version of run_info sent on THIS connection
   while (running_) {
+    if (run_info_version_ != run_info_sent) {
+      std::string info;
+      {
+        std::lock_guard<std::mutex> lock(run_info_mutex_);
+        info = run_info_line_;
+      }
+      run_info_sent = run_info_version_;
+      if (!info.empty() && !sendAll(fd, info + '\n')) return;
+    }
     std::string line;
     // 200ms poll instead of an unbounded pop() so this thread notices
     // running_ going false (stop()) or the reader thread's fd having died
@@ -183,13 +225,8 @@ void DashboardClient::writerThreadMain(int fd) {
       std::this_thread::sleep_for(std::chrono::milliseconds(200));
       continue;
     }
-    line += '\n';
-    size_t sent = 0;
-    while (sent < line.size()) {
-      ssize_t n = ::send(fd, line.data() + sent, line.size() - sent, MSG_NOSIGNAL);
-      if (n <= 0) return;  // connection dead -- let connectionThreadMain reconnect
-      sent += static_cast<size_t>(n);
-    }
+    // connection dead -- let connectionThreadMain reconnect
+    if (!sendAll(fd, line + '\n')) return;
   }
 }
 

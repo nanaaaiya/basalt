@@ -614,6 +614,10 @@ int main(int argc, char** argv) {
     rec_traj.precision(10);
     std::cout << "[RECORD] depth + trajectory -> " << record_depth_dir
               << std::endl;
+    if (dashboard_client) {
+      dashboard_client->setRunInfo(
+          basalt::fs::absolute(record_depth_dir).string());
+    }
   }
 
   if (occupancy_mapper || record_depth) {
