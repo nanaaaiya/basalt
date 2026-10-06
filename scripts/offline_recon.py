@@ -16,7 +16,9 @@ script removes that drift the way Open3D's reconstruction system does:
      wall) at their VIO values.
   4. Fusion: per-frame world correction interpolated between fragment
      centers, then the same TSDF + multi-view consistency filter as
-     offline_tsdf.py.
+     offline_tsdf.py. Depth up to --max-depth builds the main surface;
+     depth from there to --far-depth goes into a coarser layer that only
+     fills areas the main surface didn't reach (far depth is much noisier).
 
 Run with the dedicated venv:
   ~/Documents/basalt/.venv_tsdf/bin/python ~/Documents/basalt/scripts/offline_recon.py SESSION_DIR [--publish]
@@ -32,7 +34,7 @@ import open3d as o3d
 from scipy.spatial.transform import Rotation, Slerp
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from offline_tsdf import PoseInterpolator, export_surface, load_session, reject_isolated  # noqa: E402
+from offline_tsdf import PoseInterpolator, clean_surface, load_session, reject_isolated, write_surface  # noqa: E402
 
 reg = o3d.pipelines.registration
 
@@ -58,7 +60,8 @@ class Frames:
                 self.items.append((t_ns, name, T_w_i @ T_i_c))
         self.skipped = len(frames[::args.every]) - len(self.items)
 
-    def rgbd(self, name):
+    def depth(self, name):
+        """Cleaned depth image (uint16) and its raw coverage, or (None, 0)."""
         d = cv2.imread(str(self.args.session / "depth" / name), cv2.IMREAD_UNCHANGED)
         if d is None or d.shape != (self.h, self.w):
             return None, 0.0
@@ -66,15 +69,21 @@ class Frames:
         d = d.astype(np.uint16)
         d[:self.by, :] = 0; d[self.h - self.by:, :] = 0; d[:, :self.bx] = 0; d[:, self.w - self.bx:] = 0
         d[d < self.args.min_depth * self.meta["depth_scale"]] = 0
-        d = reject_isolated(d)
-        img = o3d.geometry.RGBDImage.create_from_color_and_depth(
-            self.gray, o3d.geometry.Image(d), depth_scale=self.meta["depth_scale"],
-            depth_trunc=self.args.max_depth, convert_rgb_to_intensity=False)
-        return img, coverage
+        return reject_isolated(d), coverage
 
-    def volume(self):
+    def to_rgbd(self, d, max_depth):
+        return o3d.geometry.RGBDImage.create_from_color_and_depth(
+            self.gray, o3d.geometry.Image(d), depth_scale=self.meta["depth_scale"],
+            depth_trunc=max_depth, convert_rgb_to_intensity=False)
+
+    def rgbd(self, name):
+        d, coverage = self.depth(name)
+        return (None, 0.0) if d is None else (self.to_rgbd(d, self.args.max_depth), coverage)
+
+    def volume(self, voxel=None, trunc=None):
+        voxel = voxel or self.args.voxel
         return o3d.pipelines.integration.ScalableTSDFVolume(
-            voxel_length=self.args.voxel, sdf_trunc=self.args.trunc or 4 * self.args.voxel,
+            voxel_length=voxel, sdf_trunc=trunc or 4 * voxel,
             color_type=o3d.pipelines.integration.TSDFVolumeColorType.NoColor)
 
 
@@ -158,7 +167,14 @@ def main():
     ap.add_argument("--voxel", type=float, default=0.02, help="TSDF voxel size (m)")
     ap.add_argument("--trunc", type=float, default=None, help="truncation distance (m), default 4x voxel")
     ap.add_argument("--min-depth", type=float, default=0.25)
-    ap.add_argument("--max-depth", type=float, default=2.5)
+    ap.add_argument("--max-depth", type=float, default=2.5,
+                    help="depth used for the main surface and for drift correction (m)")
+    ap.add_argument("--far-depth", type=float, default=4.5,
+                    help="depth beyond --max-depth up to this (m) is fused into a coarser gap-fill "
+                         "layer, kept only where the main surface has nothing; 0 disables")
+    ap.add_argument("--far-voxel", type=float, default=None, help="gap-fill layer voxel size (m), default 2x --voxel")
+    ap.add_argument("--far-gap", type=float, default=0.15,
+                    help="drop gap-fill surface within this distance of the main surface (m)")
     ap.add_argument("--border", type=float, default=0.12)
     ap.add_argument("--max-pose-gap-ms", type=float, default=100.0)
     ap.add_argument("--every", type=int, default=1)
@@ -255,11 +271,14 @@ def main():
     centers = np.array([np.mean(idx) for idx in frag_idx])
     slerp = Slerp(centers, Rotation.from_matrix([c[:3, :3] for c in C])) if m > 1 else None
     trans = np.array([c[:3, 3] for c in C])
-    vol = F.volume()
+    vol = F.volume(trunc=args.trunc)
+    far_voxel = args.far_voxel or 2 * args.voxel
+    far_vol = F.volume(far_voxel) if args.far_depth > args.max_depth else None
+    near_mm = args.max_depth * meta["depth_scale"]
     posed, coverage = [], []
     for i, (_, name, T_vio) in enumerate(F.items):
-        img, cov = F.rgbd(name)
-        if img is None:
+        d, cov = F.depth(name)
+        if d is None:
             continue
         coverage.append(cov)
         corr = np.eye(4)
@@ -270,10 +289,31 @@ def main():
         else:
             corr = C[0]
         T_w_c = corr @ T_vio
-        vol.integrate(img, F.intr, np.linalg.inv(T_w_c))
+        extrinsic = np.linalg.inv(T_w_c)
+        vol.integrate(F.to_rgbd(d, args.max_depth), F.intr, extrinsic)
+        if far_vol is not None:
+            d_far = d.copy()
+            d_far[d_far <= near_mm] = 0
+            far_vol.integrate(F.to_rgbd(d_far, args.far_depth), F.intr, extrinsic)
         posed.append((name, T_w_c))
     print(f"Fused {len(posed)} frames; depth coverage median {np.median(coverage) * 100:.0f}% of pixels")
-    export_surface(vol.extract_triangle_mesh(), posed, args, meta, F.bx, F.by, out, label="Recon")
+
+    mesh = clean_surface(vol.extract_triangle_mesh(), posed, args, meta, F.bx, F.by, name="main")
+    if far_vol is not None and len(mesh.vertices):
+        # Far depth is much noisier (stereo error grows with distance squared), so it
+        # only fills areas the main surface didn't reach.
+        far = clean_surface(far_vol.extract_triangle_mesh(), posed, args, meta, F.bx, F.by,
+                            voxel=far_voxel, name="gap-fill")
+        if len(far.vertices):
+            from scipy.spatial import cKDTree
+            dist, _ = cKDTree(np.asarray(mesh.vertices)).query(np.asarray(far.vertices),
+                                                               distance_upper_bound=args.far_gap)
+            far.remove_vertices_by_mask(np.isfinite(dist))
+            far.remove_unreferenced_vertices()
+            print(f"Gap-fill layer: {len(far.vertices)} vertices beyond {args.max_depth} m added "
+                  f"where the main surface had none")
+            mesh += far
+    write_surface(mesh, args, out, label="Recon")
 
 
 if __name__ == "__main__":

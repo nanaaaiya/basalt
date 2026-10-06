@@ -82,13 +82,13 @@ def reject_isolated(d, rel=0.04, abs_mm=30):
     return out
 
 
-def count_support(verts, posed, args, meta, bx, by):
+def count_support(verts, posed, args, meta, bx, by, voxel=None):
     """For each vertex, count frames whose measured depth at the vertex's
     projection agrees with the vertex's own depth (within ~2 voxels)."""
     import cv2
     w, h = int(meta["width"]), int(meta["height"])
     fx, fy, cx, cy = meta["fx"], meta["fy"], meta["cx"], meta["cy"]
-    tol = max(0.03, 2 * args.voxel)
+    tol = max(0.03, 2 * (voxel or args.voxel))
     step = max(1, len(posed) // args.support_frames)
     support = np.zeros(len(verts), np.int32)
     vh = np.c_[verts, np.ones(len(verts))]
@@ -108,13 +108,14 @@ def count_support(verts, posed, args, meta, bx, by):
     return support
 
 
-def export_surface(mesh, posed, args, meta, bx, by, out, label="TSDF"):
-    """Multi-view consistency filter + fragment cleanup on a fused mesh, then
-    write mesh.ply / height-colored points.ply (and optionally publish)."""
+def clean_surface(mesh, posed, args, meta, bx, by, voxel=None, name="surface"):
+    """Multi-view consistency filter + removal of small disconnected fragments."""
     verts = np.asarray(mesh.vertices)
-    support = count_support(verts, posed, args, meta, bx, by)
+    if len(verts) == 0:
+        return mesh
+    support = count_support(verts, posed, args, meta, bx, by, voxel)
     keep = support >= args.min_support
-    print(f"Multi-view consistency: kept {keep.mean()*100:.1f}% of {len(verts)} surface vertices "
+    print(f"Multi-view consistency ({name}): kept {keep.mean()*100:.1f}% of {len(verts)} vertices "
           f"(support >= {args.min_support} frames)")
     mesh.remove_vertices_by_mask(~keep)
     # Drop tiny disconnected fragments (stray noise blobs).
@@ -122,6 +123,11 @@ def export_surface(mesh, posed, args, meta, bx, by, out, label="TSDF"):
     tri_clusters, cluster_n = np.asarray(tri_clusters), np.asarray(cluster_n)
     mesh.remove_triangles_by_mask(cluster_n[tri_clusters] < 200)
     mesh.remove_unreferenced_vertices()
+    return mesh
+
+
+def write_surface(mesh, args, out, label="TSDF"):
+    """Write mesh.ply and height-coloured points.ply (and optionally publish)."""
     mesh.compute_vertex_normals()
     o3d.io.write_triangle_mesh(str(out / "mesh.ply"), mesh)
 
@@ -141,6 +147,10 @@ def export_surface(mesh, posed, args, meta, bx, by, out, label="TSDF"):
             name=f"{label} {args.session.name}")
         print(f"Published to dashboard MAPS tab as {meta_out['map_id']}")
 
+
+
+def export_surface(mesh, posed, args, meta, bx, by, out, label="TSDF"):
+    write_surface(clean_surface(mesh, posed, args, meta, bx, by), args, out, label)
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
