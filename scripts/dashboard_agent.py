@@ -51,7 +51,7 @@ LAUNCH_FLAGS = os.environ.get(
     "LAUNCH_FLAGS",
     f"--config-path {BASALT_DIR}/data/oak_d_pro_w_pi_config.json "
     "--show-gui false --online-loop-closure true "
-    "--enable-ir-emitters false --occupancy-rate-hz 10",
+    "--enable-ir-emitters true --ir-laser-intensity 0.17 --occupancy-rate-hz 10",
 ).split()
 
 # How long a graceful SIGINT gets to finish saving the run log and
