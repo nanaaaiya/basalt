@@ -25,6 +25,7 @@ import json
 import logging
 import os
 import signal
+import time
 from typing import Optional
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
@@ -36,16 +37,19 @@ DATA_PORT = os.environ.get("DASHBOARD_DATA_PORT", "8765")
 
 BASALT_DIR = os.environ.get("BASALT_DIR", os.path.expanduser("~/vio_ws/basalt"))
 CALIB_PATH = os.environ.get(
-    "CALIB_PATH", os.path.expanduser("~/vio_ws/basalt/results/calibration_final.json")
+    "CALIB_PATH", os.path.join(BASALT_DIR, "calib_results/calibration_oak_d_pro_w.json")
 )
-# The flight configuration used throughout this project's live testing:
-# loop closure + occupancy mapping on, headless since it's launched
-# remotely with nobody at a display. Override via LAUNCH_FLAGS (a plain
+# Each run records depth + trajectory into a new timestamped folder here
+# (for scripts/offline_recon.py); set RECORD_ROOT="" to disable recording.
+RECORD_ROOT = os.environ.get("RECORD_ROOT", os.path.expanduser("~/scans"))
+# OAK-D Pro W Pi 5 profile (see docs/oak_d_pro_w_profiles.md), headless
+# since it's launched remotely. Override via LAUNCH_FLAGS (a plain
 # space-separated string) for a different default.
 LAUNCH_FLAGS = os.environ.get(
     "LAUNCH_FLAGS",
+    f"--config-path {BASALT_DIR}/data/oak_d_pro_w_pi_config.json "
     "--show-gui false --online-loop-closure true "
-    "--enable-occupancy-mapping true --occupancy-depth-stride 2 --occupancy-rate-hz 8",
+    "--enable-ir-emitters false --occupancy-rate-hz 10",
 ).split()
 
 # How long a graceful SIGINT gets to finish saving the run log and
@@ -72,11 +76,17 @@ async def _start_process() -> None:
     release_dir = os.path.join(BASALT_DIR, "build", "release")
     log_path = os.path.join(release_dir, "dashboard_launch.log")
     log_file = open(log_path, "ab")
+    record_args = []
+    if RECORD_ROOT:
+        record_dir = os.path.join(RECORD_ROOT, time.strftime("run_%Y%m%d_%H%M%S"))
+        record_args = ["--record-depth-dir", record_dir]
+        log.info("recording to %s", record_dir)
     _proc = await asyncio.create_subprocess_exec(
         "./basalt_oak_d_vio",
         "--cam-calib",
         CALIB_PATH,
         *LAUNCH_FLAGS,
+        *record_args,
         "--dashboard-host",
         BACKEND_HOST,
         "--dashboard-port",
