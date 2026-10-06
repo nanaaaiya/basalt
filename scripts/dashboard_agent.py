@@ -24,7 +24,9 @@ import asyncio
 import json
 import logging
 import os
+import platform
 import signal
+import socket
 import time
 from typing import Optional
 
@@ -59,8 +61,42 @@ LAUNCH_FLAGS = os.environ.get(
 # necessity, not just defensive padding.
 STOP_GRACE_SECONDS = 10
 RECONNECT_DELAY_SECONDS = 5
+# Liveness signal for the backend: without it, a device that loses power
+# never closes its TCP connection and looks connected for minutes.
+HEARTBEAT_SECONDS = 2.0
 
 _proc: Optional[asyncio.subprocess.Process] = None
+
+
+def _read_text(path: str) -> str:
+    try:
+        with open(path, "rb") as f:
+            return f.read().replace(b"\x00", b" ").decode(errors="ignore").strip()
+    except OSError:
+        return ""
+
+
+def _device_info() -> dict:
+    """Identifies this board for the dashboard's device list."""
+    model = _read_text("/proc/device-tree/model") or _read_text("/sys/firmware/devicetree/base/model")
+    compatible = _read_text("/proc/device-tree/compatible").lower()
+    m = model.lower()
+    if "raspberry pi" in m:
+        kind = "raspberry_pi"
+    elif "jetson" in m or "nvidia" in m or os.path.exists("/etc/nv_tegra_release"):
+        kind = "jetson"
+    elif "qualcomm" in m or "qcom" in compatible:
+        kind = "qualcomm"
+    else:
+        kind = "unknown"
+    return {
+        "type": "hello",
+        "device_id": _read_text("/etc/machine-id") or socket.gethostname(),
+        "hostname": socket.gethostname(),
+        "platform": kind,
+        "model": model or platform.machine(),
+        "agent_version": 2,
+    }
 
 
 def _status_message() -> dict:
@@ -119,8 +155,27 @@ async def _handle_connection(reader: asyncio.StreamReader, writer: asyncio.Strea
         writer.write((json.dumps(_status_message()) + "\n").encode())
         await writer.drain()
 
+    writer.write((json.dumps(_device_info()) + "\n").encode())
     await send_status()  # initial state, so the backend has something without asking
 
+    async def heartbeat() -> None:
+        try:
+            while True:
+                await asyncio.sleep(HEARTBEAT_SECONDS)
+                beat = dict(_status_message(), type="heartbeat")
+                writer.write((json.dumps(beat) + "\n").encode())
+                await writer.drain()
+        except (ConnectionError, OSError):
+            writer.close()  # unblocks the command loop's readline so main() reconnects
+
+    beat_task = asyncio.create_task(heartbeat())
+    try:
+        await _command_loop(reader, send_status)
+    finally:
+        beat_task.cancel()
+
+
+async def _command_loop(reader: asyncio.StreamReader, send_status) -> None:
     while True:
         line = await reader.readline()
         if not line:
