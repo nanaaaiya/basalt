@@ -56,6 +56,8 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #include <opencv2/imgcodecs.hpp>
 
+#include <basalt/utils/thread_priority.h>
+
 #include <tbb/concurrent_queue.h>
 #include <tbb/global_control.h>
 
@@ -921,6 +923,7 @@ int main(int argc, char** argv) {
   std::shared_ptr<std::thread> t7;
   if (occupancy_mapper || record_depth) {
     t7.reset(new std::thread([&]() {
+      basalt::lowerCurrentThreadPriority();  // depth saving / map insertion
       auto last_processed = std::chrono::steady_clock::now();
       const auto min_interval = std::chrono::duration<double>(
           1.0 / std::max(0.1, occupancy_rate_hz));

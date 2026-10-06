@@ -52,6 +52,8 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <opengv/absolute_pose/methods.hpp>
 #include <opengv/sac/Ransac.hpp>
 #include <opengv/sac_problems/absolute_pose/AbsolutePoseSacProblem.hpp>
+
+#include <basalt/utils/thread_priority.h>
 #pragma GCC diagnostic pop
 
 namespace basalt {
@@ -624,6 +626,7 @@ void OnlineLoopClosure::stop() {
 }
 
 void OnlineLoopClosure::processingLoop() {
+  lowerCurrentThreadPriority();
   MargData::Ptr data;
   while (true) {
     input_queue.pop(data);

@@ -38,6 +38,8 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <algorithm>
 #include <iostream>
 
+#include <basalt/utils/thread_priority.h>
+
 #include <octomap/octomap.h>
 
 namespace basalt {
@@ -101,6 +103,7 @@ constexpr double kRebuildCooldownS = 3.0;
 constexpr size_t kMaxRetainedFrames = 3000;
 
 void OccupancyMapper::processingThreadMain() {
+  lowerCurrentThreadPriority();
   while (true) {
     DepthFrameInput::Ptr frame;
     if (input_queue_.try_pop(frame)) {
