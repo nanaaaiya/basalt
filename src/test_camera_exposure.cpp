@@ -81,7 +81,7 @@ int main(int argc, char** argv) {
   std::cout << "[OK] Pipeline started without crashing." << std::endl;
 
   std::ofstream csv(output_dir + "/frames.csv");
-  csv << "frame_idx,brightness,laplacian_var,exposure_us,saved_filename\n";
+  csv << "frame_idx,brightness,laplacian_var,exposure_us,iso,saved_filename\n";
 
   int saved = 0;
   int frame_idx = 0;
@@ -118,7 +118,8 @@ int main(int argc, char** argv) {
     auto exposure_us = frame->getExposureTime();
     std::cout << "frame " << frame_idx << ": brightness=" << brightness
               << " laplacian_var=" << variance
-              << " exposure_us=" << exposure_us.count() << std::endl;
+              << " exposure_us=" << exposure_us.count()
+              << " iso=" << frame->getSensitivity() << std::endl;
 
     std::string saved_filename;
     if (frame_idx % 5 == 0) {
@@ -129,7 +130,8 @@ int main(int argc, char** argv) {
       saved++;
     }
     csv << frame_idx << "," << brightness << "," << variance << ","
-        << exposure_us.count() << "," << saved_filename << "\n";
+        << exposure_us.count() << "," << frame->getSensitivity() << ","
+        << saved_filename << "\n";
 
     // Drain the right queue too so it doesn't back up -- not analyzed,
     // this test only needs one camera's stream to answer the crash/blur

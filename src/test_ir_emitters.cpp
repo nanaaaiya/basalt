@@ -52,7 +52,7 @@ double meanBrightness(const std::shared_ptr<dai::ImgFrame>& frame) {
 
 int main(int argc, char** argv) {
   if (argc < 2) {
-    std::cerr << "Usage: " << argv[0] << " <output_dir>" << std::endl;
+    std::cerr << "Usage: " << argv[0] << " <output_dir> [exposure_us iso]" << std::endl;
     return 1;
   }
   std::string output_dir = argv[1];
@@ -65,6 +65,12 @@ int main(int argc, char** argv) {
   constexpr float kCamFps = 30.0f;
   auto camLeft = pipeline.create<dai::node::Camera>()->build(
       dai::CameraBoardSocket::CAM_B, std::nullopt, kCamFps);
+  // Optional fixed exposure: with auto-exposure on, the camera compensates
+  // for (and drifts against) the emitters, hiding how much light they add.
+  const bool manual = argc >= 4;
+  if (manual) {
+    camLeft->initialControl.setManualExposure(std::stoi(argv[2]), std::stoi(argv[3]));
+  }
   auto* leftOut = camLeft->requestOutput(std::make_pair(640u, 480u));
   auto qLeft = leftOut->createOutputQueue(8, false);
 
@@ -87,6 +93,11 @@ int main(int argc, char** argv) {
       auto frame = qLeft->get<dai::ImgFrame>();
       if (!frame) continue;
       double b = meanBrightness(frame);
+      if (n == 0 && manual) {
+        std::cout << "    exposure "
+                  << std::chrono::duration_cast<std::chrono::microseconds>(frame->getExposureTime()).count()
+                  << " us, ISO " << frame->getSensitivity() << std::endl;
+      }
       sum += b;
       n++;
     }
@@ -98,6 +109,22 @@ int main(int argc, char** argv) {
   };
 
   captureAt("baseline", 0.0f, 15);
+
+  if (manual) {
+    // Alternate off/on so any remaining drift shows up as off-to-off change.
+    std::cout << "\nFixed exposure: alternating emitters off/on..." << std::endl;
+    for (float intensity : {0.0f, 0.17f, 0.0f, 0.17f, 0.0f, 0.5f, 0.0f, 1.0f, 0.0f}) {
+      device->setIrLaserDotProjectorIntensity(intensity);
+      captureAt("laser", intensity, 15);
+    }
+    for (float intensity : {0.0f, 0.5f, 0.0f, 1.0f, 0.0f}) {
+      device->setIrFloodLightIntensity(intensity);
+      captureAt("flood", intensity, 15);
+    }
+    device->setIrFloodLightIntensity(0.0f);
+    std::cout << "\n[OK] Device still responsive: " << device->getDeviceName() << std::endl;
+    return 0;
+  }
 
   std::cout << "\nTesting IR laser dot projector intensity..." << std::endl;
   for (float intensity : {0.0f, 0.3f, 0.6f, 1.0f, 0.0f}) {
