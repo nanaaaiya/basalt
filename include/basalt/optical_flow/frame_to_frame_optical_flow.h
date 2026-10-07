@@ -473,6 +473,13 @@ class FrameToFrameOpticalFlow : public OpticalFlowBase {
             std::pair<const KeypointId, Eigen::AffineCompact2f>>>
         result;
 
+    // Per-corner outcome of the best stage reached across all seed depths:
+    // 0 no seed projected, 1 forward KLT failed, 2 backward KLT failed,
+    // 3 round trip too large, 4 matched. Plus each round-trip-rejected
+    // corner's smallest round-trip error (px), to size the tolerance.
+    std::vector<int> outcome(ids.size(), 0);
+    std::vector<float> best_roundtrip_px(ids.size(), -1.f);
+
     auto compute_func = [&](const tbb::blocked_range<size_t>& range) {
       for (size_t r = range.begin(); r != range.end(); ++r) {
         const KeypointId id = ids[r];
@@ -483,40 +490,45 @@ class FrameToFrameOpticalFlow : public OpticalFlowBase {
           continue;
         Vector3 dir0 = ray0.template head<3>().normalized();
 
-        for (double depth_d : seed_depths_m) {
-          Scalar depth = Scalar(depth_d);
-          Vector3 pt_c1 = T_c1_c0_ * (dir0 * depth);
-
-          Vector4 pt_c1_h;
-          pt_c1_h.template head<3>() = pt_c1;
-          pt_c1_h[3] = Scalar(1);
-
-          Vector2 seed_px;
-          if (!calib.intrinsics[1].project(pt_c1_h, seed_px)) continue;
-
+        // KLT forward + backward from one seed; true if the round trip closes.
+        auto try_seed = [&](const Vector2& seed_px) {
           Eigen::AffineCompact2f transform_2;
           transform_2.setIdentity();
           transform_2.translation() = seed_px;
-
-          bool valid = trackPoint(pyr0, pyr1, transform_1, transform_2);
-          if (!valid) continue;
-
+          outcome[r] = std::max(outcome[r], 1);
+          if (!trackPoint(pyr0, pyr1, transform_1, transform_2)) return false;
+          outcome[r] = std::max(outcome[r], 2);
           // Backward track seeded the same way as in trackPoints(): starting
           // it at the cam1 coordinates put it a full disparity (10-50 px)
           // from the answer, rejecting most correct stereo matches.
           Eigen::AffineCompact2f transform_1_recovered = transform_2;
           transform_1_recovered.translation() =
               transform_1.translation() + (transform_2.translation() - seed_px);
-          valid = trackPoint(pyr1, pyr0, transform_2, transform_1_recovered);
-          if (!valid) continue;
-
+          if (!trackPoint(pyr1, pyr0, transform_2, transform_1_recovered))
+            return false;
+          outcome[r] = std::max(outcome[r], 3);
           Scalar dist2 = (transform_1.translation() -
                           transform_1_recovered.translation())
                              .squaredNorm();
+          float dist_px = std::sqrt(float(dist2));
+          if (best_roundtrip_px[r] < 0.f || dist_px < best_roundtrip_px[r])
+            best_roundtrip_px[r] = dist_px;
           if (dist2 < config.optical_flow_max_recovered_dist2) {
             result[id] = transform_2;
-            break;  // this depth hypothesis worked, stop trying others
+            outcome[r] = 4;
+            return true;
           }
+          return false;
+        };
+
+        for (double depth_d : seed_depths_m) {
+          Vector3 pt_c1 = T_c1_c0_ * (dir0 * Scalar(depth_d));
+          Vector4 pt_c1_h;
+          pt_c1_h.template head<3>() = pt_c1;
+          pt_c1_h[3] = Scalar(1);
+          Vector2 seed_px;
+          if (!calib.intrinsics[1].project(pt_c1_h, seed_px)) continue;
+          if (try_seed(seed_px)) break;  // this depth hypothesis worked
         }
       }
     };
@@ -526,6 +538,26 @@ class FrameToFrameOpticalFlow : public OpticalFlowBase {
 
     new_poses1.clear();
     new_poses1.insert(result.begin(), result.end());
+
+    if (!ids.empty()) {
+      int n[5] = {0, 0, 0, 0, 0};
+      std::vector<float> rejected_rt;
+      for (size_t r = 0; r < ids.size(); r++) {
+        n[outcome[r]]++;
+        if (outcome[r] == 3) rejected_rt.push_back(best_roundtrip_px[r]);
+      }
+      float med = -1.f;
+      if (!rejected_rt.empty()) {
+        std::nth_element(rejected_rt.begin(), rejected_rt.begin() + rejected_rt.size() / 2,
+                         rejected_rt.end());
+        med = rejected_rt[rejected_rt.size() / 2];
+      }
+      std::cout << "[STEREO-MATCH-DIAG] corners=" << ids.size()
+                << " no_seed=" << n[0] << " fwd_fail=" << n[1]
+                << " bwd_fail=" << n[2] << " roundtrip_reject=" << n[3]
+                << " matched=" << n[4]
+                << " roundtrip_reject_median_px=" << med << std::endl;
+    }
   }
 
   inline bool trackPoint(const basalt::ManagedImagePyr<uint16_t>& old_pyr,
