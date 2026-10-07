@@ -292,9 +292,11 @@ void DashboardClient::sendHealth(int64_t t_ns, double confidence,
                                    double tracked_ratio,
                                    std::optional<int> triangulated_points,
                                    int tracked_count,
-                                   int total_observed_count) {
+                                   int total_observed_count,
+                                   int exposure_us) {
   nlohmann::json j;
   j["type"] = "health";
+  if (exposure_us >= 0) j["exposure_us"] = exposure_us;
   j["run_id"] = "ignored";
   j["t_ns"] = t_ns;
   j["confidence"] = confidence;

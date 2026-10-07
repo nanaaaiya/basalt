@@ -179,6 +179,10 @@ class OakDDevice {
   // was too small to notice.
   DepthIntrinsics getDepthIntrinsics() const { return depth_intrinsics_; }
 
+  // Exposure of the most recent left (cam0) frame in microseconds, -1 before
+  // the first frame. Read from frame metadata, not a camera query.
+  int lastExposureUs() const { return last_exposure_us_; }
+
   // IR laser dot projector / IR flood light intensity, OAK-D Pro W only
   // (both silently no-ops on hardware without them -- DepthAI's own
   // setIr*Intensity() return false rather than throwing when unsupported,
@@ -207,6 +211,7 @@ class OakDDevice {
   const bool enable_stereo_depth_;
   const bool depth_full_res_;
   const int max_exposure_us_;
+  std::atomic<int> last_exposure_us_{-1};
   static constexpr float DEPTH_FULL_RES_FPS = 10.0f;
   DepthIntrinsics depth_intrinsics_;
 

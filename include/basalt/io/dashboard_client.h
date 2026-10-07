@@ -115,7 +115,8 @@ class DashboardClient {
                   const std::string& primary_reason, bool degraded,
                   double gyro_norm, double tracked_ratio,
                   std::optional<int> triangulated_points,
-                  int tracked_count, int total_observed_count);
+                  int tracked_count, int total_observed_count,
+                  int exposure_us = -1);
 
   // event: one of "loop_closure" | "keyframe" | "map_saved" | "reinit",
   // matching MapEventType in schema.py exactly (any other string is

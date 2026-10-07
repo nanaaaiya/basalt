@@ -801,7 +801,8 @@ int main(int argc, char** argv) {
               t_ns, health.score, health.primary_reason,
               health_in.numerically_degraded, health_in.gyro_norm,
               tracked_ratio, health_in.triangulated_points,
-              tracked_count, total_observed_count);
+              tracked_count, total_observed_count,
+              oakd_device ? oakd_device->lastExposureUs() : -1);
         }
       }
 

@@ -366,6 +366,10 @@ void OakDDevice::deviceLoop() {
 
     while (auto frame = q_left->tryGet<dai::ImgFrame>()) {
       got_data = true;
+      last_exposure_us_ = static_cast<int>(
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              frame->getExposureTime())
+              .count());
       double t = to_seconds(frame->getTimestamp());
       if (t < discard_until) continue;  // still settling after a stream gap
       left_queue.push_back({t, frame});
