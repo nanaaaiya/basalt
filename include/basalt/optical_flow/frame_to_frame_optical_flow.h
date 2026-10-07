@@ -380,7 +380,15 @@ class FrameToFrameOpticalFlow : public OpticalFlowBase {
         bool valid = trackPoint(pyr_1, pyr_2, transform_1, transform_2);
 
         if (valid) {
+          // Seed the backward track at the old position shifted by the
+          // forward search's own correction to its seed. Starting it at
+          // transform_2 (new-frame coordinates) put it a whole frame's
+          // motion away from the answer -- ~40 px at 200 deg/s -- so fast
+          // turns failed the round trip and correct tracks were dropped.
           Eigen::AffineCompact2f transform_1_recovered = transform_2;
+          transform_1_recovered.translation() =
+              transform_1.translation() +
+              (transform_2.translation() - seed_vec[r].translation());
 
           valid = trackPoint(pyr_2, pyr_1, transform_2, transform_1_recovered);
 
@@ -493,7 +501,12 @@ class FrameToFrameOpticalFlow : public OpticalFlowBase {
           bool valid = trackPoint(pyr0, pyr1, transform_1, transform_2);
           if (!valid) continue;
 
+          // Backward track seeded the same way as in trackPoints(): starting
+          // it at the cam1 coordinates put it a full disparity (10-50 px)
+          // from the answer, rejecting most correct stereo matches.
           Eigen::AffineCompact2f transform_1_recovered = transform_2;
+          transform_1_recovered.translation() =
+              transform_1.translation() + (transform_2.translation() - seed_px);
           valid = trackPoint(pyr1, pyr0, transform_2, transform_1_recovered);
           if (!valid) continue;
 
