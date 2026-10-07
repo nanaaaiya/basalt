@@ -373,6 +373,10 @@ int main(int argc, char** argv) {
   // processed depth frame as a 16-bit PNG plus the full raw VIO
   // trajectory, so poses can be interpolated at each depth timestamp
   // offline instead of trusting the live nearest-pose pairing.
+  int max_exposure_us = basalt::OakDDevice::DEFAULT_MAX_EXPOSURE_US;
+  app.add_option("--max-exposure-us", max_exposure_us,
+                 "Auto-exposure upper limit for the mono cameras (us). Lower "
+                 "means less motion blur but more gain; raise it in dim rooms.");
   bool depth_full_res = true;
   app.add_option("--depth-full-res", depth_full_res,
                  "Depth from the mono sensors' native 1280x800 at 10 fps (VIO "
@@ -494,7 +498,7 @@ int main(int argc, char** argv) {
   const bool record_depth = !record_depth_dir.empty();
   oakd_device.reset(
       new basalt::OakDDevice(enable_occupancy_mapping || record_depth,
-                              depth_full_res));
+                              depth_full_res, max_exposure_us));
 
   try {
     oakd_device->start();

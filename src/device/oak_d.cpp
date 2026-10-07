@@ -55,9 +55,11 @@ double to_seconds(
 
 }  // namespace
 
-OakDDevice::OakDDevice(bool enable_stereo_depth, bool depth_full_res)
+OakDDevice::OakDDevice(bool enable_stereo_depth, bool depth_full_res,
+                       int max_exposure_us)
     : enable_stereo_depth_(enable_stereo_depth),
-      depth_full_res_(depth_full_res) {}
+      depth_full_res_(depth_full_res),
+      max_exposure_us_(max_exposure_us) {}
 
 OakDDevice::~OakDDevice() { stop(); }
 
@@ -78,16 +80,18 @@ void OakDDevice::start() {
   auto camRight = pipeline.create<dai::node::Camera>()->build(
       dai::CameraBoardSocket::CAM_C, std::nullopt, (float)CAM_FPS);
 
-  // See MAX_EXPOSURE_US's header comment: caps auto-exposure's max
+  // See DEFAULT_MAX_EXPOSURE_US's header comment: caps auto-exposure's max
   // exposure time to reduce motion blur, verified safe via
   // basalt_test_camera_exposure before ever being added here. Set via
   // initialControl (applied once, before pipeline.start() below) rather
   // than a runtime inputControl queue message, matching what was actually
   // tested.
   camLeft->initialControl.setAutoExposureLimit(
-      std::chrono::microseconds(MAX_EXPOSURE_US));
+      std::chrono::microseconds(max_exposure_us_));
   camRight->initialControl.setAutoExposureLimit(
-      std::chrono::microseconds(MAX_EXPOSURE_US));
+      std::chrono::microseconds(max_exposure_us_));
+  std::cout << "[OAKD] auto-exposure limit: " << max_exposure_us_ << " us"
+            << std::endl;
 
   auto* leftOut = camLeft->requestOutput(std::make_pair(640u, 480u));
   auto* rightOut = camRight->requestOutput(std::make_pair(640u, 480u));

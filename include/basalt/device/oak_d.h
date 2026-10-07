@@ -93,13 +93,14 @@ class OakDDevice {
   // this file as having previously crashed the OAK-D firmware; the former
   // was verified safe first, in complete isolation from this pipeline,
   // via basalt_test_camera_exposure (see that tool's own comment).
-  // Confirmed on real handheld footage: 8ms holds the camera to
-  // Laplacian-variance sharpness in the same range as genuinely
-  // stationary footage during moderate motion, only degrading on the
-  // fastest deliberate whips -- a real, measured improvement over
-  // uncapped auto-exposure's much wider blur range, not a full fix for
-  // arbitrarily fast motion.
-  static constexpr int MAX_EXPOSURE_US = 8000;
+  // Auto-exposure always uses the longest allowed exposure before raising
+  // gain, so the cap directly sets motion blur (~ angular rate x exposure x
+  // focal length). At 8 ms, fast turns (150-300 deg/s) smeared features by
+  // 9-18 px and tracking collapsed; indoors at 4 ms the camera raises gain
+  // (ISO ~650 -> ~1300 of ~1550 max) and keeps the same brightness with no
+  // measurable extra noise, halving blur. Raise it (--max-exposure-us) in
+  // dim rooms where gain maxes out and images turn dark.
+  static constexpr int DEFAULT_MAX_EXPOSURE_US = 4000;
 
   // enable_stereo_depth: builds and runs the on-device StereoDepth node
   // (for the future occupancy-grid mapper) alongside the existing raw
@@ -114,7 +115,8 @@ class OakDDevice {
   // outputs at DEPTH_FULL_RES_FPS (VIO keeps its 640x480 30 fps streams).
   // ~1.7x finer depth than the 640x480 crop with the full FOV; 10 fps keeps
   // the device from saturating (at 30 fps VIO's own streams fell to 17 fps).
-  explicit OakDDevice(bool enable_stereo_depth = false, bool depth_full_res = true);
+  explicit OakDDevice(bool enable_stereo_depth = false, bool depth_full_res = true,
+                      int max_exposure_us = DEFAULT_MAX_EXPOSURE_US);
   ~OakDDevice();
 
   void start();
@@ -204,6 +206,7 @@ class OakDDevice {
 
   const bool enable_stereo_depth_;
   const bool depth_full_res_;
+  const int max_exposure_us_;
   static constexpr float DEPTH_FULL_RES_FPS = 10.0f;
   DepthIntrinsics depth_intrinsics_;
 
