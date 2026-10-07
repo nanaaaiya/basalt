@@ -55,8 +55,9 @@ launches this profile and records each run to `~/scans/run_<timestamp>`.
 
 ## Shared settings
 
-- Mono exposure is capped at 8 ms (`MAX_EXPOSURE_US` in `oak_d.h`) to limit
-  motion blur.
+- Mono auto-exposure is capped at 4 ms by default (`--max-exposure-us`,
+  `DEFAULT_MAX_EXPOSURE_US` in `oak_d.h`) to limit motion blur; the camera
+  raises gain instead. Raise it in dim rooms where images turn dark.
 - IR dot projector: on at 0.17 in the Pi 5 profile. It roughly doubles depth
   on blank walls (42% -> 60% of pixels in a room scan) without hurting
   tracking at room-scale distances. Keep at least ~1 m from surfaces: up
