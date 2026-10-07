@@ -498,13 +498,17 @@ class FrameToFrameOpticalFlow : public OpticalFlowBase {
           outcome[r] = std::max(outcome[r], 1);
           if (!trackPoint(pyr0, pyr1, transform_1, transform_2)) return false;
           outcome[r] = std::max(outcome[r], 2);
-          // Backward track seeded the same way as in trackPoints(): starting
-          // it at the cam1 coordinates put it a full disparity (10-50 px)
-          // from the answer, rejecting most correct stereo matches.
-          Eigen::AffineCompact2f transform_1_recovered = transform_2;
-          transform_1_recovered.translation() =
-              transform_1.translation() + (transform_2.translation() - seed_px);
-          if (!trackPoint(pyr1, pyr0, transform_2, transform_1_recovered))
+          // Backward check: start at the corner itself and refine at full
+          // resolution only. Starting from cam1 coordinates (a full
+          // disparity away) or from the seed-corrected position (which
+          // mirrors the depth guess's error), or passing through the coarse
+          // levels, pulled correct matches off; on real frames this check
+          // alone rejected most of them.
+          PatchT patch1(pyr1.lvl(0), transform_2.translation());
+          if (!patch1.valid) return false;
+          Eigen::AffineCompact2f transform_1_recovered = transform_1;
+          transform_1_recovered.linear().setIdentity();
+          if (!trackPointAtLevel(pyr0.lvl(0), patch1, transform_1_recovered))
             return false;
           outcome[r] = std::max(outcome[r], 3);
           Scalar dist2 = (transform_1.translation() -
@@ -513,7 +517,12 @@ class FrameToFrameOpticalFlow : public OpticalFlowBase {
           float dist_px = std::sqrt(float(dist2));
           if (best_roundtrip_px[r] < 0.f || dist_px < best_roundtrip_px[r])
             best_roundtrip_px[r] = dist_px;
-          if (dist2 < config.optical_flow_max_recovered_dist2) {
+          // Matches between two cameras round-trip at ~0.2-0.3 px even when
+          // correct (the lenses distort slightly differently), so the 0.2 px
+          // same-camera tolerance rejected about a third of good ones; the
+          // epipolar check in filterPoints() still removes wrong matches.
+          constexpr Scalar kStereoMaxRecoveredDist2 = 0.25;  // 0.5 px
+          if (dist2 < kStereoMaxRecoveredDist2) {
             result[id] = transform_2;
             outcome[r] = 4;
             return true;
