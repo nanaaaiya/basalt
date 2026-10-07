@@ -1500,7 +1500,7 @@ void OnlineLoopClosure::checkDriftGate() {
       drift_anchor_idx_ = n - 1;
       keyframes_since_anchor_refresh_ = 0;
       release_blending_ = true;
-      release_blend_start_pose_ = held_pose_;
+      release_blend_start_pose_ = have_last_published_pose_ ? last_published_pose_ : held_pose_;
       // See release_blend_start_was_position_only_'s header comment --
       // this capture has no live raw pose to fix up held_pose_'s stale
       // rotation with right now, so it's deferred to the first
@@ -1553,7 +1553,7 @@ void OnlineLoopClosure::forceReleaseDriftHoldLocked() const {
   drift_anchor_idx_ = keyframes_.empty() ? 0 : keyframes_.size() - 1;
   keyframes_since_anchor_refresh_ = 0;
   release_blending_ = true;
-  release_blend_start_pose_ = held_pose_;
+  release_blend_start_pose_ = have_last_published_pose_ ? last_published_pose_ : held_pose_;
   // See release_blend_start_was_position_only_'s header comment -- read
   // before drift_held_'s own reset above would matter, but
   // held_position_only_ isn't touched by this function, so order doesn't
@@ -1649,6 +1649,13 @@ bool OnlineLoopClosure::getLatestCorrectedPose(Sophus::SE3d& out) const {
 
 Sophus::SE3d OnlineLoopClosure::heldOutputPose(
     const Sophus::SE3d& current_raw_pose) const {
+  // Drift-gate hold (a suspicious loop correction, tracking still fine):
+  // keep following VIO's own motion from the held pose and only withhold the
+  // unconfirmed correction. Freezing the pose here made the displayed/
+  // navigation pose stop for 3-6 s while the camera kept moving.
+  if (drift_held_ && drift_held_since_t_ns_ >= 0) {
+    return held_pose_ * held_anchor_raw_pose_.inverse() * current_raw_pose;
+  }
   if (held_position_only_) {
     return Sophus::SE3d(current_raw_pose.so3(), held_pose_.translation());
   }
@@ -2021,6 +2028,7 @@ bool OnlineLoopClosure::getSmoothedCorrectedPose(
               .norm();
       release_blend_duration_s_ =
           std::max(kReleaseBlendDurationS, total_jump_m / kMaxBlendSpeedMps);
+      release_blend_offset_ = release_blend_start_pose_ * out.inverse();
     }
     double elapsed_s = std::chrono::duration<double>(
                             std::chrono::steady_clock::now() -
@@ -2031,8 +2039,9 @@ bool OnlineLoopClosure::getSmoothedCorrectedPose(
     } else {
       double alpha =
           std::clamp(elapsed_s / release_blend_duration_s_, 0.0, 1.0);
-      Sophus::SE3d delta = release_blend_start_pose_.inverse() * out;
-      out = release_blend_start_pose_ * Sophus::SE3d::exp(alpha * delta.log());
+      // Fade the world-frame offset between the shown pose and the target
+      // out over the blend, so the output keeps following live motion.
+      out = Sophus::SE3d::exp((1.0 - alpha) * release_blend_offset_.log()) * out;
     }
   }
 

@@ -509,6 +509,7 @@ class OnlineLoopClosure {
   // to VIO's own logical time.
   mutable bool release_blending_ = false;
   mutable Sophus::SE3d release_blend_start_pose_;
+  mutable Sophus::SE3d release_blend_offset_;  // start pose relative to the target, faded out
   // True if release_blend_start_pose_ was captured FROM a position-only
   // hold (held_position_only_ was true at that moment) -- its rotation is
   // therefore the STALE value from whenever the hold originally tripped,
