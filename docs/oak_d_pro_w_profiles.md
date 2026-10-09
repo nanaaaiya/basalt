@@ -18,8 +18,8 @@ The Pi 5 profile changes three values from the full profile:
 
 With the full profile the Pi 5 runs VIO at ~16-23 poses/s with frequent
 gaps; with the Pi 5 profile it holds ~30 poses/s with loop closure on.
-Loop closure, depth saving and the live voxel map run at a lower CPU
-priority than tracking, so they use only leftover CPU.
+Loop closure and depth saving run at a lower CPU priority than tracking,
+so they use only leftover CPU.
 
 ## Full profile (laptop)
 
@@ -29,7 +29,7 @@ priority than tracking, so they use only leftover CPU.
   --config-path data/oak_d_pro_w_config.json \
   --stereo-seed-depths 0.3 1.0 2.5 6.0 --online-loop-closure true \
   --enable-ir-emitters false \
-  --occupancy-rate-hz 10 --record-depth-dir <new folder> \
+  --record-depth-dir <new folder> \
   --dashboard-host <dashboard ip> --dashboard-port 8765
 ```
 
@@ -44,7 +44,7 @@ Depth defaults to full sensor resolution (1280x800 at 10 fps;
   --config-path data/oak_d_pro_w_pi_config.json \
   --online-loop-closure true --show-gui false \
   --enable-ir-emitters true --ir-laser-intensity 0.17 \
-  --occupancy-rate-hz 10 --record-depth-dir <new folder> \
+  --record-depth-dir <new folder> \
   --dashboard-host <dashboard ip> --dashboard-port 8765
 ```
 

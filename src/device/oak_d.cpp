@@ -108,7 +108,7 @@ void OakDDevice::start() {
   q_imu = imu->out.createOutputQueue(50, false);
 
   if (enable_stereo_depth_) {
-    // For the occupancy-grid mapper (not VIO -- that still only uses the
+    // For depth recording (not VIO -- that still only uses the
     // raw mono frames above). StereoDepth rectifies leftOut/rightOut
     // internally using the device's calibration, so it's fine that
     // they're the same raw, unrectified outputs VIO also reads.
@@ -150,19 +150,15 @@ void OakDDevice::start() {
     // mismatch is a rigid offset roughly one baseline (~7.5cm) in a fixed
     // direction for every point -- live-diagnosed as the cause of the
     // "line of voxels swept off to one side, overlapping the frustum"
-    // pattern on OAK-D Pro W, 2026-09-29 (see occupancy_mapper.h's header
-    // comment for the sibling wrong-camera-model bug this compounded with).
+    // pattern on OAK-D Pro W, 2026-09-29.
     stereo->setDepthAlign(dai::CameraBoardSocket::CAM_B);
     // The DEFAULT preset downscales its own output resolution regardless
     // of the 640x480 mono input (found producing 320x240 depth frames in
     // testing). Deliberately left at that lower resolution rather than
     // forced up to 640x480: doing so quadruples the depth data volume over
     // USB, which reproduced this device's known connection-crash pattern
-    // in live testing. OccupancyMapper::insertFrame() instead scales pixel
-    // coordinates to match the calibration's resolution before
-    // unprojecting, so the intrinsics stay correct at whatever resolution
-    // the depth stream actually outputs -- see its comment for the fuller
-    // explanation of the fan-shaped-map bug this was fixing.
+    // in live testing. Consumers scale the intrinsics to the depth
+    // stream's actual resolution.
     if (depth_full_res_) {
       camLeft->requestOutput(std::make_pair(1280u, 800u), std::nullopt,
                              dai::ImgResizeMode::CROP, DEPTH_FULL_RES_FPS)
@@ -183,10 +179,7 @@ void OakDDevice::start() {
   if (enable_stereo_depth_) {
     // See DepthIntrinsics's header comment for why this must be Luxonis's
     // own factory calibration, not calib_'s (Basalt's own, of the RAW
-    // lens). Queried at 640x480 -- OccupancyMapper's existing scale_u/
-    // scale_v logic already adapts to whatever resolution the depth
-    // stream actually outputs (see its own comment), same as it already
-    // does for calib_'s resolution.
+    // lens).
     auto device = pipeline.getDefaultDevice();
     if (device) {
       // requestOutput(640x480) from the 1280x800 OV9282 scales by 0.6 and
@@ -219,7 +212,7 @@ void OakDDevice::start() {
                 << std::endl;
     } else {
       std::cerr << "[OAKD] Could not get device handle for depth "
-                   "intrinsics -- occupancy mapping will be wrong"
+                   "intrinsics -- recorded depth metadata will be wrong"
                 << std::endl;
     }
   }
@@ -312,10 +305,8 @@ void OakDDevice::deviceLoop() {
       queues = output_queues;
     }
 
-    // Independent of the IMU/stereo-frame pairing below -- the occupancy
-    // mapper times its own depth frames against VIO's pose stream itself,
-    // the same way DashboardClient consumes poses without needing to be
-    // threaded through this pairing logic. try_push, not push: this same
+    // Independent of the IMU/stereo-frame pairing below -- depth frames
+    // carry their own timestamps. try_push, not push: this same
     // loop also reads the IMU/mono frames VIO actually needs every single
     // one of, so a depth consumer that ever falls behind must never be
     // able to block this thread -- dropping a depth frame costs nothing

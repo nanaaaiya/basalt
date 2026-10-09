@@ -313,29 +313,6 @@ class OnlineLoopClosure {
   // immediate live one.
   Eigen::aligned_vector<Eigen::Vector3d> buildPointCloud() const;
 
-  // Looks up the best CURRENTLY-known corrected pose for a raw body/IMU
-  // pose captured at some past t_ns -- for OccupancyMapper::rebuild() (see
-  // its own comment): lets a dense map be periodically rebuilt from the
-  // CURRENT pose graph instead of carrying forward whatever correction (if
-  // any) was live at the moment each depth frame was first inserted,
-  // which is exactly what left permanent ghost layers behind after a
-  // later loop-closure correction, live-diagnosed 2026-10-01.
-  //
-  // Deliberately separate from getSmoothedCorrectedPose(): that method is
-  // built for sequential LIVE calls (it caches last_published_pose_/
-  // last_raw_pose_seen_, drives the drift-gate hold/release state
-  // machine, etc.) -- calling it out of order with old, retained raw
-  // poses during a rebuild pass would corrupt that live bookkeeping. This
-  // is const and touches none of it: same "nearest keyframe + raw delta"
-  // math checkDriftGate() already uses internally
-  // (T_predicted = T_reference_corrected * T_raw_delta), just read-only
-  // and safe to call as many times, in whatever order, as a rebuild
-  // needs. Returns false (leaving out untouched) if there are no
-  // keyframes yet to anchor against.
-  bool getCorrectedPoseForRebuild(int64_t t_ns,
-                                  const Sophus::SE3d& raw_pose_at_t,
-                                  Sophus::SE3d& out) const;
-
  private:
   struct LoopKeyframe {
     int64_t t_ns;

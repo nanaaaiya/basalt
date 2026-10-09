@@ -182,7 +182,6 @@ find_package(fmt CONFIG REQUIRED)
 find_package(CLI11 CONFIG REQUIRED)
 find_package(magic_enum CONFIG REQUIRED)
 find_package(nlohmann_json CONFIG REQUIRED)
-find_package(octomap CONFIG REQUIRED)
 find_package(opengv CONFIG REQUIRED)
 find_package(rosbag CONFIG REQUIRED)
 find_package(Pangolin CONFIG REQUIRED)
@@ -283,7 +282,6 @@ target_sources(basalt
     ${CMAKE_CURRENT_SOURCE_DIR}/include/basalt/linearization/linearization_abs_sc.hpp
     ${CMAKE_CURRENT_SOURCE_DIR}/include/basalt/linearization/linearization_base.hpp
     ${CMAKE_CURRENT_SOURCE_DIR}/include/basalt/linearization/linearization_rel_sc.hpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/include/basalt/mapping/occupancy_mapper.h
     ${CMAKE_CURRENT_SOURCE_DIR}/include/basalt/optical_flow/frame_to_frame_optical_flow.h
     ${CMAKE_CURRENT_SOURCE_DIR}/include/basalt/optical_flow/multiscale_frame_to_frame_optical_flow.h
     ${CMAKE_CURRENT_SOURCE_DIR}/include/basalt/optical_flow/optical_flow.h
@@ -333,7 +331,6 @@ target_sources(basalt
     ${CMAKE_CURRENT_SOURCE_DIR}/src/linearization/linearization_abs_sc.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/linearization/linearization_base.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/linearization/linearization_rel_sc.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/mapping/occupancy_mapper.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/optical_flow/optical_flow.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/utils/keypoints.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/utils/system_utils.cpp
@@ -354,7 +351,7 @@ target_sources(basalt
 
 target_link_libraries(basalt
   PUBLIC ${STD_CXX_FS} Eigen3::Eigen basalt::opencv basalt::basalt-headers TBB::tbb
-  PRIVATE basalt::magic_enum rosbag apriltag opengv nlohmann_json::nlohmann_json fmt::fmt octomap octomath)
+  PRIVATE basalt::magic_enum rosbag apriltag opengv nlohmann_json::nlohmann_json fmt::fmt)
 target_include_directories(basalt PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/include
   ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/ros/include)

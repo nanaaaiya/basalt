@@ -103,7 +103,7 @@ class OakDDevice {
   static constexpr int DEFAULT_MAX_EXPOSURE_US = 4000;
 
   // enable_stereo_depth: builds and runs the on-device StereoDepth node
-  // (for the future occupancy-grid mapper) alongside the existing raw
+  // (for depth recording) alongside the existing raw
   // mono + IMU streams VIO uses. This has to be a constructor-time
   // choice, not a setter called after start() like setOutputQueues()
   // below -- DepthAI's node graph is fixed once pipeline.start() runs,
@@ -127,8 +127,8 @@ class OakDDevice {
       tbb::concurrent_bounded_queue<ImuData<double>::Ptr>* imu_queue);
   void detachOutputQueues();
 
-  // Separate from setOutputQueues() above -- depth is for the (future)
-  // occupancy-grid mapper, an entirely separate consumer from VIO's
+  // Separate from setOutputQueues() above -- depth is for recording, an
+  // entirely separate consumer from VIO's
   // image/IMU wiring, and shouldn't need to touch that call at every
   // existing call site just to add this. Safe to call whether or not
   // enable_stereo_depth was set; it's simply never fed if not.
@@ -157,9 +157,7 @@ class OakDDevice {
   // all -- unlike calib_.intrinsics[cam_id], which describes the RAW,
   // un-rectified lens (needed for VIO/optical-flow, which reads raw
   // frames, but wrong for depth). fx/fy/cx/cy are reported at
-  // `width`x`height`; OccupancyMapper scales them to whatever resolution
-  // the actual depth stream outputs, same as it already did for the
-  // calib-vs-depth-resolution mismatch (see its own comment).
+  // `width`x`height`.
   struct DepthIntrinsics {
     double fx = 0, fy = 0, cx = 0, cy = 0;
     int width = 0, height = 0;

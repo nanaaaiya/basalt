@@ -75,7 +75,6 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <basalt/io/dashboard_client.h>
 #include <basalt/io/dataset_io.h>
 #include <basalt/io/marg_data_io.h>
-#include <basalt/mapping/occupancy_mapper.h>
 #include <basalt/utils/filesystem.h>
 #include <basalt/utils/vio_health.h>
 #include <basalt/spline/se3_spline.h>
@@ -108,7 +107,6 @@ basalt::OakDDevice::Ptr oakd_device;
 basalt::OnlineLoopClosure::Ptr online_loop_closure;
 basalt::MargDataFanOut::Ptr marg_fan_out;
 basalt::DashboardClient::Ptr dashboard_client;
-basalt::OccupancyMapper::Ptr occupancy_mapper;
 tbb::concurrent_bounded_queue<std::shared_ptr<dai::ImgFrame>> depth_queue;
 
 using Button = pangolin::Var<std::function<void(void)>>;
@@ -212,25 +210,6 @@ std::string marg_data_path;
 
 bool step_by_step = false;
 int64_t curr_t_ns = -1;
-// Latest raw VIO pose, for the occupancy mapper to use when
-// --online-loop-closure isn't active (or hasn't produced a corrected pose
-// yet) -- guarded by vio_state_mutex like curr_t_ns/vio_t_w_i above.
-Sophus::SE3d curr_raw_pose;
-// Short time-indexed history of raw poses (ascending t_ns), so a depth
-// frame can be paired with the pose that was actually true AT ITS OWN
-// CAPTURE TIME (see t7's lookupRawPoseNear()), not just "whatever pose is
-// freshest when the depth-processing thread gets around to it" -- under
-// real camera motion those two differ by however long the frame sat in
-// depth_queue plus t7's own occupancy_rate_hz throttling, and every bit of
-// that gap directly smears the resulting point cloud (a stationary test
-// never surfaces this -- pose doesn't change either way -- which is why
-// it passed hand-verification earlier; a moving test does). Live-
-// diagnosed on OAK-D Pro W, 2026-09-29: voxels stopped forming a clean
-// wall-like surface specifically once the camera was actually moved
-// around, not just held still. Capped (not unbounded) since this is only
-// ever queried for very recent frames.
-std::deque<std::pair<int64_t, Sophus::SE3d>> raw_pose_history;
-constexpr size_t kRawPoseHistoryCap = 400;
 std::mutex vio_state_mutex;
 tbb::concurrent_bounded_queue<std::vector<float>> vio_plot_queue;
 
@@ -286,59 +265,10 @@ int main(int argc, char** argv) {
   app.add_option("--dashboard-port", dashboard_port,
                  "Dashboard backend's PI5_TCP_PORT.");
 
-  // Live 3D occupancy-grid mapping (see basalt::OccupancyMapper). Enables
-  // the OAK-D's on-device StereoDepth node too -- see OakDDevice's
-  // enable_stereo_depth constructor flag. See the "KNOWN LIMITATION" note
-  // at the top of occupancy_mapper.h before relying on this for a real
-  // flight -- a pre-existing OAK-D/USB instability, independent of this
-  // feature, can crash the whole process under sustained real-hardware use.
-  bool enable_occupancy_mapping = false;
-  app.add_option("--enable-occupancy-mapping", enable_occupancy_mapping,
-                 "Build a live 3D occupancy grid from stereo depth "
-                 "(see OccupancyMapper).");
-  double occupancy_voxel_size = 0.2;
-  app.add_option("--occupancy-voxel-size", occupancy_voxel_size,
-                 "Occupancy grid voxel size in meters.");
-  int occupancy_depth_stride = 4;
-  app.add_option("--occupancy-depth-stride", occupancy_depth_stride,
-                 "Only insert every Nth depth pixel (in both axes) -- a "
-                 "compute-budget knob, not a depth-quality one.");
-  double occupancy_rate_hz = 5.0;
-  app.add_option("--occupancy-rate-hz", occupancy_rate_hz,
-                 "Max rate to integrate depth frames into the occupancy "
-                 "grid -- independent of the depth stream's own ~30fps, "
-                 "since mapping doesn't need every frame.");
-  // min default: see OccupancyMapper's constructor comment -- without
-  // this, active-IR stereo on a close, flat, low-texture wall was
-  // observed producing high-confidence FALSE matches many meters away
-  // that a confidence threshold alone doesn't catch, live-diagnosed on
-  // OAK-D Pro W 2026-09-29.
-  int occupancy_min_depth_mm = 150;
-  app.add_option("--occupancy-min-depth-mm", occupancy_min_depth_mm,
-                 "Reject depth pixels closer than this (mm) -- 0 disables.");
-  // History, 2026-09-29: 3000 -> pileup right at 3000mm while rotating
-  // in a corner. Raised to 6000 assuming an open room -- pileup just
-  // moved to 6000mm instead, and the user confirmed the real walls are
-  // NOT farther than ~3m (sitting in a corner, rotating in place). So
-  // that pileup was never a real room boundary either time -- it's
-  // confidently-wrong far matches (see setConfidenceThreshold's comment
-  // in oak_d.cpp for the likely cause: grazing-angle viewing, hard to
-  // avoid while rotating in a corner). Back down to a value grounded in
-  // the ACTUAL known room bound now that we have one, plus a margin for
-  // corner-to-far-corner diagonal distance -- not a blind guess this
-  // time. Tighten toward 3000 or raise toward the room's real diagonal
-  // if this specific value doesn't match the actual space.
-  int occupancy_max_depth_mm = 3500;
-  app.add_option("--occupancy-max-depth-mm", occupancy_max_depth_mm,
-                 "Reject depth pixels farther than this (mm) -- 0 disables. "
-                 "Filters out coherent false stereo matches on close, "
-                 "low-texture surfaces under active IR, not just noise.");
-
   // OAK-D Pro W only -- silently a no-op on hardware without an IR
-  // projector (see OakDDevice::setIrEmitters()'s comment). Off by default,
-  // same reasoning as enable_occupancy_mapping above: opt-in for a feature
-  // this specific hardware needs recalibration/live validation before
-  // being trusted unconditionally. Live-verified crash-safe in isolation
+  // projector (see OakDDevice::setIrEmitters()'s comment). Off by default:
+  // opt-in for a feature this specific hardware needs live validation
+  // before being trusted unconditionally. Live-verified crash-safe in isolation
   // via basalt_test_ir_emitters before being wired in here.
   bool enable_ir_emitters = false;
   app.add_option("--enable-ir-emitters", enable_ir_emitters,
@@ -351,9 +281,8 @@ int main(int argc, char** argv) {
   // 0.5 (~600mA) is ~3x that -- plausible over-drive at the ~0.4-0.5m
   // range this rig is tested at, saturating/blooming the dot pattern on a
   // close flat wall into a coherent but WRONG set of high-confidence
-  // stereo matches (not just noise -- see OccupancyMapper's min/max depth
-  // filter comment for that same failure mode, diagnosed 2026-09-29 as a
-  // depth-VALUE problem, not a coordinate/math one). Revisit empirically;
+  // stereo matches (not just noise; diagnosed 2026-09-29 as a depth-VALUE
+  // problem, not a coordinate/math one). Revisit empirically;
   // this is the documented starting point, not a live-tuned final value.
   double ir_laser_intensity = 0.17;
   app.add_option("--ir-laser-intensity", ir_laser_intensity,
@@ -497,7 +426,7 @@ int main(int argc, char** argv) {
 
   const bool record_depth = !record_depth_dir.empty();
   oakd_device.reset(
-      new basalt::OakDDevice(enable_occupancy_mapping || record_depth,
+      new basalt::OakDDevice(record_depth,
                               depth_full_res, max_exposure_us));
 
   try {
@@ -570,31 +499,6 @@ int main(int argc, char** argv) {
     dashboard_client->start();
   }
 
-  if (enable_occupancy_mapping) {
-    // Luxonis's own factory calibration, NOT Basalt's calib -- see
-    // OccupancyMapper::DepthIntrinsics's header comment for why using
-    // Basalt's own (RAW-lens) camera model here produced a severely
-    // warped point cloud on OAK-D Pro W.
-    auto oakd_intr = oakd_device->getDepthIntrinsics();
-    basalt::DepthIntrinsics depth_intr;
-    depth_intr.fx = oakd_intr.fx;
-    depth_intr.fy = oakd_intr.fy;
-    depth_intr.cx = oakd_intr.cx;
-    depth_intr.cy = oakd_intr.cy;
-    depth_intr.width = oakd_intr.width;
-    depth_intr.height = oakd_intr.height;
-    occupancy_mapper.reset(new basalt::OccupancyMapper(
-        depth_intr, occupancy_voxel_size, occupancy_depth_stride,
-        occupancy_min_depth_mm, occupancy_max_depth_mm));
-    occupancy_mapper->start();
-    // No setPoseLookup(): rebuild-on-loop-closure is disabled. Live
-    // loop-closure corrections measured ~0 (median 0 m, p95 2.8 cm) on
-    // real panning runs, so re-posing had nothing to fix, while clear()
-    // isn't recorded by octomap change detection -- rebuilds only ever
-    // ADDED voxels on the dashboard. The clean map comes from the offline
-    // TSDF path (--record-depth-dir) instead.
-  }
-
   std::ofstream rec_frames, rec_traj;
   if (record_depth) {
     basalt::fs::create_directories(record_depth_dir + "/depth");
@@ -624,7 +528,7 @@ int main(int argc, char** argv) {
     }
   }
 
-  if (occupancy_mapper || record_depth) {
+  if (record_depth) {
     depth_queue.set_capacity(4);
     oakd_device->setDepthOutputQueue(&depth_queue);
   }
@@ -673,11 +577,6 @@ int main(int argc, char** argv) {
         std::lock_guard<std::mutex> lock(vio_state_mutex);
         vio_t_ns.emplace_back(data->t_ns);
         vio_t_w_i.emplace_back(T_w_i.translation());
-        curr_raw_pose = T_w_i;
-        raw_pose_history.emplace_back(data->t_ns, T_w_i);
-        while (raw_pose_history.size() > kRawPoseHistoryCap) {
-          raw_pose_history.pop_front();
-        }
       }
 
       if (rec_traj.is_open()) {
@@ -926,111 +825,27 @@ int main(int argc, char** argv) {
     std::cout << "Finished t6" << std::endl;
   });
 
-  // Feeds real depth frames + the current pose into occupancy_mapper.
-  // Independent of show_gui for the same reason t6 is -- a real headless
-  // flight still needs mapping to run.
+  // Saves every depth frame for offline mapping (scripts/offline_recon.py).
   std::shared_ptr<std::thread> t7;
-  if (occupancy_mapper || record_depth) {
+  if (record_depth) {
     t7.reset(new std::thread([&]() {
-      basalt::lowerCurrentThreadPriority();  // depth saving / map insertion
-      auto last_processed = std::chrono::steady_clock::now();
-      const auto min_interval = std::chrono::duration<double>(
-          1.0 / std::max(0.1, occupancy_rate_hz));
-
-      int64_t total_added = 0, total_removed = 0;
-
+      basalt::lowerCurrentThreadPriority();
       while (!terminate) {
         std::shared_ptr<dai::ImgFrame> depth_frame;
         depth_queue.pop(depth_frame);
         if (!depth_frame) break;  // shutdown sentinel from OakDDevice::stop()
 
-        auto now = std::chrono::steady_clock::now();
-        if (now - last_processed < min_interval) continue;  // rate budget
-        last_processed = now;
-
         double t_sec = std::chrono::duration<double>(
                            depth_frame->getTimestamp().time_since_epoch())
                            .count();
         int64_t depth_t_ns = static_cast<int64_t>(t_sec * 1e9);
-
-        if (record_depth) {
-          std::string name = std::to_string(depth_t_ns) + ".png";
-          if (cv::imwrite(record_depth_dir + "/depth/" + name,
-                          depth_frame->getCvFrame())) {
-            rec_frames << depth_t_ns << ',' << name << std::endl;
-          }
-        }
-        if (!occupancy_mapper) continue;
-
-        // Pose AT THE DEPTH FRAME'S OWN CAPTURE TIME. VIO usually lags the
-        // depth stream, so wait (briefly) for a VIO state at or after
-        // depth_t_ns instead of silently clamping to an older pose, and
-        // skip the frame if the nearest state is still too far away.
-        constexpr int64_t kMaxPoseGapNs = 40'000'000;  // 40 ms
-        Sophus::SE3d raw_now;
-        bool have_pose = false;
-        for (int attempt = 0; attempt < 15 && !have_pose && !terminate;
-             ++attempt) {
-          {
-            std::lock_guard<std::mutex> lock(vio_state_mutex);
-            if (!raw_pose_history.empty() &&
-                raw_pose_history.back().first >= depth_t_ns) {
-              auto it = std::lower_bound(
-                  raw_pose_history.begin(), raw_pose_history.end(),
-                  depth_t_ns,
-                  [](const std::pair<int64_t, Sophus::SE3d>& s, int64_t t) {
-                    return s.first < t;
-                  });
-              if (it != raw_pose_history.begin()) {
-                auto prev = std::prev(it);
-                if (depth_t_ns - prev->first < it->first - depth_t_ns) {
-                  it = prev;
-                }
-              }
-              if (std::abs(it->first - depth_t_ns) <= kMaxPoseGapNs) {
-                raw_now = it->second;
-                have_pose = true;
-              }
-              break;
-            }
-          }
-          std::this_thread::sleep_for(std::chrono::milliseconds(20));
-        }
-        if (!have_pose) continue;
-
-        // The RAW VIO pose, not getSmoothedCorrectedPose(): that one is a
-        // display pose (frozen during drift-gate holds, interpolated during
-        // blends), and inserting depth with it while the camera moves puts
-        // copies of surfaces in the wrong place.
-        const Sophus::SE3d& pose = raw_now;
-
-        auto input = std::make_shared<basalt::DepthFrameInput>();
-        input->t_ns = depth_t_ns;
-        input->T_w_c = pose * calib.T_i_c[0];
-        // Uncorrected body pose at capture -- retained by OccupancyMapper
-        // so a later rebuild() can ask OnlineLoopClosure for a FRESH
-        // corrected pose at this same t_ns once the pose graph has moved
-        // on, instead of being stuck with whatever correction (if any)
-        // was live right now. See DepthFrameInput::T_w_i_raw's comment.
-        input->T_w_i_raw = raw_now;
-        input->depth_mm = depth_frame->getCvFrame();
-        occupancy_mapper->addDepthFrame(input);
-
-        basalt::VoxelDelta delta;
-        while (occupancy_mapper->pollVoxelDelta(delta)) {
-          total_added += delta.added.size();
-          total_removed += delta.removed.size();
-          if (dashboard_client) {
-            dashboard_client->sendVoxelBatch(input->t_ns, occupancy_voxel_size,
-                                              delta.added, delta.removed);
-          }
+        std::string name = std::to_string(depth_t_ns) + ".png";
+        if (cv::imwrite(record_depth_dir + "/depth/" + name,
+                        depth_frame->getCvFrame())) {
+          rec_frames << depth_t_ns << ',' << name << std::endl;
         }
       }
-
-      std::cout << "Finished t7 -- occupancy grid: " << total_added
-                << " voxels added, " << total_removed << " removed (net "
-                << (total_added - total_removed) << " occupied)"
-                << std::endl;
+      std::cout << "Finished t7 -- depth recording" << std::endl;
     }));
   }
 
@@ -1183,7 +998,6 @@ int main(int argc, char** argv) {
   terminate = true;
 
   if (online_loop_closure) online_loop_closure->stop();
-  if (occupancy_mapper) occupancy_mapper->stop();
 
   // Push nullptr to output queues to unblock waiting threads. imu_tap_queue
   // needs its own push -- OakDDevice::stop() only sentinels the queues it
