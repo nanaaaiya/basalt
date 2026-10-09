@@ -359,6 +359,9 @@ class OnlineLoopClosure {
     double yaw_correction = 0;
     Eigen::Vector3d t_opt = Eigen::Vector3d::Zero();
 
+    // Raw VIO distance travelled from the first keyframe to this one.
+    double path_length = 0;
+
     Sophus::SE3d correctedPose() const {
       return Sophus::SE3d(
           Eigen::AngleAxisd(yaw_correction, Eigen::Vector3d::UnitZ())

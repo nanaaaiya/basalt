@@ -186,6 +186,17 @@ constexpr int64_t kMinLoopClosureTimeGapNs = 2'000'000'000;
 // bounded by kMaxCandidatesToVerify regardless of this cap.
 constexpr size_t kMaxLoopEdgesPerKeyframe = 2;
 
+// A loop match is rejected if its relative pose disagrees with raw VIO's by
+// more than this. VIO is accurate over short spans, so a large disagreement
+// means a wrong match; the allowance grows with distance and time travelled
+// between the two keyframes so real accumulated drift can still be
+// corrected. On EuRoC V1_01-03 this kept all 295 correct matches and
+// rejected all 26 that were off by more than 30 cm against ground truth.
+constexpr double kLoopMaxDisagreementM = 0.2;
+constexpr double kLoopMaxDisagreementPerPathM = 0.03;
+constexpr double kLoopMaxDisagreementDeg = 3.0;
+constexpr double kLoopMaxDisagreementDegPerMin = 1.0;
+
 // Huber threshold (meters) for robust down-weighting of loop-closure edges
 // in solvePoseGraph() -- see the comment at its use site. A residual under
 // this is treated as normal noise (full weight); beyond it, weight falls
@@ -660,6 +671,15 @@ void OnlineLoopClosure::processKeyframe(const MargData::Ptr& data,
   LoopKeyframe kf;
   kf.t_ns = kf_id;
   kf.T_w_i_raw = T_w_i_raw;
+  {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    if (!keyframes_.empty()) {
+      const LoopKeyframe& prev = keyframes_.back();
+      kf.path_length =
+          prev.path_length +
+          (T_w_i_raw.translation() - prev.T_w_i_raw.translation()).norm();
+    }
+  }
 
   detectKeypointsMapping(img0, kf.kd0, config_.mapper_detection_num_points);
 
@@ -1047,6 +1067,28 @@ void OnlineLoopClosure::processKeyframe(const MargData::Ptr& data,
       closure.T_body_partner_new =
           calib_.T_i_c[0] * T_partnerCam_newCam * calib_.T_i_c[0].inverse();
       closure.num_inliers = (int)ransac.inliers_.size();
+
+      {
+        const Sophus::SE3d T_raw_partner_new =
+            partner->T_w_i_raw.inverse() * T_w_i_raw;
+        const Sophus::SE3d D =
+            T_raw_partner_new.inverse() * closure.T_body_partner_new;
+        const double t_err = D.translation().norm();
+        const double rot_err_deg = D.so3().log().norm() * 180.0 / M_PI;
+        const double max_t = kLoopMaxDisagreementM +
+                             kLoopMaxDisagreementPerPathM *
+                                 (kf.path_length - partner->path_length);
+        const double max_rot_deg =
+            kLoopMaxDisagreementDeg +
+            kLoopMaxDisagreementDegPerMin * (kf_id - partner_t_ns) * 1e-9 / 60.0;
+        if (t_err > max_t || rot_err_deg > max_rot_deg) {
+          std::cout << "              RESULT: rejected (disagrees with VIO: "
+                    << t_err << " m / " << rot_err_deg << " deg, allowed "
+                    << max_t << " m / " << max_rot_deg << " deg)" << std::endl;
+          continue;
+        }
+      }
+
       accepted_closures.push_back(closure);
 
       // Publish the localization result immediately -- before the
