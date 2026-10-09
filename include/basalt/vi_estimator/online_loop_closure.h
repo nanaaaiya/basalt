@@ -353,17 +353,25 @@ class OnlineLoopClosure {
     // below, to avoid feeding corrections back into their own inputs.
     Sophus::SE3d T_w_i_raw;
 
-    // Pose graph state: roll/pitch fixed (from raw VIO pose, never
-    // corrected -- IMU/gravity already observes these well); yaw + t are
-    // the solved-for unknowns.
-    double roll = 0, pitch = 0, yaw = 0;
+    // Pose graph state: a heading correction about world z applied on top
+    // of the raw rotation (roll/pitch come from VIO, which observes gravity),
+    // and the position. Independent of how the IMU is mounted.
+    double yaw_correction = 0;
     Eigen::Vector3d t_opt = Eigen::Vector3d::Zero();
+
+    Sophus::SE3d correctedPose() const {
+      return Sophus::SE3d(
+          Eigen::AngleAxisd(yaw_correction, Eigen::Vector3d::UnitZ())
+                  .toRotationMatrix() *
+              T_w_i_raw.rotationMatrix(),
+          t_opt);
+    }
   };
 
   struct PoseGraphEdge {
     size_t i, j;
-    Eigen::Vector3d dt;
-    double dyaw;
+    Eigen::Vector3d dt;    // t_j - t_i in node i's body frame
+    double dyaw;           // yaw_correction_j - yaw_correction_i
     // Relative confidence of this edge's measurement, applied as a scalar
     // weight on its residual in the solve (equivalent to scaling its
     // information matrix). Odometry edges keep the default 1.0; loop edges

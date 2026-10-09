@@ -429,22 +429,9 @@ constexpr int kLowParallaxMinTriangulatedPoints = 10;
 constexpr double kLowParallaxPersistenceSeconds = 3.0;
 constexpr double kLowParallaxRecoveryGraceS = 1.0;
 
-// Decompose R = Rz(yaw) * Ry(pitch) * Rx(roll). Assumes no gimbal lock
-// (pitch away from +-90 deg), a reasonable assumption for a handheld/mobile
-// device that isn't doing full vertical flips.
-void decomposeYPR(const Eigen::Matrix3d& R, double& roll, double& pitch,
-                  double& yaw) {
-  pitch = std::asin(std::clamp(-R(2, 0), -1.0, 1.0));
-  roll = std::atan2(R(2, 1), R(2, 2));
-  yaw = std::atan2(R(1, 0), R(0, 0));
-}
-
-Eigen::Matrix3d composeYPR(double roll, double pitch, double yaw) {
-  return (Eigen::AngleAxisd(yaw, Eigen::Vector3d::UnitZ()) *
-          Eigen::AngleAxisd(pitch, Eigen::Vector3d::UnitY()) *
-          Eigen::AngleAxisd(roll, Eigen::Vector3d::UnitX()))
-      .toRotationMatrix();
-}
+// Heading (rotation about world z) of a world-frame rotation that is close
+// to a pure z rotation.
+double headingOf(const Eigen::Matrix3d& R) { return std::atan2(R(1, 0), R(0, 0)); }
 
 double wrapAngle(double a) {
   while (a > M_PI) a -= 2 * M_PI;
@@ -1077,9 +1064,7 @@ void OnlineLoopClosure::processKeyframe(const MargData::Ptr& data,
         loc.t_ns = kf_id;
         loc.reference_t_ns = partner_t_ns;
         loc.T_reference_current = closure.T_body_partner_new;
-        Sophus::SE3d T_w_reference_corrected(
-            composeYPR(partner->roll, partner->pitch, partner->yaw),
-            partner->t_opt);
+        Sophus::SE3d T_w_reference_corrected = partner->correctedPose();
         loc.T_w_current = T_w_reference_corrected * closure.T_body_partner_new;
         loc.num_inliers = closure.num_inliers;
         localization_queue.try_push(loc);
@@ -1094,7 +1079,6 @@ void OnlineLoopClosure::processKeyframe(const MargData::Ptr& data,
   auto t3 = std::chrono::steady_clock::now();
 
   // --- Insert this keyframe + edges into the pose graph ---
-  decomposeYPR(T_w_i_raw.rotationMatrix(), kf.roll, kf.pitch, kf.yaw);
   kf.t_opt = T_w_i_raw.translation();
 
   bool need_resolve = false;
@@ -1111,9 +1095,7 @@ void OnlineLoopClosure::processKeyframe(const MargData::Ptr& data,
       e.i = new_idx - 1;
       e.j = new_idx;
       e.dt = T_rel.translation();
-      double r, p, y;
-      decomposeYPR(T_rel.rotationMatrix(), r, p, y);
-      e.dyaw = y;
+      e.dyaw = 0;  // raw relative rotation needs no heading correction
       edges_.push_back(e);
     }
 
@@ -1122,9 +1104,11 @@ void OnlineLoopClosure::processKeyframe(const MargData::Ptr& data,
       e.i = closure.partner_idx;
       e.j = new_idx;
       e.dt = closure.T_body_partner_new.translation();
-      double r, p, y;
-      decomposeYPR(closure.T_body_partner_new.rotationMatrix(), r, p, y);
-      e.dyaw = y;
+      // Heading correction that makes the raw rotations agree with the
+      // measured relative rotation, expressed about world z.
+      e.dyaw = headingOf(keyframes_[e.i].T_w_i_raw.rotationMatrix() *
+                         closure.T_body_partner_new.rotationMatrix() *
+                         T_w_i_raw.rotationMatrix().transpose());
       // See PoseGraphEdge::weight comment (online_loop_closure.h) -- a
       // closure that just barely cleared mapper_min_matches gets the same
       // baseline trust as an odometry edge (weight 1.0); one with several
@@ -1259,7 +1243,7 @@ void OnlineLoopClosure::solvePoseGraph() {
     // The graph is naturally sparse (each node only touches a couple of
     // edges), so a triplet-built SparseMatrix + SimplicialLDLT scales with
     // the number of actual connections instead of dim^2/dim^3. Analytic
-    // Jacobians (derived from d(R^T)/d(yaw) = [d Rz(yaw)/d yaw * Ry * Rx]^T)
+    // Jacobians (derived from d(R^T)/d(yaw) = [d Rz(yaw)/d yaw * Ci]^T)
     // remove the 16 extra residual evaluations per edge the numeric version
     // needed, though that was a much smaller share of the 1s+ cost.
     std::vector<Eigen::Triplet<double>> triplets;
@@ -1278,16 +1262,16 @@ void OnlineLoopClosure::solvePoseGraph() {
       const LoopKeyframe& ni = keyframes_[e.i];
       const LoopKeyframe& nj = keyframes_[e.j];
 
-      // Ri = Rz(yaw_i) * Ci, where Ci = Ry(pitch_i) * Rx(roll_i) is
-      // constant (roll/pitch are never optimized) -- matches composeYPR().
-      Eigen::Matrix3d Ci = composeYPR(ni.roll, ni.pitch, 0.0);
-      Eigen::Matrix3d Rzi =
-          Eigen::AngleAxisd(ni.yaw, Eigen::Vector3d::UnitZ()).toRotationMatrix();
+      // Ri = Rz(yaw_correction_i) * Ci, where Ci is the raw VIO rotation.
+      Eigen::Matrix3d Ci = ni.T_w_i_raw.rotationMatrix();
+      Eigen::Matrix3d Rzi = Eigen::AngleAxisd(ni.yaw_correction,
+                                              Eigen::Vector3d::UnitZ())
+                                .toRotationMatrix();
       Eigen::Matrix3d Ri = Rzi * Ci;
 
       Eigen::Vector3d dt_vec = nj.t_opt - ni.t_opt;
       Eigen::Vector3d predicted_dt = Ri.transpose() * dt_vec;
-      double predicted_dyaw = wrapAngle(nj.yaw - ni.yaw);
+      double predicted_dyaw = wrapAngle(nj.yaw_correction - ni.yaw_correction);
 
       Eigen::Vector4d r;
       r.head<3>() = predicted_dt - e.dt;
@@ -1371,7 +1355,8 @@ void OnlineLoopClosure::solvePoseGraph() {
     for (size_t idx = 1; idx < n; idx++) {
       int off = param_offset(idx);
       keyframes_[idx].t_opt += dx.segment(off, 3);
-      keyframes_[idx].yaw = wrapAngle(keyframes_[idx].yaw + dx(off + 3));
+      keyframes_[idx].yaw_correction =
+          wrapAngle(keyframes_[idx].yaw_correction + dx(off + 3));
     }
 
     if (dx.norm() < 1e-7) break;
@@ -1403,8 +1388,7 @@ void OnlineLoopClosure::checkDriftGate() {
   if (drift_anchor_idx_ >= n) drift_anchor_idx_ = 0;  // safety, shouldn't happen
 
   const LoopKeyframe& newest = keyframes_[n - 1];
-  Sophus::SE3d T_newest_corrected(composeYPR(newest.roll, newest.pitch, newest.yaw),
-                                  newest.t_opt);
+  Sophus::SE3d T_newest_corrected = newest.correctedPose();
 
   // Force-release regardless of residual once the hold has gone on too
   // long -- see kDriftGateMaxHoldSeconds's comment. Checked before the
@@ -1431,7 +1415,7 @@ void OnlineLoopClosure::checkDriftGate() {
   } else {
     const LoopKeyframe& anchor = keyframes_[drift_anchor_idx_];
     T_reference_corrected =
-        Sophus::SE3d(composeYPR(anchor.roll, anchor.pitch, anchor.yaw), anchor.t_opt);
+        anchor.correctedPose();
     T_reference_raw = anchor.T_w_i_raw;
   }
 
@@ -1643,7 +1627,7 @@ bool OnlineLoopClosure::getLatestCorrectedPose(Sophus::SE3d& out) const {
   std::lock_guard<std::mutex> lock(state_mutex_);
   if (keyframes_.empty()) return false;
   const LoopKeyframe& kf = keyframes_.back();
-  out = Sophus::SE3d(composeYPR(kf.roll, kf.pitch, kf.yaw), kf.t_opt);
+  out = kf.correctedPose();
   return true;
 }
 
@@ -1790,8 +1774,7 @@ bool OnlineLoopClosure::getSmoothedCorrectedPose(
         held_anchor_raw_pose_ = last_raw_pose_seen_;
       } else {
         const LoopKeyframe& newest = keyframes_.back();
-        held_pose_ = Sophus::SE3d(composeYPR(newest.roll, newest.pitch, newest.yaw),
-                                  newest.t_opt);
+        held_pose_ = newest.correctedPose();
         held_anchor_raw_pose_ = newest.T_w_i_raw;
       }
       drift_held_ = true;
@@ -1884,9 +1867,7 @@ bool OnlineLoopClosure::getSmoothedCorrectedPose(
           held_anchor_raw_pose_ = last_raw_pose_seen_;
         } else {
           const LoopKeyframe& newest = keyframes_.back();
-          held_pose_ = Sophus::SE3d(
-              composeYPR(newest.roll, newest.pitch, newest.yaw),
-              newest.t_opt);
+          held_pose_ = newest.correctedPose();
           held_anchor_raw_pose_ = newest.T_w_i_raw;
         }
         drift_held_ = true;
@@ -1945,8 +1926,7 @@ bool OnlineLoopClosure::getSmoothedCorrectedPose(
     last_seen_kf_t_ns_for_stationary_override_ = kf.t_ns;
   }
 
-  Sophus::SE3d T_w_i_corrected_kf(composeYPR(kf.roll, kf.pitch, kf.yaw),
-                                   kf.t_opt);
+  Sophus::SE3d T_w_i_corrected_kf = kf.correctedPose();
   // Raw motion since this keyframe was captured -- kf.T_w_i_raw and
   // current_raw_pose are both raw VIO poses in the same (uncorrected)
   // world frame, so this delta is meaningful even though that frame's
@@ -2061,7 +2041,7 @@ Eigen::aligned_vector<Eigen::Vector3d> OnlineLoopClosure::buildPointCloud()
   std::lock_guard<std::mutex> lock(state_mutex_);
   Eigen::aligned_vector<Eigen::Vector3d> out;
   for (const auto& kf : keyframes_) {
-    Sophus::SE3d T_w_i(composeYPR(kf.roll, kf.pitch, kf.yaw), kf.t_opt);
+    Sophus::SE3d T_w_i = kf.correctedPose();
     Sophus::SE3d T_w_c0 = T_w_i * calib_.T_i_c[0];
     for (const auto& p_c0 : kf.pts3d) out.push_back(T_w_c0 * p_c0);
   }
@@ -2113,8 +2093,7 @@ bool OnlineLoopClosure::getCorrectedPoseForRebuild(
   // method's header comment for why it's duplicated here read-only
   // rather than calling into that shared logic directly.
   const LoopKeyframe& ref = keyframes_[best_idx];
-  Sophus::SE3d T_reference_corrected(composeYPR(ref.roll, ref.pitch, ref.yaw),
-                                     ref.t_opt);
+  Sophus::SE3d T_reference_corrected = ref.correctedPose();
   Sophus::SE3d T_raw_delta = ref.T_w_i_raw.inverse() * raw_pose_at_t;
   out = T_reference_corrected * T_raw_delta;
   return true;
