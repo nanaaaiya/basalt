@@ -218,11 +218,12 @@ void DashboardClient::writerThreadMain(int fd) {
       if (!info.empty() && !sendAll(fd, info + '\n')) return;
     }
     std::string line;
-    // 200ms poll instead of an unbounded pop() so this thread notices
-    // running_ going false (stop()) or the reader thread's fd having died
-    // promptly instead of blocking indefinitely on an empty queue.
+    // Poll instead of a blocking pop() so this thread notices running_
+    // going false (stop()) instead of blocking on an empty queue. Kept
+    // short: every queued message waits up to this long before sending
+    // (200 ms here delayed poses ~90 ms on average and sent them in bursts).
     if (!out_queue_.try_pop(line)) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(200));
+      std::this_thread::sleep_for(std::chrono::milliseconds(2));
       continue;
     }
     // connection dead -- let connectionThreadMain reconnect
